@@ -1,0 +1,29 @@
+# --- core ---
+pandas>=2.2
+numpy>=1.26
+pydantic>=2.6
+pydantic-settings>=2.2
+python-dotenv>=1.0
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# --- modeling ---
+lightgbm>=4.3
+scikit-learn>=1.4
+mlflow>=2.12
+
+# --- backtest / data ---
+yfinance>=0.2.40      # fallback / cheap price source for local dev
+alpaca-py>=0.28        # optional broker + market data when BROKER=alpaca
+ib-insync>=0.9.86      # IBKR broker when BROKER=ibkr
+
+# --- monitoring / alerts ---
+streamlit>=1.33
+requests>=2.31
+
+# --- orchestration (optional, Phase 0 only needs this if you want the UI) ---
+prefect>=2.16
+
+# --- dev / test ---
+pytest>=8.1
+ruff>=0.4

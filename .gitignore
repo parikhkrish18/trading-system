@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+mlruns/
+mlflow.db
+*.log
+.DS_Store
+data_backfill/
+*.parquet
+.ipynb_checkpoints/

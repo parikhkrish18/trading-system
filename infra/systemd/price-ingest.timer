@@ -1,0 +1,11 @@
+[Unit]
+Description=Run price-ingest.service daily after US market close
+
+[Timer]
+# 21:15 UTC ~= 4:15pm ET (adjust for DST manually, or use a UTC-aware
+# scheduler if this matters enough to automate).
+OnCalendar=Mon..Fri 21:15
+Persistent=true
+
+[Install]
+WantedBy=timers.target

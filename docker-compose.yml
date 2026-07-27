@@ -1,0 +1,51 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: trading-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-trading}
+      POSTGRES_USER: ${DB_USER:-trading}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me_locally}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-trading}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: trading-mlflow
+    restart: unless-stopped
+    depends_on:
+      - timescaledb
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/artifacts/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: monitoring/dashboard/Dockerfile
+    container_name: trading-dashboard
+    restart: unless-stopped
+    depends_on:
+      - timescaledb
+    env_file: .env
+    ports:
+      - "8501:8501"
+
+volumes:
+  timescale_data:
+  mlflow_artifacts:
