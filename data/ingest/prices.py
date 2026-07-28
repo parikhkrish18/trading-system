@@ -19,6 +19,7 @@ import pandas as pd
 
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
+from data.ingest.universe import resolve_symbols
 from data.validators.checks import run_all_validators
 
 
@@ -93,14 +94,15 @@ def ingest_prices(symbols: list[str], start: dt.date, end: dt.date, source: str 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest daily OHLCV bars into TimescaleDB.")
-    parser.add_argument("--symbols", required=True, help="Comma-separated tickers, e.g. SPY,QQQ,TQQQ,SQQQ")
+    parser.add_argument("--symbols", default=None, help="Comma-separated tickers, e.g. SPY,QQQ,TQQQ,SQQQ")
+    parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
     parser.add_argument("--source", default="yfinance", choices=["yfinance", "alpaca"])
     parser.add_argument("--backfill-years", type=int, default=0, help="If set, pulls this many years of history.")
     parser.add_argument("--start", type=str, default=None, help="YYYY-MM-DD, overrides --backfill-years.")
     parser.add_argument("--end", type=str, default=None, help="YYYY-MM-DD, defaults to today.")
     args = parser.parse_args()
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    symbols = resolve_symbols(args.symbols, args.universe)
     end = dt.date.fromisoformat(args.end) if args.end else dt.datetime.now(tz=dt.UTC).date()
     if args.start:
         start = dt.date.fromisoformat(args.start)

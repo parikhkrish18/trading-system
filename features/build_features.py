@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import argparse
 
+import numpy as np
 import pandas as pd
 
 from data.ingest.db import get_engine, upsert_dataframe
-from features.event_risk.calendar_features import days_to_next_macro_event
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
 from features.quant.momentum import adx, rolling_return
 from features.quant.volatility import atr, realized_vol, vol_of_vol
@@ -63,6 +63,13 @@ def build_qualitative_features(prices: pd.DataFrame, news: pd.DataFrame) -> pd.D
     price dates so this joins cleanly onto build_quant_features' output.
     News ts is naturally point-in-time (when it was published), so no
     look-ahead risk here as long as each date only looks backward.
+
+    Vectorized via a time-based rolling window rather than a per-date Python
+    loop (needed once --universe is scanning ~500 symbols, not 4): per
+    symbol, price dates are interleaved into the news timeline as zero-weight
+    "anchor" rows, then a single pass of `.rolling("Nd")` computes the
+    trailing window ending at every row — anchor rows included — in one
+    vectorized call instead of re-filtering the full news series per date.
     """
     if news.empty or prices.empty:
         return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
@@ -70,51 +77,87 @@ def build_qualitative_features(prices: pd.DataFrame, news: pd.DataFrame) -> pd.D
     if scored.empty:
         return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
 
-    rows: list[tuple] = []
+    frames: list[pd.DataFrame] = []
     for symbol, price_dates in prices.groupby("symbol")["ts"]:
-        sym_news = scored.loc[scored["symbol"] == symbol].sort_values("ts")
+        sym_news = scored.loc[scored["symbol"] == symbol, ["ts", "sentiment"]]
         if sym_news.empty:
             continue
-        sentiment_series = sym_news.set_index("ts")["sentiment"]
 
-        for date in price_dates.sort_values():
-            trailing_3d = sentiment_series.loc[
-                (sentiment_series.index <= date) & (sentiment_series.index > date - pd.Timedelta(days=3))
-            ]
-            trailing_10d = sentiment_series.loc[
-                (sentiment_series.index <= date) & (sentiment_series.index > date - pd.Timedelta(days=10))
-            ]
-            if trailing_10d.empty:
-                continue
-            mean_10d = trailing_10d.mean()
-            rows.append((symbol, date, "sentiment_mean_10d", mean_10d))
-            rows.append((symbol, date, "news_volume_3d", float(len(trailing_3d))))
-            if not trailing_3d.empty:
-                mean_3d = trailing_3d.mean()
-                rows.append((symbol, date, "sentiment_mean_3d", mean_3d))
-                rows.append((symbol, date, "sentiment_momentum_3v10", mean_3d - mean_10d))
+        anchors = pd.DataFrame(
+            {"ts": price_dates.drop_duplicates(), "sentiment": np.nan, "is_anchor": True}
+        )
+        combined = (
+            pd.concat([sym_news.assign(is_anchor=False), anchors], ignore_index=True)
+            .sort_values("ts", kind="stable")
+            .set_index("ts")
+        )
 
-    return pd.DataFrame(rows, columns=["symbol", "ts", "feature_name", "value"])
+        mean_3d = combined["sentiment"].rolling("3D").mean()
+        count_3d = combined["sentiment"].rolling("3D").count()
+        mean_10d = combined["sentiment"].rolling("10D").mean()
+        count_10d = combined["sentiment"].rolling("10D").count()
+
+        mask = combined["is_anchor"].to_numpy() & (count_10d.to_numpy() > 0)
+        if not mask.any():
+            continue
+
+        anchor_ts = combined.index[mask]
+        out = pd.DataFrame(
+            {
+                "symbol": symbol,
+                "ts": anchor_ts,
+                "sentiment_mean_10d": mean_10d.to_numpy()[mask],
+                "news_volume_3d": count_3d.to_numpy()[mask],
+                "sentiment_mean_3d": mean_3d.to_numpy()[mask],
+            }
+        )
+        out["sentiment_momentum_3v10"] = out["sentiment_mean_3d"] - out["sentiment_mean_10d"]
+        # sentiment_mean_3d / sentiment_momentum_3v10 only apply when the 3d
+        # window actually had news (matches the original "if trailing_3d" gate).
+        out.loc[out["news_volume_3d"] == 0, ["sentiment_mean_3d", "sentiment_momentum_3v10"]] = np.nan
+        frames.append(out)
+
+    if not frames:
+        return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
+
+    wide = pd.concat(frames, ignore_index=True)
+    long = wide.melt(id_vars=["symbol", "ts"], var_name="feature_name", value_name="value")
+    return long.dropna(subset=["value"])
 
 
 def build_event_risk_features(prices: pd.DataFrame, macro_calendar: pd.DataFrame) -> pd.DataFrame:
     """
     macro_calendar: columns [ts, category] from the macro_calendar table.
-    Countdown-to-next-event is market-wide, not symbol-specific, but stored
-    per symbol/date to match the features table's schema.
+    Countdown-to-next-event is market-wide, not symbol-specific — computed
+    once per unique trading date (not per symbol) via merge_asof, then
+    broadcast onto every symbol that has a price row on that date. This is
+    the thing that mattered most to vectorize: a naive per-symbol loop
+    recomputes the identical market-wide countdown up to ~500 times.
     """
     if macro_calendar.empty or prices.empty:
         return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
 
-    rows: list[tuple] = []
-    for symbol, price_dates in prices.groupby("symbol")["ts"]:
-        for date in price_dates.sort_values():
-            for category in _MACRO_CATEGORIES:
-                days = days_to_next_macro_event(date, macro_calendar, category=category)
-                if pd.notna(days):
-                    rows.append((symbol, date, f"days_to_next_{category.lower()}", float(days)))
+    unique_dates = pd.DataFrame({"ts": prices["ts"].drop_duplicates().sort_values()})
 
-    return pd.DataFrame(rows, columns=["symbol", "ts", "feature_name", "value"])
+    per_date_frames = []
+    for category in _MACRO_CATEGORIES:
+        event_dates = macro_calendar.loc[macro_calendar["category"] == category, ["ts"]].sort_values("ts")
+        if event_dates.empty:
+            continue
+        joined = pd.merge_asof(
+            unique_dates, event_dates.rename(columns={"ts": "event_ts"}), left_on="ts", right_on="event_ts",
+            direction="forward",
+        )
+        joined = joined.dropna(subset=["event_ts"])
+        joined["value"] = (joined["event_ts"] - joined["ts"]).dt.total_seconds() / 86400
+        joined["feature_name"] = f"days_to_next_{category.lower()}"
+        per_date_frames.append(joined[["ts", "feature_name", "value"]])
+
+    if not per_date_frames:
+        return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
+
+    per_date = pd.concat(per_date_frames, ignore_index=True)
+    return prices[["symbol", "ts"]].drop_duplicates().merge(per_date, on="ts", how="inner")
 
 
 def build_fundamentals_features(prices: pd.DataFrame, fundamentals: pd.DataFrame) -> pd.DataFrame:
@@ -124,25 +167,27 @@ def build_fundamentals_features(prices: pd.DataFrame, fundamentals: pd.DataFrame
     — using end_date instead would leak information: a metric only becomes
     usable on/after the date it was actually filed, not the fiscal period it
     describes). As-of joins the latest known value of each metric onto each
-    symbol's price dates.
+    symbol's price dates via merge_asof (one call per metric, across all
+    symbols at once) instead of a per-symbol Python loop.
     """
     if fundamentals.empty or prices.empty:
         return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
 
-    rows: list[tuple] = []
-    for symbol, price_dates in prices.groupby("symbol")["ts"]:
-        sym_fund = fundamentals.loc[fundamentals["symbol"] == symbol]
-        if sym_fund.empty:
-            continue
-        sorted_dates = price_dates.sort_values()
-        for metric, msub in sym_fund.groupby("metric"):
-            series = msub.sort_values("ts").set_index("ts")["value"]
-            for date in sorted_dates:
-                latest = series.asof(date)
-                if pd.notna(latest):
-                    rows.append((symbol, date, f"fund_{metric}_latest", latest))
+    price_dates = prices[["symbol", "ts"]].drop_duplicates().sort_values("ts")
 
-    return pd.DataFrame(rows, columns=["symbol", "ts", "feature_name", "value"])
+    frames = []
+    for metric, msub in fundamentals.groupby("metric"):
+        metric_sorted = msub[["symbol", "ts", "value"]].sort_values("ts")
+        joined = pd.merge_asof(price_dates, metric_sorted, on="ts", by="symbol", direction="backward")
+        joined = joined.dropna(subset=["value"])
+        if joined.empty:
+            continue
+        joined["feature_name"] = f"fund_{metric}_latest"
+        frames.append(joined[["symbol", "ts", "feature_name", "value"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
+    return pd.concat(frames, ignore_index=True)
 
 
 def build_and_store(symbols: list[str], feature_set_id: str) -> int:

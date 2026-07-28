@@ -77,3 +77,51 @@ def test_target_position_size_full_pipeline():
     )
     # 0.8 * 0.25 = 0.20 confidence-scaled, then * 0.35 chop dampening
     assert size == pytest.approx(0.20 * 0.35)
+
+
+def test_target_position_size_uses_short_cap_for_negative_forecast():
+    corr = pd.DataFrame({"TSLA": [1.0]}, index=["TSLA"])
+    size = target_position_size(
+        forecast=-10.0,  # deep in saturation for both caps
+        forecast_scale=1.0,
+        regime=TREND,
+        symbol="TSLA",
+        current_positions={},
+        correlation_matrix=corr,
+        max_position_pct=0.25,
+        max_correlated_exposure_pct=0.50,
+        max_short_position_pct=0.15,
+    )
+    assert size == pytest.approx(-0.15)  # capped at the short limit, not the long one
+
+
+def test_target_position_size_long_forecast_unaffected_by_short_cap():
+    corr = pd.DataFrame({"TSLA": [1.0]}, index=["TSLA"])
+    size = target_position_size(
+        forecast=10.0,
+        forecast_scale=1.0,
+        regime=TREND,
+        symbol="TSLA",
+        current_positions={},
+        correlation_matrix=corr,
+        max_position_pct=0.25,
+        max_correlated_exposure_pct=0.50,
+        max_short_position_pct=0.15,
+    )
+    assert size == pytest.approx(0.25)  # long cap, not short cap
+
+
+def test_target_position_size_without_short_cap_falls_back_to_long_cap():
+    """Existing (pre-short-selling) callers that don't pass max_short_position_pct keep old behavior."""
+    corr = pd.DataFrame({"TQQQ": [1.0]}, index=["TQQQ"])
+    size = target_position_size(
+        forecast=-10.0,
+        forecast_scale=1.0,
+        regime=TREND,
+        symbol="TQQQ",
+        current_positions={},
+        correlation_matrix=corr,
+        max_position_pct=0.25,
+        max_correlated_exposure_pct=0.50,
+    )
+    assert size == pytest.approx(-0.25)

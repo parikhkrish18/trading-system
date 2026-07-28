@@ -32,7 +32,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from config.settings import settings
 from data.ingest.db import get_engine
-from models.forecast.lgbm_forecast import ForecastModel
+from data.ingest.universe import resolve_symbols
+from models.forecast.ensemble import EnsembleForecastModel
 
 
 @dataclasses.dataclass
@@ -75,12 +76,13 @@ def make_expanding_folds(dates: pd.DatetimeIndex, n_folds: int, min_train_frac: 
     return folds
 
 
-def load_training_frame(feature_set_id: str, symbols: list[str], target_horizon_days: int) -> pd.DataFrame:
+def load_feature_frame(feature_set_id: str, symbols: list[str]) -> pd.DataFrame:
     """
-    Pulls features + prices, pivots features long->wide, and builds the
-    forward-return target. Target is built from *future* prices relative to
-    each row's ts — this is the one place look-ahead would sneak in if the
-    join were done wrong, so keep this function small and test it directly.
+    Pulls features + prices and pivots features long->wide. Shared by
+    load_training_frame (below, which adds a forward-return target) and
+    models.screener.load_latest_features (which scores the most recent row
+    per symbol — one that by definition has no forward return yet, since
+    that would require future data).
     """
     engine = get_engine()
     symbol_list = ", ".join(f"'{s}'" for s in symbols)
@@ -98,8 +100,17 @@ def load_training_frame(feature_set_id: str, symbols: list[str], target_horizon_
         raise ValueError("No features or prices found — run ingestion + build_features first.")
 
     wide = features.pivot_table(index=["symbol", "ts"], columns="feature_name", values="value").reset_index()
-    merged = wide.merge(prices, on=["symbol", "ts"], how="inner").sort_values(["symbol", "ts"])
+    return wide.merge(prices, on=["symbol", "ts"], how="inner").sort_values(["symbol", "ts"])
 
+
+def load_training_frame(feature_set_id: str, symbols: list[str], target_horizon_days: int) -> pd.DataFrame:
+    """
+    Adds the forward-return target on top of load_feature_frame. Target is
+    built from *future* prices relative to each row's ts — this is the one
+    place look-ahead would sneak in if the join were done wrong, so keep
+    this function small and test it directly.
+    """
+    merged = load_feature_frame(feature_set_id, symbols)
     merged["fwd_return"] = merged.groupby("symbol")["close"].transform(
         lambda s: s.shift(-target_horizon_days) / s - 1
     )
@@ -112,6 +123,8 @@ def run_walk_forward(
     target_horizon_days: int = 5,
     n_folds: int = 6,
     model_name: str = "forecast_lgbm",
+    n_ensemble_models: int = 5,
+    confident_agreement_threshold: float = 0.8,
 ) -> pd.DataFrame:
     df = load_training_frame(feature_set_id, symbols, target_horizon_days)
     feature_cols = [c for c in df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
@@ -141,20 +154,46 @@ def run_walk_forward(
                     "feature_set_id": feature_set_id,
                     "target_horizon_days": target_horizon_days,
                     "n_features": len(feature_cols),
+                    "n_ensemble_models": n_ensemble_models,
+                    "confident_agreement_threshold": confident_agreement_threshold,
                 }
             )
 
-            model = ForecastModel()
+            model = EnsembleForecastModel(n_models=n_ensemble_models)
             model.fit(train_df[feature_cols], train_df["fwd_return"])
-            preds = model.predict(test_df[feature_cols])
+            ensemble_out = model.predict(test_df[feature_cols])
+            preds = ensemble_out["mean_prediction"].to_numpy()
+            actual = test_df["fwd_return"].to_numpy()
 
-            mae = mean_absolute_error(test_df["fwd_return"], preds)
-            rmse = np.sqrt(mean_squared_error(test_df["fwd_return"], preds))
+            mae = mean_absolute_error(actual, preds)
+            rmse = np.sqrt(mean_squared_error(actual, preds))
             # Directional accuracy matters at least as much as magnitude error
             # for a system that ultimately just takes long/short/flat decisions.
-            directional_acc = float(np.mean(np.sign(preds) == np.sign(test_df["fwd_return"])))
+            directional_acc = float(np.mean(np.sign(preds) == np.sign(actual)))
 
-            mlflow.log_metrics({"mae": mae, "rmse": rmse, "directional_accuracy": directional_acc})
+            # Does ensemble agreement actually correlate with being right?
+            # This is what calibrates the screener's confidence threshold —
+            # if accuracy on the "confident" subset isn't meaningfully better
+            # than the overall accuracy above, agreement isn't a useful filter.
+            confident_mask = (ensemble_out["direction_agreement"] >= confident_agreement_threshold).to_numpy()
+            pct_confident = float(confident_mask.mean())
+            if confident_mask.any():
+                directional_acc_confident = float(
+                    np.mean(np.sign(preds[confident_mask]) == np.sign(actual[confident_mask]))
+                )
+            else:
+                directional_acc_confident = float("nan")
+
+            mlflow.log_metrics(
+                {
+                    "mae": mae,
+                    "rmse": rmse,
+                    "directional_accuracy": directional_acc,
+                    "directional_accuracy_when_confident": directional_acc_confident,
+                    "pct_rows_confident": pct_confident,
+                    "mean_ensemble_std": float(ensemble_out["std_prediction"].mean()),
+                }
+            )
 
             results.append(
                 {
@@ -166,6 +205,8 @@ def run_walk_forward(
                     "mae": mae,
                     "rmse": rmse,
                     "directional_accuracy": directional_acc,
+                    "directional_accuracy_when_confident": directional_acc_confident,
+                    "pct_rows_confident": pct_confident,
                 }
             )
 
@@ -175,19 +216,32 @@ def run_walk_forward(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Walk-forward train/evaluate the forecast model.")
     parser.add_argument("--feature-set-id", required=True)
-    parser.add_argument("--symbols", required=True)
+    parser.add_argument("--symbols", default=None)
+    parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
     parser.add_argument("--target-horizon-days", type=int, default=5)
     parser.add_argument("--n-folds", type=int, default=6)
+    parser.add_argument("--n-ensemble-models", type=int, default=5)
+    parser.add_argument("--confident-agreement-threshold", type=float, default=0.8)
     args = parser.parse_args()
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",")]
-    results = run_walk_forward(args.feature_set_id, symbols, args.target_horizon_days, args.n_folds)
+    symbols = resolve_symbols(args.symbols, args.universe)
+    results = run_walk_forward(
+        args.feature_set_id,
+        symbols,
+        args.target_horizon_days,
+        args.n_folds,
+        n_ensemble_models=args.n_ensemble_models,
+        confident_agreement_threshold=args.confident_agreement_threshold,
+    )
 
     print(results.to_string(index=False))
     print(
         "\nPer the plan: do not touch position sizing or live logic until this is "
         "stable across multiple folds, not just one lucky split. Check "
-        "directional_accuracy and rmse variance across folds above, not just the mean."
+        "directional_accuracy, directional_accuracy_when_confident, and rmse "
+        "variance across folds above, not just the mean. If "
+        "directional_accuracy_when_confident isn't meaningfully better than "
+        "directional_accuracy, ensemble agreement isn't a useful confidence filter yet."
     )
 
 

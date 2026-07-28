@@ -31,7 +31,7 @@ def test_fetch_fundamentals_reshapes_to_long_format(monkeypatch):
         assert params["ticker"] == "SPY"
         return _FakeResponse({"results": [_polygon_report("2026-06-30", eps=2.5, revenue=1_000_000.0)]})
 
-    monkeypatch.setattr(fundamentals.requests, "get", fake_get)
+    monkeypatch.setattr(fundamentals, "polygon_get",fake_get)
     monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
 
     df = fundamentals.fetch_fundamentals(["SPY"])
@@ -56,7 +56,7 @@ def test_fetch_fundamentals_prefers_filing_date_over_end_date(monkeypatch):
         "filing_date": "2026-08-04",
         "financials": {"income_statement": {"diluted_earnings_per_share": {"value": 2.5}}},
     }
-    monkeypatch.setattr(fundamentals.requests, "get", lambda *a, **k: _FakeResponse({"results": [report]}))
+    monkeypatch.setattr(fundamentals, "polygon_get",lambda *a, **k: _FakeResponse({"results": [report]}))
     monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
 
     df = fundamentals.fetch_fundamentals(["SPY"])
@@ -65,7 +65,7 @@ def test_fetch_fundamentals_prefers_filing_date_over_end_date(monkeypatch):
 
 
 def test_fetch_fundamentals_falls_back_to_end_date_when_filing_date_missing(monkeypatch):
-    monkeypatch.setattr(fundamentals.requests, "get", lambda *a, **k: _FakeResponse({"results": [_polygon_report("2026-06-30", eps=2.5, revenue=1_000_000.0)]}))
+    monkeypatch.setattr(fundamentals, "polygon_get",lambda *a, **k: _FakeResponse({"results": [_polygon_report("2026-06-30", eps=2.5, revenue=1_000_000.0)]}))
     monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
 
     df = fundamentals.fetch_fundamentals(["SPY"])
@@ -75,7 +75,7 @@ def test_fetch_fundamentals_falls_back_to_end_date_when_filing_date_missing(monk
 
 def test_fetch_fundamentals_skips_missing_metrics(monkeypatch):
     report = {"end_date": "2026-06-30", "financials": {"income_statement": {}}}
-    monkeypatch.setattr(fundamentals.requests, "get", lambda *a, **k: _FakeResponse({"results": [report]}))
+    monkeypatch.setattr(fundamentals, "polygon_get",lambda *a, **k: _FakeResponse({"results": [report]}))
     monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
 
     df = fundamentals.fetch_fundamentals(["SPY"])
@@ -84,7 +84,7 @@ def test_fetch_fundamentals_skips_missing_metrics(monkeypatch):
 
 def test_fetch_fundamentals_skips_reports_without_a_date(monkeypatch):
     report = {"financials": {"income_statement": {"revenues": {"value": 100.0}}}}
-    monkeypatch.setattr(fundamentals.requests, "get", lambda *a, **k: _FakeResponse({"results": [report]}))
+    monkeypatch.setattr(fundamentals, "polygon_get",lambda *a, **k: _FakeResponse({"results": [report]}))
     monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
 
     df = fundamentals.fetch_fundamentals(["SPY"])
@@ -95,7 +95,7 @@ def test_ingest_fundamentals_upserts_with_correct_conflict_cols(monkeypatch):
     monkeypatch.setattr(
         fundamentals,
         "fetch_fundamentals",
-        lambda symbols: pd.DataFrame(
+        lambda symbols, sleep_seconds=0: pd.DataFrame(
             {
                 "symbol": ["SPY"],
                 "ts": pd.to_datetime(["2026-06-30"], utc=True),

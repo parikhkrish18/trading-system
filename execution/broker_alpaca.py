@@ -60,6 +60,18 @@ class AlpacaBroker:
     def get_portfolio_value(self) -> float:
         return float(self.client.get_account().equity)
 
+    def is_shortable(self, symbol: str) -> bool:
+        """
+        Whether Alpaca will currently let this symbol be sold short — checks
+        both `shortable` (the asset class allows it at all) and
+        `easy_to_borrow` (shares are actually available right now, not just
+        theoretically shortable). Callers (the screener) should skip any
+        short candidate this returns False for rather than submitting an
+        order that's just going to get rejected.
+        """
+        asset = self.client.get_asset(symbol)
+        return bool(getattr(asset, "shortable", False) and getattr(asset, "easy_to_borrow", False))
+
     def submit_target_position(self, symbol: str, target_shares: float) -> dict | None:
         """
         Submits a single market order to move from the current position in

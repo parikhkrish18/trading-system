@@ -13,6 +13,15 @@ Safety choices mirror broker_alpaca.py:
   - Paper and live use separate ports, selected by TRADING_MODE.
   - Constructing IBKRBroker in "live" mode requires confirm_live=True.
   - Every order placement is logged before submission.
+
+Short-selling limitation: unlike broker_alpaca.py, this module has no
+is_shortable() pre-check. ib_insync doesn't expose IBKR's short-locate
+inventory through the base API without an extra market-data subscription,
+so there's no reliable way to know in advance whether a short will be
+filled. An unshortable order will be rejected by IBKR itself at submission
+time — that rejection surfaces via the returned trade's orderStatus, and
+callers (the screener/trading loop) must check and log it rather than
+assume the order went through just because placeOrder() didn't raise.
 """
 from __future__ import annotations
 

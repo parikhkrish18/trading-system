@@ -16,12 +16,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import time
 
 import pandas as pd
-import requests
 
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
+from data.ingest.http import DEFAULT_SLEEP_SECONDS, polygon_get
+from data.ingest.universe import resolve_symbols
 
 POLYGON_FINANCIALS_URL = "https://api.polygon.io/vX/reference/financials"
 
@@ -36,21 +38,26 @@ _METRIC_PATHS = {
 }
 
 
-def fetch_fundamentals(symbols: list[str]) -> pd.DataFrame:
+def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_SECONDS) -> pd.DataFrame:
     """
     Pull quarterly financials per symbol from Polygon and reshape into
     long format. Returns columns: symbol, ts (tz-aware), metric, value, source.
+
+    `sleep_seconds` paces requests between symbols — matters once --universe
+    is scanning hundreds of names against a rate-limited free-tier key; a
+    single-digit --symbols list can pass sleep_seconds=0.
     """
     rows: list[dict] = []
-    for symbol in symbols:
+    for i, symbol in enumerate(symbols):
+        if i > 0 and sleep_seconds > 0:
+            time.sleep(sleep_seconds)
         params = {
             "ticker": symbol,
             "timeframe": "quarterly",
             "limit": 20,
             "apiKey": settings.polygon_api_key,
         }
-        resp = requests.get(POLYGON_FINANCIALS_URL, params=params, timeout=30)
-        resp.raise_for_status()
+        resp = polygon_get(POLYGON_FINANCIALS_URL, params)
         results = resp.json().get("results", [])
 
         for report in results:
@@ -84,18 +91,23 @@ def fetch_fundamentals(symbols: list[str]) -> pd.DataFrame:
     return df
 
 
-def ingest_fundamentals(symbols: list[str]) -> int:
-    df = fetch_fundamentals(symbols)
+def ingest_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_SECONDS) -> int:
+    df = fetch_fundamentals(symbols, sleep_seconds=sleep_seconds)
     return upsert_dataframe(df, table="fundamentals", conflict_cols=["symbol", "ts", "metric"])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest fundamentals into TimescaleDB.")
-    parser.add_argument("--symbols", required=True, help="Comma-separated tickers")
+    parser.add_argument("--symbols", default=None, help="Comma-separated tickers")
+    parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
+    parser.add_argument(
+        "--sleep-seconds", type=float, default=DEFAULT_SLEEP_SECONDS,
+        help="Pause between symbols to stay under Polygon's rate limit (set 0 for a short --symbols list).",
+    )
     args = parser.parse_args()
-    symbols = [s.strip().upper() for s in args.symbols.split(",")]
-    n = ingest_fundamentals(symbols)
-    print(f"Ingested {n} fundamentals rows for {symbols}.")
+    symbols = resolve_symbols(args.symbols, args.universe)
+    n = ingest_fundamentals(symbols, sleep_seconds=args.sleep_seconds)
+    print(f"Ingested {n} fundamentals rows for {len(symbols)} symbol(s).")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-.PHONY: up down migrate ingest test lint dashboard
+.PHONY: up down migrate universe ingest screen test lint dashboard
 
 up:
 	docker compose up -d timescaledb mlflow
@@ -9,8 +9,14 @@ down:
 migrate:
 	python -m data.schema.migrate
 
+universe:
+	python -m data.ingest.universe --scrape
+
 ingest:
-	python -m data.ingest.prices --symbols SPY,QQQ,TQQQ,SQQQ --backfill-years 5
+	python -m data.ingest.prices --universe --backfill-years 5
+
+screen:
+	python -m models.screener --feature-set-id v3 --universe --top-k 10
 
 test:
 	pytest -v

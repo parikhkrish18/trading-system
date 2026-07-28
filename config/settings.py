@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # --- Risk limits ---
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
     max_single_position_pct: float = Field(default=0.25, alias="MAX_SINGLE_POSITION_PCT")
+    # Lower than max_single_position_pct deliberately: a long position can
+    # only ever lose 100% of what's put in, but a short's loss is structurally
+    # uncapped (the underlying can keep rising) — size shorts more
+    # conservatively by default to reflect that asymmetry.
+    max_short_position_pct: float = Field(default=0.15, alias="MAX_SHORT_POSITION_PCT")
     max_correlated_exposure_pct: float = Field(default=0.50, alias="MAX_CORRELATED_EXPOSURE_PCT")
 
     @property

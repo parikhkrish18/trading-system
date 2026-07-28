@@ -85,9 +85,22 @@ def target_position_size(
     max_position_pct: float,
     max_correlated_exposure_pct: float,
     chop_dampening: float = 0.35,
+    max_short_position_pct: float | None = None,
 ) -> float:
-    """Full sizing pipeline: confidence -> regime adjustment -> correlation adjustment."""
-    size = confidence_scaled_size(forecast, forecast_scale, max_position_pct)
+    """
+    Full sizing pipeline: confidence -> regime adjustment -> correlation adjustment.
+
+    `max_short_position_pct`, when given, caps a negative (short) forecast
+    more conservatively than `max_position_pct` caps a long one — a short's
+    loss is structurally uncapped, a long's isn't, so the same headroom
+    isn't the right default for both. Falls back to `max_position_pct` for
+    both directions if not given, to keep the long-only callers unaffected.
+    """
+    effective_max_pct = max_position_pct
+    if forecast < 0 and max_short_position_pct is not None:
+        effective_max_pct = max_short_position_pct
+
+    size = confidence_scaled_size(forecast, forecast_scale, effective_max_pct)
     size = regime_adjusted_size(size, regime, chop_dampening)
     size = correlation_adjusted_size(
         size, symbol, current_positions, correlation_matrix, max_correlated_exposure_pct
