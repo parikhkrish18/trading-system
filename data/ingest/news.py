@@ -74,8 +74,11 @@ def fetch_news(symbols: list[str], since_hours: int) -> pd.DataFrame:
 
 def ingest_news(symbols: list[str], since_hours: int = 24) -> int:
     df = fetch_news(symbols, since_hours)
-    df["sentiment"] = pd.NA
-    df["surprise"] = pd.NA
+    # float("nan"), not pd.NA: an all-pd.NA column has no numeric dtype, so
+    # to_sql would write it as text and the DB (a `double precision` column)
+    # would reject the insert with a type mismatch.
+    df["sentiment"] = float("nan")
+    df["surprise"] = float("nan")
     return upsert_dataframe(df, table="news_events", conflict_cols=["id", "ts"])
 
 

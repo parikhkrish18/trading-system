@@ -50,6 +50,27 @@ def test_score_sentiment_merges_scores_back_onto_rows(monkeypatch):
     assert set(scored.columns) >= {"id", "ts", "symbol", "headline", "sentiment"}
 
 
+def test_score_sentiment_handles_markdown_code_fence(monkeypatch):
+    """Claude sometimes wraps JSON in ```json ... ``` despite being told not to."""
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        payload = json.dumps([{"id": item["id"], "sentiment": 0.3} for item in items])
+        return f"```json\n{payload}\n```"
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+    headlines = pd.DataFrame(
+        {
+            "id": [1],
+            "ts": pd.to_datetime(["2026-07-27"], utc=True),
+            "symbol": ["SPY"],
+            "headline": ["headline"],
+        }
+    )
+    scored = sentiment.score_sentiment(headlines)
+    assert list(scored["sentiment"]) == [0.3]
+
+
 def test_score_sentiment_empty_input_returns_empty(monkeypatch):
     monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(lambda messages: "[]"))
     headlines = pd.DataFrame(columns=["id", "ts", "symbol", "headline"])

@@ -54,7 +54,13 @@ def fetch_fundamentals(symbols: list[str]) -> pd.DataFrame:
         results = resp.json().get("results", [])
 
         for report in results:
-            report_date = report.get("end_date") or report.get("filing_date")
+            # Use filing_date (when the report actually became public), not
+            # end_date (the fiscal period's end) — using end_date would let a
+            # model "see" a quarter's numbers as of the quarter's last day,
+            # weeks before they were actually filed. That's look-ahead bias:
+            # it would inflate backtested accuracy in a way that can't repeat
+            # in live trading, since real-time data has no such head start.
+            report_date = report.get("filing_date") or report.get("end_date")
             if not report_date:
                 continue
             financials = report.get("financials", {})

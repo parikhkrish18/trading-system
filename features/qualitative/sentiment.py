@@ -32,6 +32,16 @@ _SYSTEM_PROMPT = (
 )
 
 
+def _strip_code_fence(text: str) -> str:
+    """Claude sometimes wraps JSON in a ```json ... ``` fence despite being told not to."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[: -3]
+    return text.strip()
+
+
 def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, float]:
     items = [{"id": int(row["id"]), "symbol": row["symbol"], "headline": row["headline"]} for _, row in batch.iterrows()]
     resp = client.messages.create(
@@ -40,7 +50,7 @@ def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, float]:
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": json.dumps(items)}],
     )
-    text = resp.content[0].text
+    text = _strip_code_fence(resp.content[0].text)
     scores = json.loads(text)
     return {int(s["id"]): float(s["sentiment"]) for s in scores}
 

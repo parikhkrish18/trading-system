@@ -17,9 +17,14 @@ import argparse
 import pandas as pd
 
 from data.ingest.db import get_engine, upsert_dataframe
+from features.event_risk.calendar_features import days_to_next_macro_event
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
 from features.quant.momentum import adx, rolling_return
 from features.quant.volatility import atr, realized_vol, vol_of_vol
+
+# Macro categories tracked in the macro_calendar table (see
+# data/ingest/macro_calendar.py) — one countdown feature per category.
+_MACRO_CATEGORIES = ["FOMC", "CPI", "JOBS"]
 
 # Registry of feature functions and how to call them, so the number/shape of
 # features is explicit and reviewable in one place rather than scattered.
@@ -50,6 +55,96 @@ def build_quant_features(prices: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def build_qualitative_features(prices: pd.DataFrame, news: pd.DataFrame) -> pd.DataFrame:
+    """
+    news: columns [symbol, ts, sentiment] from news_events (unscored rows —
+    sentiment IS NULL — carry no signal yet and are dropped). Aggregates
+    trailing sentiment into daily features, anchored to each symbol's own
+    price dates so this joins cleanly onto build_quant_features' output.
+    News ts is naturally point-in-time (when it was published), so no
+    look-ahead risk here as long as each date only looks backward.
+    """
+    if news.empty or prices.empty:
+        return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
+    scored = news.dropna(subset=["sentiment"])
+    if scored.empty:
+        return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
+
+    rows: list[tuple] = []
+    for symbol, price_dates in prices.groupby("symbol")["ts"]:
+        sym_news = scored.loc[scored["symbol"] == symbol].sort_values("ts")
+        if sym_news.empty:
+            continue
+        sentiment_series = sym_news.set_index("ts")["sentiment"]
+
+        for date in price_dates.sort_values():
+            trailing_3d = sentiment_series.loc[
+                (sentiment_series.index <= date) & (sentiment_series.index > date - pd.Timedelta(days=3))
+            ]
+            trailing_10d = sentiment_series.loc[
+                (sentiment_series.index <= date) & (sentiment_series.index > date - pd.Timedelta(days=10))
+            ]
+            if trailing_10d.empty:
+                continue
+            mean_10d = trailing_10d.mean()
+            rows.append((symbol, date, "sentiment_mean_10d", mean_10d))
+            rows.append((symbol, date, "news_volume_3d", float(len(trailing_3d))))
+            if not trailing_3d.empty:
+                mean_3d = trailing_3d.mean()
+                rows.append((symbol, date, "sentiment_mean_3d", mean_3d))
+                rows.append((symbol, date, "sentiment_momentum_3v10", mean_3d - mean_10d))
+
+    return pd.DataFrame(rows, columns=["symbol", "ts", "feature_name", "value"])
+
+
+def build_event_risk_features(prices: pd.DataFrame, macro_calendar: pd.DataFrame) -> pd.DataFrame:
+    """
+    macro_calendar: columns [ts, category] from the macro_calendar table.
+    Countdown-to-next-event is market-wide, not symbol-specific, but stored
+    per symbol/date to match the features table's schema.
+    """
+    if macro_calendar.empty or prices.empty:
+        return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
+
+    rows: list[tuple] = []
+    for symbol, price_dates in prices.groupby("symbol")["ts"]:
+        for date in price_dates.sort_values():
+            for category in _MACRO_CATEGORIES:
+                days = days_to_next_macro_event(date, macro_calendar, category=category)
+                if pd.notna(days):
+                    rows.append((symbol, date, f"days_to_next_{category.lower()}", float(days)))
+
+    return pd.DataFrame(rows, columns=["symbol", "ts", "feature_name", "value"])
+
+
+def build_fundamentals_features(prices: pd.DataFrame, fundamentals: pd.DataFrame) -> pd.DataFrame:
+    """
+    fundamentals: columns [symbol, ts, metric, value] from the fundamentals
+    table, where ts is the report's filing_date (see data/ingest/fundamentals.py
+    — using end_date instead would leak information: a metric only becomes
+    usable on/after the date it was actually filed, not the fiscal period it
+    describes). As-of joins the latest known value of each metric onto each
+    symbol's price dates.
+    """
+    if fundamentals.empty or prices.empty:
+        return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
+
+    rows: list[tuple] = []
+    for symbol, price_dates in prices.groupby("symbol")["ts"]:
+        sym_fund = fundamentals.loc[fundamentals["symbol"] == symbol]
+        if sym_fund.empty:
+            continue
+        sorted_dates = price_dates.sort_values()
+        for metric, msub in sym_fund.groupby("metric"):
+            series = msub.sort_values("ts").set_index("ts")["value"]
+            for date in sorted_dates:
+                latest = series.asof(date)
+                if pd.notna(latest):
+                    rows.append((symbol, date, f"fund_{metric}_latest", latest))
+
+    return pd.DataFrame(rows, columns=["symbol", "ts", "feature_name", "value"])
+
+
 def build_and_store(symbols: list[str], feature_set_id: str) -> int:
     engine = get_engine()
     symbol_list = ", ".join(f"'{s}'" for s in symbols)
@@ -61,14 +156,30 @@ def build_and_store(symbols: list[str], feature_set_id: str) -> int:
         print("No price data found — run data.ingest.prices first.")
         return 0
 
-    features = build_quant_features(prices)
+    news = pd.read_sql(
+        f"SELECT symbol, ts, sentiment FROM news_events WHERE symbol IN ({symbol_list})", engine
+    )
+    macro_calendar = pd.read_sql("SELECT ts, category FROM macro_calendar", engine)
+    fundamentals = pd.read_sql(
+        f"SELECT symbol, ts, metric, value FROM fundamentals WHERE symbol IN ({symbol_list})", engine
+    )
+
+    feature_frames = [
+        frame
+        for frame in (
+            build_quant_features(prices),
+            build_qualitative_features(prices, news),
+            build_event_risk_features(prices, macro_calendar),
+            build_fundamentals_features(prices, fundamentals),
+        )
+        if not frame.empty
+    ]
+    features = pd.concat(
+        feature_frames,
+        ignore_index=True,
+    )
     features["feature_set_id"] = feature_set_id
     features = features.dropna(subset=["value"])
-
-    # NOTE: qualitative (sentiment) and event-risk features join in here once
-    # features/qualitative/sentiment.py and the macro calendar are populated —
-    # left out of the default run until those vendor integrations are wired up,
-    # so this doesn't silently produce a feature set missing half its inputs.
 
     n = upsert_dataframe(features, table="features", conflict_cols=["symbol", "ts", "feature_set_id", "feature_name"])
     return n
