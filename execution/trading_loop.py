@@ -142,7 +142,6 @@ def _log_decisions(candidates, executed: dict[str, float], feature_set_id: str, 
 def run_cycle(
     feature_set_id: str,
     symbols: list[str],
-    top_k: int = 10,
     dry_run: bool = False,
 ) -> CycleResult:
     broker = get_broker()  # never passes confirm_live=True — paper-only by construction
@@ -158,7 +157,7 @@ def run_cycle(
 
     regime = _market_regime(engine)
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
-    candidates = run_screen(feature_set_id, symbols, top_k=top_k, regime=regime, is_shortable_fn=is_shortable_fn)
+    candidates = run_screen(feature_set_id, symbols, regime=regime, is_shortable_fn=is_shortable_fn)
 
     if not candidates:
         logger.info("No candidates cleared the confidence bar this cycle.")
@@ -222,12 +221,11 @@ def main() -> None:
     parser.add_argument("--feature-set-id", required=True)
     parser.add_argument("--symbols", default=None)
     parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
-    parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--dry-run", action="store_true", help="Screen only — never touches the broker.")
     args = parser.parse_args()
 
     symbols = resolve_symbols(args.symbols, args.universe)
-    result = run_cycle(args.feature_set_id, symbols, top_k=args.top_k, dry_run=args.dry_run)
+    result = run_cycle(args.feature_set_id, symbols, dry_run=args.dry_run)
     print(result)
 
 

@@ -44,7 +44,12 @@ def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.Data
         sub = sub.rename(
             columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
         )
-        sub = sub[["open", "high", "low", "close", "volume"]].dropna(how="all")
+        # how="any", not "all": a row missing even one OHLCV field (e.g. a
+        # vendor glitch that returns a null close but valid open/high/low)
+        # violates the prices table's NOT NULL constraints and fails the
+        # whole batch's single INSERT — better to drop that one row here
+        # than poison every symbol's data for the day.
+        sub = sub[["open", "high", "low", "close", "volume"]].dropna(how="any")
         sub["symbol"] = sym
         sub["ts"] = pd.to_datetime(sub.index, utc=True)
         sub["source"] = "yfinance"

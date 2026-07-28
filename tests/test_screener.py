@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from models.regime.trend_chop_classifier import TREND
-from models.screener import build_correlation_matrix, score_universe, select_trades
+from models.screener import build_correlation_matrix, score_universe, select_concentrated_trades, select_trades
 
 
 class _FakeEnsemble:
@@ -148,6 +148,100 @@ def test_select_trades_shortable_check_does_not_affect_longs():
     )
 
     assert len(candidates) == 1
+
+
+def test_select_concentrated_trades_splits_by_relative_conviction():
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    # conviction_score: AAPL=0.04, TSLA=0.02 -> raw split 2:1 -> 0.667/0.333, within [0.30, 0.70] bounds.
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+
+    assert len(candidates) == 2
+    by_symbol = {c.symbol: c for c in candidates}
+    assert by_symbol["AAPL"].target_position_pct == pytest.approx(2 / 3, rel=1e-6)
+    assert by_symbol["TSLA"].target_position_pct == pytest.approx(1 / 3, rel=1e-6)
+    # fully deployed
+    assert sum(abs(c.target_position_pct) for c in candidates) == pytest.approx(1.0)
+
+
+def test_select_concentrated_trades_clamps_dominant_leg_at_bound():
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.50, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": 0.01, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    # Raw split would be ~98/2 — clamped to 70/30 so one pick can't swallow the whole deployment.
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+
+    by_symbol = {c.symbol: c for c in candidates}
+    assert by_symbol["AAPL"].target_position_pct == pytest.approx(0.70)
+    assert by_symbol["TSLA"].target_position_pct == pytest.approx(0.30)
+
+
+def test_select_concentrated_trades_signs_match_forecast_direction():
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": -0.02, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+    by_symbol = {c.symbol: c for c in candidates}
+    assert by_symbol["AAPL"].side == "long"
+    assert by_symbol["AAPL"].target_position_pct > 0
+    assert by_symbol["TSLA"].side == "short"
+    assert by_symbol["TSLA"].target_position_pct < 0
+
+
+def test_select_concentrated_trades_single_confident_candidate_goes_all_in():
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True}]
+    )
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+
+    assert len(candidates) == 1
+    assert candidates[0].target_position_pct == pytest.approx(1.0)
+
+
+def test_select_concentrated_trades_no_confident_candidates_returns_empty():
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.20, "direction_agreement": 0.55, "confident": False}]
+    )
+    assert select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30) == []
+
+
+def test_select_concentrated_trades_respects_total_deploy_pct():
+    """Regime-based damping (see run_screen) scales both legs down together."""
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30, total_deploy_pct=0.35)
+    assert sum(abs(c.target_position_pct) for c in candidates) == pytest.approx(0.35)
+
+
+def test_select_concentrated_trades_skips_unshortable_and_falls_through_ranking():
+    scored = _scored_df(
+        [
+            {"symbol": "TSLA", "predicted_return": -0.06, "direction_agreement": 1.0, "confident": True},  # unshortable
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "MSFT", "predicted_return": 0.03, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    candidates = select_concentrated_trades(
+        scored, max_leg_pct=0.70, min_leg_pct=0.30,
+        is_shortable_fn=lambda symbol: symbol != "TSLA",
+    )
+
+    symbols = {c.symbol for c in candidates}
+    assert symbols == {"AAPL", "MSFT"}  # TSLA skipped, next two ranked candidates picked instead
 
 
 def test_build_correlation_matrix_from_prices():

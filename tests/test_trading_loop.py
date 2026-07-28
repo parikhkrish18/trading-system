@@ -72,7 +72,7 @@ def test_run_cycle_flattens_and_skips_trading_on_pretrade_breaker(monkeypatch):
     screen_called = []
     monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: screen_called.append(1))
 
-    result = trading_loop.run_cycle("v3", ["AAPL"], top_k=5)
+    result = trading_loop.run_cycle("v3", ["AAPL"])
 
     assert result.status == "flattened_pre_trade"
     assert broker.flattened

@@ -59,13 +59,30 @@ class Settings(BaseSettings):
 
     # --- Risk limits ---
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
-    max_single_position_pct: float = Field(default=0.25, alias="MAX_SINGLE_POSITION_PCT")
+    # These two are now circuit-breaker-only thresholds — the "last line of
+    # defense" catching a genuine anomaly (e.g. a stale price feeding a bad
+    # size calculation), not the sizing-time cap. The active strategy
+    # (models.screener.run_screen) concentrates into 2 positions via
+    # max/min_concentrated_position_pct below, which legitimately deploys
+    # up to ~70% of portfolio in a single name — these breaker thresholds
+    # sit above that on purpose, so normal operation never trips them.
+    max_single_position_pct: float = Field(default=0.80, alias="MAX_SINGLE_POSITION_PCT")
     # Lower than max_single_position_pct deliberately: a long position can
     # only ever lose 100% of what's put in, but a short's loss is structurally
     # uncapped (the underlying can keep rising) — size shorts more
-    # conservatively by default to reflect that asymmetry.
+    # conservatively by default to reflect that asymmetry. Only used by the
+    # legacy diversified-book path (risk.sizing.select_trades), not the
+    # active concentrated strategy.
     max_short_position_pct: float = Field(default=0.15, alias="MAX_SHORT_POSITION_PCT")
-    max_correlated_exposure_pct: float = Field(default=0.50, alias="MAX_CORRELATED_EXPOSURE_PCT")
+    max_correlated_exposure_pct: float = Field(default=0.95, alias="MAX_CORRELATED_EXPOSURE_PCT")
+
+    # --- Concentrated 2-trade strategy (models.screener.select_concentrated_trades) ---
+    # Split between the two highest-conviction picks is weighted by relative
+    # confidence, bounded so the dominant leg can't swallow the whole
+    # deployment: max_concentrated_position_pct caps it, and
+    # min_concentrated_position_pct (= 1 - max) floors the other leg.
+    max_concentrated_position_pct: float = Field(default=0.70, alias="MAX_CONCENTRATED_POSITION_PCT")
+    min_concentrated_position_pct: float = Field(default=0.30, alias="MIN_CONCENTRATED_POSITION_PCT")
 
     @property
     def db_url(self) -> str:

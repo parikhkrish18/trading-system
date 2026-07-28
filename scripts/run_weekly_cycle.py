@@ -55,7 +55,6 @@ def run_job(name: str, fn, *args, **kwargs):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full weekly universe-refresh + screen + trade pipeline.")
     parser.add_argument("--feature-set-id", required=True)
-    parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument(
         "--since-hours", type=int, default=24 * 8,
         help="News lookback window — default covers a week plus a day of slack.",
@@ -78,7 +77,7 @@ def main() -> None:
     run_job("macro_calendar_refresh", refresh_macro_calendar)
     run_job("build_features", build_and_store, symbols, args.feature_set_id)
 
-    result = run_job("trading_cycle", run_cycle, args.feature_set_id, symbols, args.top_k, args.dry_run)
+    result = run_job("trading_cycle", run_cycle, args.feature_set_id, symbols, args.dry_run)
     logger.info("Weekly cycle result: %s", result)
 
 
