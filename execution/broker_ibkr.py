@@ -130,7 +130,7 @@ class IBKRBroker:
             return None
 
         side = "BUY" if delta > 0 else "SELL"
-        qty = abs(int(round(delta)))
+        qty = abs(round(delta))
         if qty < 1:
             return None
 

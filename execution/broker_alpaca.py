@@ -92,7 +92,7 @@ class AlpacaBroker:
         qty = abs(round(delta, 4))
 
         if side == OrderSide.SELL and target_shares < 0:
-            qty = float(int(round(qty)))
+            qty = float(round(qty))
             if qty < 1:
                 logger.info("Skipping %s: rounds to 0 whole shares for a short order.", symbol)
                 return None
