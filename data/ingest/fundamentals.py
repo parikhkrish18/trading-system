@@ -1,17 +1,16 @@
 """
-Phase 1 fundamentals puller — STUB.
+Phase 1 fundamentals puller — Polygon.io.
 
-The plan calls for a "fundamentals+news bundle" vendor (e.g. a Polygon
-add-on, or a dedicated fundamentals API). Plug your vendor's client in here;
-the shape downstream code expects is a long-format dataframe:
+Pulls quarterly financials via Polygon's vX financials endpoint and reshapes
+into the long-format schema downstream code expects:
 
     symbol | ts | metric | value | source
 
 e.g. one row per (symbol, report_date, "eps_actual"), another for
 (symbol, report_date, "revenue_actual"), etc. This keeps the schema stable
-regardless of which metrics your vendor exposes.
+regardless of which metrics the vendor exposes.
 
-Usage (once implemented):
+Usage:
     python -m data.ingest.fundamentals --symbols SPY,QQQ
 """
 from __future__ import annotations
@@ -19,20 +18,64 @@ from __future__ import annotations
 import argparse
 
 import pandas as pd
+import requests
 
+from config.settings import settings
 from data.ingest.db import upsert_dataframe
+
+POLYGON_FINANCIALS_URL = "https://api.polygon.io/vX/reference/financials"
+
+# Metric -> path within a Polygon financials result's `financials` block.
+_METRIC_PATHS = {
+    "eps_actual": ("income_statement", "diluted_earnings_per_share", "value"),
+    "revenue_actual": ("income_statement", "revenues", "value"),
+    "net_income": ("income_statement", "net_income_loss", "value"),
+    "gross_profit": ("income_statement", "gross_profit", "value"),
+    "total_assets": ("balance_sheet", "assets", "value"),
+    "total_liabilities": ("balance_sheet", "liabilities", "value"),
+}
 
 
 def fetch_fundamentals(symbols: list[str]) -> pd.DataFrame:
     """
-    Replace this with a real vendor call. Must return columns:
-    symbol, ts (tz-aware), metric, value, source.
+    Pull quarterly financials per symbol from Polygon and reshape into
+    long format. Returns columns: symbol, ts (tz-aware), metric, value, source.
     """
-    raise NotImplementedError(
-        "Wire up a fundamentals vendor here (e.g. Polygon fundamentals endpoint, "
-        "or your data bundle's equivalent). Expected output shape is documented "
-        "in this module's docstring."
-    )
+    rows: list[dict] = []
+    for symbol in symbols:
+        params = {
+            "ticker": symbol,
+            "timeframe": "quarterly",
+            "limit": 20,
+            "apiKey": settings.polygon_api_key,
+        }
+        resp = requests.get(POLYGON_FINANCIALS_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+
+        for report in results:
+            report_date = report.get("end_date") or report.get("filing_date")
+            if not report_date:
+                continue
+            financials = report.get("financials", {})
+            for metric, (statement, field, subfield) in _METRIC_PATHS.items():
+                value = financials.get(statement, {}).get(field, {}).get(subfield)
+                if value is None:
+                    continue
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "ts": report_date,
+                        "metric": metric,
+                        "value": value,
+                        "source": "polygon",
+                    }
+                )
+
+    df = pd.DataFrame(rows, columns=["symbol", "ts", "metric", "value", "source"])
+    if not df.empty:
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    return df
 
 
 def ingest_fundamentals(symbols: list[str]) -> int:

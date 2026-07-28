@@ -1,5 +1,18 @@
 -- Phase 1: core hypertables. Run via `python -m data.schema.migrate`.
-CREATE EXTENSION IF NOT EXISTS timescaledb;
+--
+-- TimescaleDB is optional here: if the extension isn't installed (e.g. local
+-- dev on a platform where TimescaleDB won't build), every create_hypertable
+-- call below is skipped and these stay as plain Postgres tables. All the
+-- Python code just reads/writes rows through SQLAlchemy/pandas either way,
+-- so nothing downstream depends on hypertable-specific behavior — it's a
+-- partitioning/performance optimization for production scale, not a
+-- correctness requirement.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb') THEN
+        CREATE EXTENSION IF NOT EXISTS timescaledb;
+    END IF;
+END $$;
 
 -- Raw daily OHLCV bars per symbol.
 CREATE TABLE IF NOT EXISTS prices (
@@ -14,7 +27,12 @@ CREATE TABLE IF NOT EXISTS prices (
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (symbol, ts)
 );
-SELECT create_hypertable('prices', 'ts', if_not_exists => TRUE);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+        PERFORM create_hypertable('prices', 'ts', if_not_exists => TRUE);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_prices_symbol_ts ON prices (symbol, ts DESC);
 
 -- Fundamentals snapshots (sparse — e.g. quarterly).
@@ -27,7 +45,12 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (symbol, ts, metric)
 );
-SELECT create_hypertable('fundamentals', 'ts', if_not_exists => TRUE);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+        PERFORM create_hypertable('fundamentals', 'ts', if_not_exists => TRUE);
+    END IF;
+END $$;
 
 -- News / filing events with an attached sentiment/surprise score.
 CREATE TABLE IF NOT EXISTS news_events (
@@ -41,7 +64,12 @@ CREATE TABLE IF NOT EXISTS news_events (
     ingested_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (id, ts)
 );
-SELECT create_hypertable('news_events', 'ts', if_not_exists => TRUE);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+        PERFORM create_hypertable('news_events', 'ts', if_not_exists => TRUE);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_news_symbol_ts ON news_events (symbol, ts DESC);
 
 -- Macro calendar (FOMC, CPI, jobs report, etc).
@@ -52,7 +80,12 @@ CREATE TABLE IF NOT EXISTS macro_calendar (
     notes       TEXT,
     PRIMARY KEY (event_name, ts)
 );
-SELECT create_hypertable('macro_calendar', 'ts', if_not_exists => TRUE);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+        PERFORM create_hypertable('macro_calendar', 'ts', if_not_exists => TRUE);
+    END IF;
+END $$;
 
 -- Engineered feature store, versioned by feature_set_id so any historical
 -- model run can be reproduced exactly (Phase 2, point 5 of the plan).
@@ -65,7 +98,12 @@ CREATE TABLE IF NOT EXISTS features (
     computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (symbol, ts, feature_set_id, feature_name)
 );
-SELECT create_hypertable('features', 'ts', if_not_exists => TRUE);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+        PERFORM create_hypertable('features', 'ts', if_not_exists => TRUE);
+    END IF;
+END $$;
 
 -- Every live/paper decision, logged at decision time (Phase 6, point 2).
 CREATE TABLE IF NOT EXISTS decisions (
@@ -81,4 +119,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     mode              TEXT        NOT NULL,  -- 'paper' | 'live'
     PRIMARY KEY (id, ts)
 );
-SELECT create_hypertable('decisions', 'ts', if_not_exists => TRUE);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+        PERFORM create_hypertable('decisions', 'ts', if_not_exists => TRUE);
+    END IF;
+END $$;

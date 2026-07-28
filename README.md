@@ -14,6 +14,11 @@ Fully working now:
 - Docker-composed TimescaleDB + MLflow (Phase 0)
 - DB schema + migrations (Phase 1)
 - Price ingestion (Alpaca or yfinance fallback) with upsert + validators (Phase 1)
+- Fundamentals + news ingestion via Polygon (needs `POLYGON_API_KEY`) (Phase 1)
+- Headline sentiment scoring via Claude (needs `ANTHROPIC_API_KEY`) (Phase 2)
+- Macro calendar: FOMC dates scraped from federalreserve.gov, CPI/Jobs dates
+  from FRED's API (needs `FRED_API_KEY` — bls.gov itself blocks scraping),
+  monthly systemd timer in `infra/systemd/macro-calendar-refresh.*` (Phase 1)
 - Quant feature functions: momentum, volatility, mean-reversion (Phase 2)
 - Leveraged-ETF **daily-reset decay simulator** — the thing the plan calls
   out as the #1 modeling mistake (Phase 4)
@@ -22,19 +27,20 @@ Fully working now:
 - Position sizing + circuit breakers (Phase 5)
 - Alpaca paper/live broker wrapper (Phase 5)
 - **IBKR broker wrapper** via TWS/IB Gateway (default; same ports as Blue Chip bot)
+- Streamlit monitoring dashboard: decisions, price history, forecast-accuracy
+  trend, equity/drawdown chart, circuit-breaker status panel (Phase 8) — the
+  latter two need `monitoring.equity.record_equity_snapshot()` and
+  `monitoring.breaker_state.check_and_record_breakers()` wired into the
+  execution loop once paper trading is running, to have data to show
+- Slack alerting (needs `SLACK_WEBHOOK_URL`)
 - Unit tests for the highest-risk modules (decay sim, validators, sizing,
-  circuit breakers)
+  circuit breakers) plus the vendor-integration and reconciliation modules
+  added above
 
 Stubbed with a clear interface, needs a vendor/API key + your judgment calls:
-- Fundamentals ingestion
-- News ingestion + sentiment scoring (needs an LLM or fine-tuned classifier)
-- Macro calendar (seeded with a few example FOMC/CPI/jobs dates — replace
-  with a real feed)
 - Regime (trend-vs-chop) classifier (rule-based ADX stub — swap in a trained
-  model once you have walk-forward infra validated)
-- Streamlit monitoring dashboard (reads real tables, but has placeholder
-  layout — polish once you have live data flowing)
-- Slack/email alerting (webhook stub)
+  model once you have walk-forward infra validated and labeled regime history;
+  no vendor needed, this one's a training-data problem, not an API problem)
 
 ## Quickstart
 

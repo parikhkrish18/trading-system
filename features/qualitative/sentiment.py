@@ -1,39 +1,69 @@
 """
-Phase 2 qualitative features — STUB.
+Phase 2 qualitative features.
 
 Turns raw headlines/filing text (from `news_events`) into a numeric
-sentiment/surprise score per (symbol, day). Two reasonable approaches:
+sentiment score per (symbol, day), via batched calls to Claude (cheap model —
+this is a high-volume, low-value-per-call task, so cost matters more than
+for the core forecast model).
 
-  1. LLM-based: prompt an LLM per headline/article for a sentiment score in
-     [-1, 1], batched, with a cheap model — this is a high-volume, low-value-
-     per-call task, so cost matters more than for the core forecast model.
-  2. Fine-tuned classifier: cheaper at scale once you have labeled data
-     (e.g. label by subsequent short-horizon return as a proxy target).
-
-Either way, keep this as a separate pass from ingestion (see
-data/ingest/news.py) so you can re-score historical news with a better
-model without re-pulling raw data.
+Kept as a separate pass from ingestion (see data/ingest/news.py) so you can
+re-score historical news with a better model without re-pulling raw data.
 """
 from __future__ import annotations
 
-import pandas as pd
+import json
 
+import pandas as pd
+from anthropic import Anthropic
+
+from config.settings import settings
 from data.ingest.db import get_engine
+
+_MODEL = "claude-haiku-4-5"
+_BATCH_SIZE = 20
+
+_SYSTEM_PROMPT = (
+    "You are scoring financial news headlines for sentiment. For each "
+    "headline, assign a sentiment score from -1.0 (very negative for the "
+    "stock) to 1.0 (very positive for the stock), 0.0 for neutral/mixed. "
+    "Respond with ONLY a JSON array of objects: "
+    '[{"id": <id>, "sentiment": <float>}, ...], one entry per headline, '
+    "in the same order given. No other text."
+)
+
+
+def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, float]:
+    items = [{"id": int(row["id"]), "symbol": row["symbol"], "headline": row["headline"]} for _, row in batch.iterrows()]
+    resp = client.messages.create(
+        model=_MODEL,
+        max_tokens=1024,
+        system=_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": json.dumps(items)}],
+    )
+    text = resp.content[0].text
+    scores = json.loads(text)
+    return {int(s["id"]): float(s["sentiment"]) for s in scores}
 
 
 def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
     """
     Input: dataframe with at least ['id', 'ts', 'symbol', 'headline'].
     Output: same rows plus a 'sentiment' column in [-1, 1].
-
-    Replace this with a real call to your chosen scorer (LLM API or
-    fine-tuned classifier inference).
     """
-    raise NotImplementedError(
-        "Wire up an LLM call or fine-tuned classifier here. Keep this function "
-        "pure (dataframe in, dataframe out) so it's easy to unit test with a "
-        "handful of hand-labeled examples before trusting it in the pipeline."
-    )
+    if headlines.empty:
+        return headlines.assign(sentiment=pd.Series(dtype=float))
+
+    client = Anthropic(api_key=settings.anthropic_api_key)
+    scored = headlines.copy()
+    scored["sentiment"] = pd.NA
+
+    for start in range(0, len(headlines), _BATCH_SIZE):
+        batch = headlines.iloc[start : start + _BATCH_SIZE]
+        id_to_score = _score_batch(client, batch)
+        for row_id, score in id_to_score.items():
+            scored.loc[scored["id"] == row_id, "sentiment"] = score
+
+    return scored
 
 
 def backfill_unscored_news(batch_size: int = 500) -> int:

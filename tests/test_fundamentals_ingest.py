@@ -1,0 +1,93 @@
+import pandas as pd
+
+from data.ingest import fundamentals
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def _polygon_report(end_date: str, eps: float, revenue: float) -> dict:
+    return {
+        "end_date": end_date,
+        "financials": {
+            "income_statement": {
+                "diluted_earnings_per_share": {"value": eps},
+                "revenues": {"value": revenue},
+            }
+        },
+    }
+
+
+def test_fetch_fundamentals_reshapes_to_long_format(monkeypatch):
+    def fake_get(url, params=None, timeout=None):
+        assert params["ticker"] == "SPY"
+        return _FakeResponse({"results": [_polygon_report("2026-06-30", eps=2.5, revenue=1_000_000.0)]})
+
+    monkeypatch.setattr(fundamentals.requests, "get", fake_get)
+    monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
+
+    df = fundamentals.fetch_fundamentals(["SPY"])
+
+    assert list(df.columns) == ["symbol", "ts", "metric", "value", "source"]
+    assert set(df["metric"]) == {"eps_actual", "revenue_actual"}
+    assert (df["symbol"] == "SPY").all()
+    assert (df["source"] == "polygon").all()
+
+    eps_row = df.loc[df["metric"] == "eps_actual"].iloc[0]
+    assert eps_row["value"] == 2.5
+
+
+def test_fetch_fundamentals_skips_missing_metrics(monkeypatch):
+    report = {"end_date": "2026-06-30", "financials": {"income_statement": {}}}
+    monkeypatch.setattr(fundamentals.requests, "get", lambda *a, **k: _FakeResponse({"results": [report]}))
+    monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
+
+    df = fundamentals.fetch_fundamentals(["SPY"])
+    assert df.empty
+
+
+def test_fetch_fundamentals_skips_reports_without_a_date(monkeypatch):
+    report = {"financials": {"income_statement": {"revenues": {"value": 100.0}}}}
+    monkeypatch.setattr(fundamentals.requests, "get", lambda *a, **k: _FakeResponse({"results": [report]}))
+    monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
+
+    df = fundamentals.fetch_fundamentals(["SPY"])
+    assert df.empty
+
+
+def test_ingest_fundamentals_upserts_with_correct_conflict_cols(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals,
+        "fetch_fundamentals",
+        lambda symbols: pd.DataFrame(
+            {
+                "symbol": ["SPY"],
+                "ts": pd.to_datetime(["2026-06-30"], utc=True),
+                "metric": ["eps_actual"],
+                "value": [2.5],
+                "source": ["polygon"],
+            }
+        ),
+    )
+    captured = {}
+
+    def fake_upsert(df, table, conflict_cols):
+        captured["table"] = table
+        captured["conflict_cols"] = conflict_cols
+        return len(df)
+
+    monkeypatch.setattr(fundamentals, "upsert_dataframe", fake_upsert)
+
+    n = fundamentals.ingest_fundamentals(["SPY"])
+
+    assert n == 1
+    assert captured["table"] == "fundamentals"
+    assert captured["conflict_cols"] == ["symbol", "ts", "metric"]

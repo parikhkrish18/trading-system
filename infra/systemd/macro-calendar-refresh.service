@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly macro calendar refresh (FOMC + CPI/Jobs dates) for trading-system
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/trading-system
+EnvironmentFile=/opt/trading-system/.env
+ExecStart=/opt/trading-system/.venv/bin/python -m data.ingest.macro_calendar --scrape --months-ahead 6

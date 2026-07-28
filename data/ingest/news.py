@@ -1,36 +1,75 @@
 """
-Phase 1 news puller — STUB.
+Phase 1 news puller — Polygon.io.
 
-Plug a news/filing vendor in here. The `sentiment` and `surprise` columns
-are left NULL at ingest time — they get filled in by
+Pulls ticker news via Polygon's news endpoint. The `sentiment` and
+`surprise` columns are left NULL at ingest time — they get filled in by
 features/qualitative/sentiment.py as a separate pass, so re-scoring with a
 better model later doesn't require re-pulling raw news.
 
 Expected output shape:
     symbol | ts | headline | source
 
-Usage (once implemented):
+Usage:
     python -m data.ingest.news --symbols SPY,QQQ --since-hours 24
 """
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import hashlib
 
 import pandas as pd
+import requests
 
+from config.settings import settings
 from data.ingest.db import upsert_dataframe
+
+POLYGON_NEWS_URL = "https://api.polygon.io/v2/reference/news"
+
+
+def _stable_id(polygon_article_id: str) -> int:
+    """
+    news_events.id is a BIGSERIAL used as an upsert conflict key. Polygon's
+    article id is a string, so hash it into a stable bigint — this makes
+    re-pulling the same article idempotent instead of inserting a duplicate
+    row with a fresh auto-generated id each time.
+    """
+    digest = hashlib.sha256(polygon_article_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) >> 1  # fits signed bigint
 
 
 def fetch_news(symbols: list[str], since_hours: int) -> pd.DataFrame:
     """
-    Replace with a real vendor call (news API, filings feed, etc).
-    Must return columns: symbol, ts (tz-aware), headline, source.
+    Pull recent news per symbol from Polygon.
+    Returns columns: id, symbol, ts (tz-aware), headline, source.
     """
-    raise NotImplementedError(
-        "Wire up a news/filings vendor here. Expected output shape documented "
-        "in this module's docstring. sentiment/surprise are filled in later by "
-        "features/qualitative/sentiment.py, not at ingest time."
-    )
+    since = dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=since_hours)
+    rows: list[dict] = []
+
+    for symbol in symbols:
+        params = {
+            "ticker": symbol,
+            "published_utc.gte": since.isoformat(),
+            "limit": 1000,
+            "apiKey": settings.polygon_api_key,
+        }
+        resp = requests.get(POLYGON_NEWS_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        rows.extend(
+            {
+                "id": _stable_id(article["id"]),
+                "symbol": symbol,
+                "ts": article["published_utc"],
+                "headline": article.get("title", ""),
+                "source": "polygon",
+            }
+            for article in resp.json().get("results", [])
+        )
+
+    df = pd.DataFrame(rows, columns=["id", "symbol", "ts", "headline", "source"])
+    if not df.empty:
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    return df
 
 
 def ingest_news(symbols: list[str], since_hours: int = 24) -> int:

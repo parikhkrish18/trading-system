@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     # --- Data vendors ---
     polygon_api_key: str = Field(default="", alias="POLYGON_API_KEY")
     fundamentals_news_api_key: str = Field(default="", alias="FUNDAMENTALS_NEWS_API_KEY")
+    # Free key: https://fred.stlouisfed.org/docs/api/api_key.html — used for
+    # CPI/jobs release dates in data/ingest/macro_calendar.py (BLS's own site
+    # blocks automated requests, see that module's docstring).
+    fred_api_key: str = Field(default="", alias="FRED_API_KEY")
+
+    # --- LLM (sentiment scoring) ---
+    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 
     # --- DB ---
     db_host: str = Field(default="localhost", alias="DB_HOST")

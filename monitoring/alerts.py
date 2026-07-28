@@ -1,8 +1,7 @@
 """
 Alerting for: circuit breaker triggers, data pipeline failures, and any
-position exceeding risk limits (Phase 8, point 2). Slack is implemented
-directly (just a webhook POST); email is left as a stub since it needs an
-SMTP/SES/etc choice the team hasn't made yet.
+position exceeding risk limits (Phase 8, point 2). Delivered via Slack
+webhook.
 """
 from __future__ import annotations
 
@@ -35,14 +34,6 @@ def send_slack_alert(message: str, severity: str = "warning") -> bool:
     except requests.RequestException:
         logger.exception("Failed to send Slack alert: %s", text)
         return False
-
-
-def send_email_alert(subject: str, body: str, to: str) -> bool:
-    """
-    STUB — wire up SMTP, SES, SendGrid, or whichever the team picks.
-    Keep the same (subject, body, to) -> bool shape so callers don't change.
-    """
-    raise NotImplementedError("Choose and wire up an email provider (SES/SendGrid/SMTP).")
 
 
 def alert_circuit_breaker(reason: str) -> None:

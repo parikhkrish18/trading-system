@@ -12,6 +12,9 @@ import pandas as pd
 import streamlit as st
 
 from data.ingest.db import get_engine
+from monitoring.breaker_state import load_latest_breaker_state
+from monitoring.equity import load_equity_curve
+from monitoring.forecast_accuracy import compute_forecast_accuracy
 
 st.set_page_config(page_title="Trading System Monitor", layout="wide")
 st.title("Trading System — Monitoring")
@@ -69,7 +72,54 @@ if symbols:
         pivot = prices.pivot(index="ts", columns="symbol", values="close").sort_index()
         st.line_chart(pivot)
 
-st.caption(
-    "TODO once live: model forecast-accuracy trend, drawdown chart from equity "
-    "curve, and a circuit-breaker status panel wired to risk/circuit_breakers.py."
-)
+st.subheader("Model forecast-accuracy trend")
+if decisions.empty or not symbols:
+    st.info("Needs both logged decisions and price history above to compute.")
+else:
+    forecasted = decisions.dropna(subset=["forecast"])[["symbol", "ts", "forecast"]]
+    accuracy = compute_forecast_accuracy(forecasted, load_recent_prices(symbols, limit_days=400))
+    if accuracy.empty:
+        st.info("No decision has a matured forward return yet (needs at least one price bar after the decision timestamp).")
+    else:
+        st.metric("Directional hit rate (sign of forecast vs. sign of next-bar return)", f"{accuracy['hit'].mean():.1%}")
+        rolling_hit_rate = accuracy.sort_values("ts").set_index("ts")["hit"].astype(float).rolling(20, min_periods=5).mean()
+        st.line_chart(rolling_hit_rate.rename("rolling_20_hit_rate"))
+
+st.subheader("Equity curve & drawdown")
+equity = load_equity_curve()
+if equity.empty:
+    st.info(
+        "No equity snapshots recorded yet — call "
+        "monitoring.equity.record_equity_snapshot(equity_value, mode) from the "
+        "execution loop once paper trading is running."
+    )
+else:
+    equity = equity.sort_values("ts")
+    running_peak = equity["equity_value"].cummax()
+    drawdown = (equity["equity_value"] / running_peak - 1).rename("drawdown")
+    st.line_chart(equity.set_index("ts")["equity_value"])
+    st.line_chart(pd.DataFrame({"drawdown": drawdown.values}, index=equity["ts"]))
+
+st.subheader("Circuit breaker status")
+breaker_state = load_latest_breaker_state()
+if breaker_state.empty:
+    st.info(
+        "No breaker checks recorded yet — call "
+        "monitoring.breaker_state.check_and_record_breakers(...) from the "
+        "execution loop in place of risk.circuit_breakers.run_all_breakers(...)."
+    )
+else:
+    latest_per_breaker = breaker_state.sort_values("ts").groupby("breaker_name", as_index=False).tail(1)
+    for _, row in latest_per_breaker.sort_values("breaker_name").iterrows():
+        label = f"{row['breaker_name']} — last checked {row['ts']}"
+        if row["triggered"]:
+            st.error(f"TRIGGERED — {row['reason']} ({label})")
+        else:
+            st.success(f"OK ({label})")
+
+    with st.expander("Recent breaker trip history"):
+        tripped = breaker_state[breaker_state["triggered"]].sort_values("ts", ascending=False)
+        if tripped.empty:
+            st.write("No trips in recorded history.")
+        else:
+            st.dataframe(tripped, use_container_width=True)

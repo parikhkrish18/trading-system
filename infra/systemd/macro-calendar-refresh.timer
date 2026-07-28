@@ -1,0 +1,11 @@
+[Unit]
+Description=Run macro-calendar-refresh.service monthly
+
+[Timer]
+# 1st of the month, 06:00 UTC. FOMC/CPI/jobs schedules move rarely enough
+# that monthly is plenty; re-run manually after any FOMC schedule change.
+OnCalendar=*-*-01 06:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
