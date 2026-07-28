@@ -76,8 +76,10 @@ class AlpacaBroker:
         """
         Submits a single market order to move from the current position in
         `symbol` to `target_shares`. Returns the order dict, or None if no
-        trade was needed. Uses whole shares — extend to fractional if your
-        universe needs it, Alpaca supports fractional for many symbols.
+        trade was needed. Fractional shares by default (Alpaca supports it
+        for most symbols) — except orders that open or increase a short
+        position, which Alpaca rejects outright if fractional ("fractional
+        orders cannot be sold short"); those get rounded to whole shares.
         """
         current_positions = self.get_positions()
         current_shares = current_positions.get(symbol, 0.0)
@@ -88,6 +90,12 @@ class AlpacaBroker:
 
         side = OrderSide.BUY if delta > 0 else OrderSide.SELL
         qty = abs(round(delta, 4))
+
+        if side == OrderSide.SELL and target_shares < 0:
+            qty = float(int(round(qty)))
+            if qty < 1:
+                logger.info("Skipping %s: rounds to 0 whole shares for a short order.", symbol)
+                return None
 
         logger.info(
             "Submitting %s order: %s %s shares (mode=%s, current=%s, target=%s)",
