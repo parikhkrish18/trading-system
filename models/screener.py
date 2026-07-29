@@ -20,9 +20,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import json
 from collections.abc import Callable
 
 import pandas as pd
+from sqlalchemy.dialects.postgresql import JSONB
 
 from config.settings import settings
 from data.ingest.db import get_engine
@@ -43,6 +45,11 @@ class TradeCandidate:
     direction_agreement: float
     conviction_score: float
     target_position_pct: float
+    # Top contributing features (LightGBM pred_contrib — genuine per-prediction
+    # Tree SHAP, not just global feature importance), populated by run_screen.
+    # None for candidates built via the legacy select_trades() path, which
+    # doesn't have an ensemble/feature frame in scope to compute this from.
+    reasoning: list[dict] | None = None
 
 
 def load_latest_features(feature_set_id: str, symbols: list[str]) -> pd.DataFrame:
@@ -240,6 +247,39 @@ def select_concentrated_trades(
     return [_make_candidate(row, weight, total_deploy_pct) for row, weight in zip(picks, weights, strict=False)]
 
 
+def _attach_reasoning(
+    candidates: list[TradeCandidate],
+    ensemble: EnsembleForecastModel,
+    latest_features: pd.DataFrame,
+    feature_cols: list[str],
+    top_n: int = 5,
+) -> None:
+    """
+    Mutates each candidate in place, attaching the top `top_n` features by
+    |contribution| (LightGBM pred_contrib) — this is what actually answers
+    "why did the model pick this," not just the final forecast number.
+    """
+    if not candidates:
+        return
+
+    symbols = [c.symbol for c in candidates]
+    rows = latest_features.set_index("symbol").loc[symbols]
+    X = rows.reindex(columns=feature_cols)
+    contributions = ensemble.predict_contributions(X)
+
+    for candidate in candidates:
+        contrib_row = contributions.loc[candidate.symbol].drop("base_value")
+        top_features = contrib_row.abs().sort_values(ascending=False).head(top_n).index
+        candidate.reasoning = [
+            {
+                "feature_name": feat,
+                "value": None if pd.isna(rows.loc[candidate.symbol, feat]) else float(rows.loc[candidate.symbol, feat]),
+                "contribution": float(contrib_row[feat]),
+            }
+            for feat in top_features
+        ]
+
+
 def run_screen(
     feature_set_id: str,
     symbols: list[str],
@@ -271,16 +311,18 @@ def run_screen(
 
     total_deploy_pct = regime_adjusted_size(1.0, regime)
 
-    return select_concentrated_trades(
+    candidates = select_concentrated_trades(
         scored,
         max_leg_pct=settings.max_concentrated_position_pct,
         min_leg_pct=settings.min_concentrated_position_pct,
         total_deploy_pct=total_deploy_pct,
         is_shortable_fn=is_shortable_fn,
     )
+    _attach_reasoning(candidates, ensemble, latest, feature_cols)
+    return candidates
 
 
-def log_candidates(candidates: list[TradeCandidate], feature_set_id: str, mode: str = "paper") -> int:
+def log_candidates(candidates: list[TradeCandidate], feature_set_id: str, mode: str = "paper", regime: str | None = None) -> int:
     """Writes the shortlist to the decisions table — proposed, not executed (executed_position left null)."""
     if not candidates:
         return 0
@@ -292,16 +334,17 @@ def log_candidates(candidates: list[TradeCandidate], feature_set_id: str, mode: 
             "feature_set_id": feature_set_id,
             "model_version": _MODEL_VERSION,
             "forecast": c.predicted_return,
-            "regime": None,
+            "regime": regime,
             "target_position": c.target_position_pct,
             "executed_position": None,
             "mode": mode,
+            "reasoning": json.dumps(c.reasoning) if c.reasoning is not None else None,
         }
         for c in candidates
     ]
     df = pd.DataFrame(rows)
     engine = get_engine()
-    df.to_sql("decisions", engine, if_exists="append", index=False)
+    df.to_sql("decisions", engine, if_exists="append", index=False, dtype={"reasoning": JSONB})
     return len(rows)
 
 

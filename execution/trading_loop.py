@@ -18,10 +18,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import json
 import logging
 import time
 
 import pandas as pd
+from sqlalchemy.dialects.postgresql import JSONB
 
 from config.settings import settings
 from data.ingest.db import get_engine
@@ -118,7 +120,7 @@ def _flatten_and_alert(broker, reason: str) -> None:
     record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
 
 
-def _log_decisions(candidates, executed: dict[str, float], feature_set_id: str, mode: str) -> None:
+def _log_decisions(candidates, executed: dict[str, float], feature_set_id: str, mode: str, regime: str) -> None:
     if not candidates:
         return
     now = dt.datetime.now(tz=dt.UTC)
@@ -129,14 +131,15 @@ def _log_decisions(candidates, executed: dict[str, float], feature_set_id: str, 
             "feature_set_id": feature_set_id,
             "model_version": _MODEL_VERSION,
             "forecast": c.predicted_return,
-            "regime": None,
+            "regime": regime,
             "target_position": c.target_position_pct,
             "executed_position": executed.get(c.symbol),
             "mode": mode,
+            "reasoning": json.dumps(c.reasoning) if c.reasoning is not None else None,
         }
         for c in candidates
     ]
-    pd.DataFrame(rows).to_sql("decisions", get_engine(), if_exists="append", index=False)
+    pd.DataFrame(rows).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
 
 def run_cycle(
@@ -211,7 +214,7 @@ def run_cycle(
 
     time.sleep(5)  # let paper fills settle before reading positions back
     actual_positions = broker.get_positions()
-    _log_decisions(candidates, actual_positions, feature_set_id, broker.mode)
+    _log_decisions(candidates, actual_positions, feature_set_id, broker.mode, regime)
 
     reconciliation = reconcile_positions(intended_shares, actual_positions)
     reconciliation_summary = summarize(reconciliation)

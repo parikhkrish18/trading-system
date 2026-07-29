@@ -15,6 +15,13 @@ class _FakeAsset:
 class _FakePosition:
     symbol: str
     qty: float
+    side: str = "long"
+    avg_entry_price: float = 0.0
+    current_price: float = 0.0
+    market_value: float = 0.0
+    cost_basis: float = 0.0
+    unrealized_pl: float = 0.0
+    unrealized_plpc: float = 0.0
 
 
 @dataclass
@@ -222,3 +229,28 @@ def test_submit_target_position_extended_hours_raises_without_a_quote(monkeypatc
 
     with pytest.raises(RuntimeError, match="No quote available"):
         broker.submit_target_position("AAPL", 5.0)
+
+
+def test_get_positions_detailed_maps_all_fields(monkeypatch):
+    broker, client = _make_broker(monkeypatch)
+    client.get_all_positions = lambda: [
+        _FakePosition(
+            symbol="TSLA", qty=68.721, side="long", avg_entry_price=306.72,
+            current_price=308.63, market_value=21209.36, cost_basis=21077.98,
+            unrealized_pl=131.38, unrealized_plpc=0.00623,
+        )
+    ]
+
+    result = broker.get_positions_detailed()
+
+    assert len(result) == 1
+    pos = result[0]
+    assert pos["symbol"] == "TSLA"
+    assert pos["side"] == "long"
+    assert pos["qty"] == 68.721
+    assert pos["unrealized_pl"] == pytest.approx(131.38)
+
+
+def test_get_positions_detailed_empty_when_no_positions(monkeypatch):
+    broker, _ = _make_broker(monkeypatch)
+    assert broker.get_positions_detailed() == []

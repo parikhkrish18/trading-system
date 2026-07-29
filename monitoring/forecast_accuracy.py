@@ -1,6 +1,11 @@
 """
-Pure computation for the dashboard's forecast-accuracy panel, split out of
-monitoring/dashboard/app.py so it's unit-testable without a Streamlit/DB context.
+Pure computation for the dashboard's live forecast-accuracy panel (how
+often recent real decisions' predicted direction matched what actually
+happened) — kept separate from monitoring/dashboard/server.py so it's
+unit-testable without a DB/HTTP context. Complements, not replaces, the
+walk-forward backtest metrics in MLflow (server.py's /api/analysis/runs):
+this measures live decisions after the fact, walk-forward measures the
+model on held-out history before any of them were made.
 """
 from __future__ import annotations
 

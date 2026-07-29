@@ -67,6 +67,29 @@ class AlpacaBroker:
         positions = self.client.get_all_positions()
         return {p.symbol: float(p.qty) for p in positions}
 
+    def get_positions_detailed(self) -> list[dict]:
+        """
+        Richer than get_positions() (which stays {symbol: qty} exactly as-is
+        since execution/reconciliation.py and trading_loop.py depend on that
+        contract) — for display purposes, e.g. the dashboard's position
+        overview: entry price, live price, P&L, market value.
+        """
+        positions = self.client.get_all_positions()
+        return [
+            {
+                "symbol": p.symbol,
+                "qty": float(p.qty),
+                "side": str(p.side.value) if hasattr(p.side, "value") else str(p.side),
+                "avg_entry_price": float(p.avg_entry_price),
+                "current_price": float(p.current_price),
+                "market_value": float(p.market_value),
+                "cost_basis": float(p.cost_basis),
+                "unrealized_pl": float(p.unrealized_pl),
+                "unrealized_plpc": float(p.unrealized_plpc),
+            }
+            for p in positions
+        ]
+
     def get_portfolio_value(self) -> float:
         return float(self.client.get_account().equity)
 

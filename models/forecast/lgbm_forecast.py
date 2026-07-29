@@ -67,6 +67,20 @@ class ForecastModel:
         importances = self.model.feature_importance(importance_type="gain")
         return pd.Series(importances, index=self.feature_names).sort_values(ascending=False)
 
+    def predict_contributions(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Per-prediction, per-feature contribution values (Tree SHAP, via
+        LightGBM's pred_contrib) — genuine "why did the model predict this"
+        for a single row, not just global feature importance. Columns are
+        X's features plus a trailing "base_value" column; each row's
+        contributions + base_value sum to that row's raw prediction.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not trained yet.")
+        contrib = self.model.predict(X, pred_contrib=True, num_iteration=self.model.best_iteration or None)
+        columns = [*self.feature_names, "base_value"]
+        return pd.DataFrame(contrib, columns=columns, index=X.index)
+
     def save(self, path: str) -> None:
         if self.model is None:
             raise RuntimeError("Model not trained yet.")

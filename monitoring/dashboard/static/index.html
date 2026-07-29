@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trading System Monitor</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Trading System Monitor</h1>
+    <div class="topbar-right">
+      <span id="mode-badge" class="badge">…</span>
+      <button id="refresh-btn" class="btn">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="positions-section">
+      <h2>Positions <span class="muted" id="positions-count"></span></h2>
+      <div id="positions-summary" class="summary-row"></div>
+      <div id="positions-list" class="positions-grid"></div>
+    </section>
+
+    <section id="equity-section">
+      <h2>Equity &amp; Drawdown</h2>
+      <div class="summary-row" id="equity-summary"></div>
+      <div class="chart-pair">
+        <div class="chart-box">
+          <h3>Equity</h3>
+          <div id="equity-chart"></div>
+        </div>
+        <div class="chart-box">
+          <h3>Drawdown</h3>
+          <div id="drawdown-chart"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="breakers-section">
+      <h2>Circuit Breakers</h2>
+      <div id="breakers-list" class="breakers-grid"></div>
+    </section>
+
+    <section id="analysis-section">
+      <h2>Model Analysis <span class="muted">(walk-forward folds, MLflow)</span></h2>
+      <div class="chart-box">
+        <h3>Directional accuracy over time</h3>
+        <div id="analysis-chart"></div>
+      </div>
+      <div class="table-wrap">
+        <table id="analysis-table">
+          <thead>
+            <tr>
+              <th>Fold</th><th>Feature set</th><th>Test window</th>
+              <th>MAE</th><th>RMSE</th><th>Dir. acc.</th><th>Dir. acc. (confident)</th><th>% confident</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="decisions-section">
+      <h2>Decision History</h2>
+      <div class="summary-row" id="live-accuracy-summary"></div>
+      <div class="filter-row">
+        <input id="decision-symbol-filter" placeholder="Filter by symbol (e.g. TSLA)" />
+        <button id="decision-filter-btn" class="btn btn-secondary">Filter</button>
+      </div>
+      <div class="table-wrap">
+        <table id="decisions-table">
+          <thead>
+            <tr>
+              <th>Time</th><th>Symbol</th><th>Forecast</th><th>Regime</th>
+              <th>Target</th><th>Executed</th><th>Mode</th><th>Reasoning</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="tests-section">
+      <h2>Test Suite</h2>
+      <div class="summary-row">
+        <div id="test-status" class="stat-card">Never run</div>
+        <button id="run-tests-btn" class="btn">Run tests now</button>
+      </div>
+      <details id="test-output-wrap">
+        <summary>Full output</summary>
+        <pre id="test-output"></pre>
+      </details>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

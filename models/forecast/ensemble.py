@@ -75,3 +75,10 @@ class EnsembleForecastModel:
             raise RuntimeError("Ensemble not trained yet.")
         importances = pd.concat([m.feature_importance() for m in self.models], axis=1)
         return importances.mean(axis=1).sort_values(ascending=False)
+
+    def predict_contributions(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Per-feature contributions (see ForecastModel.predict_contributions), averaged across members."""
+        if not self.models:
+            raise RuntimeError("Ensemble not trained yet — call fit() first.")
+        contribs = [m.predict_contributions(X) for m in self.models]
+        return sum(contribs) / len(contribs)

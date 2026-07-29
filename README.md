@@ -44,10 +44,19 @@ Fully working now:
   (`models/forecast/ensemble.py`) — a single LightGBM model has no native
   confidence signal, so this trains K models with different seeds and only
   treats a prediction as trustworthy if they agree on direction (Phase 3)
-- **The screener** (`models/screener.py`): scores the full universe, ranks
-  by conviction (agreement × magnitude), sizes the shortlist via
-  `risk/sizing.py`, and logs candidates to `decisions` (mode=paper,
-  nothing executed) — it does not place orders, see Non-goals below
+- **The screener** (`models/screener.py`): scores the full universe,
+  concentrates into the top 2 highest-conviction picks (confidence-weighted
+  split, not a diversified top-10 book), and attaches genuine per-decision
+  reasoning (LightGBM `pred_contrib` — real Tree SHAP feature contributions,
+  not just global feature importance)
+- **`execution/trading_loop.py`**: takes the screener's shortlist and
+  actually places (paper) orders — pre/post-trade circuit breaker checks,
+  full rebalance (closes anything not in the new shortlist), reconciliation,
+  equity recording, extended-hours support (limit orders outside RTH, since
+  market orders aren't accepted at all then). Hard-enforced paper-only by
+  construction: never passes `confirm_live=True`. `scripts/run_weekly_cycle.py`
+  chains the full pipeline (universe/price/fundamentals/news refresh →
+  screen → trade); `infra/launchd/` schedules it weekly on macOS.
 - Long **and short** support: `MAX_SHORT_POSITION_PCT` (more conservative
   than the long cap — short losses are structurally uncapped), an
   Alpaca `is_shortable()` pre-check, IBKR's lack of an equivalent
@@ -58,11 +67,11 @@ Fully working now:
 - Position sizing + circuit breakers (Phase 5)
 - Alpaca paper/live broker wrapper (Phase 5)
 - **IBKR broker wrapper** via TWS/IB Gateway (default; same ports as Blue Chip bot)
-- Streamlit monitoring dashboard: decisions, price history, forecast-accuracy
-  trend, equity/drawdown chart, circuit-breaker status panel (Phase 8) — the
-  latter two need `monitoring.equity.record_equity_snapshot()` and
-  `monitoring.breaker_state.check_and_record_breakers()` wired into the
-  execution loop once paper trading is running, to have data to show
+- Custom monitoring dashboard (`monitoring/dashboard/server.py` — FastAPI +
+  vanilla JS, no Streamlit): every open position with live P&L and the
+  model's actual reasoning for entering it, decision history, walk-forward
+  analysis from MLflow, live directional hit-rate, equity/drawdown,
+  circuit-breaker status, and the test suite runnable on demand. `make dashboard`
 - Slack alerting (needs `SLACK_WEBHOOK_URL`)
 - Unit tests across ingestion, features, the ensemble model, the screener,
   sizing, and the highest-risk modules (decay sim, validators, circuit breakers)

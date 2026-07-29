@@ -7,26 +7,13 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/kp/Downloads/trading-system/.venv/bin/streamlit</string>
-        <string>run</string>
-        <string>monitoring/dashboard/app.py</string>
-        <string>--server.headless</string>
-        <string>true</string>
-        <string>--server.port</string>
-        <string>8501</string>
+        <string>/Users/kp/Downloads/trading-system/.venv/bin/python</string>
+        <string>-m</string>
+        <string>monitoring.dashboard.server</string>
     </array>
 
     <key>WorkingDirectory</key>
     <string>/Users/kp/Downloads/trading-system</string>
-
-    <!-- Streamlit runs the target script with its own directory on
-         sys.path, not the working directory, so `from data.ingest...`
-         imports fail without this — hit live, not hypothetical. -->
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PYTHONPATH</key>
-        <string>/Users/kp/Downloads/trading-system</string>
-    </dict>
 
     <key>StandardOutPath</key>
     <string>/Users/kp/Downloads/trading-system/logs/dashboard.log</string>

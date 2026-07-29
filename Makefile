@@ -25,4 +25,4 @@ lint:
 	ruff check .
 
 dashboard:
-	streamlit run monitoring/dashboard/app.py
+	python -m monitoring.dashboard.server

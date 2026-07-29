@@ -8,6 +8,7 @@ venv/
 mlruns/
 mlflow.db
 *.log
+logs/
 .DS_Store
 data_backfill/
 *.parquet

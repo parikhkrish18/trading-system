@@ -84,3 +84,37 @@ def test_ensemble_feature_importance_before_fit_raises():
     ensemble = EnsembleForecastModel()
     with pytest.raises(RuntimeError, match="not trained"):
         ensemble.feature_importance()
+
+
+def test_ensemble_predict_contributions_shape_and_columns():
+    X, y = _synthetic_data()
+    ensemble = EnsembleForecastModel(n_models=3, num_boost_round=20, base_seed=1)
+    ensemble.fit(X, y)
+
+    contrib = ensemble.predict_contributions(X)
+
+    assert list(contrib.columns) == ["f1", "f2", "f3", "base_value"]
+    assert list(contrib.index) == list(X.index)
+
+
+def test_ensemble_predict_contributions_sum_to_mean_prediction():
+    """
+    The core correctness property of Tree SHAP: contributions + base_value
+    reconstruct the raw prediction exactly (up to floating point) — this is
+    what makes "reasoning" honest rather than decorative.
+    """
+    X, y = _synthetic_data()
+    ensemble = EnsembleForecastModel(n_models=3, num_boost_round=20, base_seed=1)
+    ensemble.fit(X, y)
+
+    contrib = ensemble.predict_contributions(X)
+    preds = ensemble.predict(X)["mean_prediction"]
+
+    reconstructed = contrib.sum(axis=1)
+    assert (reconstructed - preds).abs().max() < 1e-6
+
+
+def test_ensemble_predict_contributions_before_fit_raises():
+    ensemble = EnsembleForecastModel()
+    with pytest.raises(RuntimeError, match="not trained"):
+        ensemble.predict_contributions(pd.DataFrame({"f1": [1.0]}))

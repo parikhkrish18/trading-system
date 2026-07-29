@@ -3,16 +3,23 @@ import pandas as pd
 import pytest
 
 from models.regime.trend_chop_classifier import TREND
-from models.screener import build_correlation_matrix, score_universe, select_concentrated_trades, select_trades
+from models.screener import (
+    _attach_reasoning,
+    build_correlation_matrix,
+    score_universe,
+    select_concentrated_trades,
+    select_trades,
+)
 
 
 class _FakeEnsemble:
     """Fakes EnsembleForecastModel.predict with a preset mapping of row index -> stats."""
 
-    def __init__(self, mean_prediction, direction_agreement, std_prediction=None):
+    def __init__(self, mean_prediction, direction_agreement, std_prediction=None, contributions=None):
         self.mean_prediction = mean_prediction
         self.direction_agreement = direction_agreement
         self.std_prediction = std_prediction if std_prediction is not None else [0.0] * len(mean_prediction)
+        self._contributions = contributions
 
     def predict(self, X):
         return pd.DataFrame(
@@ -23,6 +30,9 @@ class _FakeEnsemble:
             },
             index=X.index,
         )
+
+    def predict_contributions(self, X):
+        return self._contributions.loc[X.index]
 
 
 def test_score_universe_computes_conviction_and_confident_flag():
@@ -242,6 +252,31 @@ def test_select_concentrated_trades_skips_unshortable_and_falls_through_ranking(
 
     symbols = {c.symbol for c in candidates}
     assert symbols == {"AAPL", "MSFT"}  # TSLA skipped, next two ranked candidates picked instead
+
+
+def test_attach_reasoning_picks_top_features_by_absolute_contribution():
+    candidates = select_concentrated_trades(
+        _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]),
+        max_leg_pct=0.70, min_leg_pct=0.30,
+    )
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [1.5], "f2": [-0.5], "f3": [0.1]})
+    # Indexed by symbol, matching what _attach_reasoning's X (latest.set_index("symbol")) actually looks like.
+    contributions = pd.DataFrame(
+        {"f1": [0.03], "f2": [-0.08], "f3": [0.001], "base_value": [0.0]}, index=pd.Index(["AAPL"], name="symbol")
+    )
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
+
+    _attach_reasoning(candidates, ensemble, latest, feature_cols=["f1", "f2", "f3"], top_n=2)
+
+    reasoning = candidates[0].reasoning
+    assert [r["feature_name"] for r in reasoning] == ["f2", "f1"]  # ranked by |contribution|, f3 excluded (top_n=2)
+    assert reasoning[0]["contribution"] == pytest.approx(-0.08)
+    assert reasoning[0]["value"] == pytest.approx(-0.5)
+
+
+def test_attach_reasoning_empty_candidates_is_noop():
+    ensemble = _FakeEnsemble(mean_prediction=[], direction_agreement=[])
+    _attach_reasoning([], ensemble, pd.DataFrame(), feature_cols=[])  # should not raise
 
 
 def test_build_correlation_matrix_from_prices():
