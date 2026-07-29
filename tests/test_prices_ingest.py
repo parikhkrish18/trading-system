@@ -36,6 +36,34 @@ def test_fetch_yfinance_drops_rows_with_any_null_ohlcv_field(monkeypatch):
     assert len(df[df["symbol"] == "BADCO"]) == 2  # the null-close bar dropped, other 2 kept
 
 
+def test_fetch_yfinance_translates_dotted_tickers_to_dashes(monkeypatch):
+    """
+    Regression test, hit live: Wikipedia/Polygon/Alpaca all use "BRK.B" (the
+    SEC's own convention), but yfinance only recognizes "BRK-B" and silently
+    reports the dotted form as delisted. Symbol in our DB stays dotted.
+    """
+    import yfinance
+
+    idx = pd.bdate_range("2026-01-02", periods=2)
+    # Single-symbol yfinance response is flat (no MultiIndex columns).
+    flat = pd.DataFrame(
+        {"Open": [1, 2], "High": [1, 2], "Low": [1, 2], "Close": [1, 2], "Volume": [10, 20]}, index=idx
+    )
+    captured_symbols = {}
+
+    def fake_download(symbols, **kwargs):
+        captured_symbols["requested"] = symbols
+        return flat
+
+    monkeypatch.setattr(yfinance, "download", fake_download)
+
+    df = _fetch_yfinance(["BRK.B"], pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-05").date())
+
+    assert captured_symbols["requested"] == ["BRK-B"]  # yfinance got the dashed form
+    assert set(df["symbol"]) == {"BRK.B"}  # our data stays in canonical dotted form
+    assert len(df) == 2
+
+
 def test_fetch_yfinance_single_symbol_still_drops_null_rows(monkeypatch):
     import yfinance
 

@@ -59,6 +59,18 @@ def main() -> None:
         "--since-hours", type=int, default=24 * 8,
         help="News lookback window — default covers a week plus a day of slack.",
     )
+    parser.add_argument(
+        "--backfill-years", type=int, default=0,
+        help=(
+            "Price history window. Default 0 means the normal steady-state "
+            "top-up: just the last 7 days, assuming a prior backfill already "
+            "gave the DB its historical depth. Set this (e.g. 5) after a "
+            "fresh/truncated prices table, or every quant feature's rolling "
+            "window (10/20-day momentum etc.) comes back empty and the "
+            "trading cycle has nothing to train on — hit live, not "
+            "hypothetical."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Screen only, never place orders.")
     args = parser.parse_args()
 
@@ -70,7 +82,8 @@ def main() -> None:
         return
 
     today = dt.datetime.now(tz=dt.UTC).date()
-    run_job("price_ingest", ingest_prices, [*symbols, _REGIME_PROXY], today - dt.timedelta(days=7), today, "yfinance")
+    price_start = today.replace(year=today.year - args.backfill_years) if args.backfill_years else today - dt.timedelta(days=7)
+    run_job("price_ingest", ingest_prices, [*symbols, _REGIME_PROXY], price_start, today, "yfinance")
     run_job("fundamentals_ingest", ingest_fundamentals, symbols)
     run_job("news_ingest", ingest_news, symbols, args.since_hours)
     run_job("sentiment_backfill", backfill_unscored_news, 5000)

@@ -26,8 +26,17 @@ from data.validators.checks import run_all_validators
 def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
     import yfinance as yf
 
+    # yfinance expects dual-class tickers with a dash (BRK-B), but our
+    # canonical symbol everywhere else — Wikipedia's universe scrape,
+    # Polygon, Alpaca — uses a dot (BRK.B), matching the SEC's own
+    # convention. Translate only for this vendor's API call; store and
+    # return the canonical dotted form so downstream code never has to
+    # know this quirk exists. Hit live: BRK.B and BF.B both silently
+    # failed ("possibly delisted") before this fix.
+    yf_symbol = {s: s.replace(".", "-") for s in symbols}
+
     raw = yf.download(
-        symbols,
+        list(yf_symbol.values()),
         start=start.isoformat(),
         end=end.isoformat(),
         auto_adjust=False,
@@ -38,7 +47,7 @@ def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.Data
     frames = []
     for sym in symbols:
         try:
-            sub = raw[sym].copy() if len(symbols) > 1 else raw.copy()
+            sub = raw[yf_symbol[sym]].copy() if len(symbols) > 1 else raw.copy()
         except KeyError:
             continue
         sub = sub.rename(
