@@ -111,6 +111,47 @@ def test_run_cycle_no_candidates_returns_early(monkeypatch):
     assert broker.submitted == []
 
 
+def test_run_cycle_closes_positions_not_in_new_candidate_set(monkeypatch):
+    """
+    The core rebalance fix: switching from a top-10 diversified book to a
+    top-2 concentrated one means everything not in this cycle's shortlist
+    must actually get closed, not just left open from a prior cycle.
+    """
+    broker = _FakeBroker(positions={"OLD1": 10.0, "OLD2": -5.0, "TSLA": 3.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("TSLA", "long", 0.5)])
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"TSLA": 100.0})
+
+    result = trading_loop.run_cycle("v3", ["TSLA", "OLD1", "OLD2"])
+
+    submitted_symbols = {s for s, _ in broker.submitted}
+    assert submitted_symbols == {"OLD1", "OLD2", "TSLA"}
+    old1_order = next(shares for s, shares in broker.submitted if s == "OLD1")
+    old2_order = next(shares for s, shares in broker.submitted if s == "OLD2")
+    assert old1_order == 0.0
+    assert old2_order == 0.0
+    assert result.orders_placed == 3
+
+
+def test_run_cycle_no_candidates_still_closes_stale_positions(monkeypatch):
+    """Zero confidence this cycle should mean fully in cash, not 'leave whatever was open.'"""
+    broker = _FakeBroker(positions={"OLD1": 10.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [])
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {})
+
+    result = trading_loop.run_cycle("v3", ["OLD1"])
+
+    assert result.status == "traded"
+    assert broker.submitted == [("OLD1", 0.0)]
+
+
 def test_run_cycle_isolates_per_symbol_order_failures(monkeypatch):
     broker = _FakeBroker(submit_error_for={"BAD"})
     monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)

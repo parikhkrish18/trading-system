@@ -159,22 +159,42 @@ def run_cycle(
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
     candidates = run_screen(feature_set_id, symbols, regime=regime, is_shortable_fn=is_shortable_fn)
 
-    if not candidates:
-        logger.info("No candidates cleared the confidence bar this cycle.")
-        send_slack_alert("No confident candidates this cycle — nothing traded.", severity="info")
-        return CycleResult("no_candidates", 0, 0, None, broker.get_portfolio_value())
-
     if dry_run:
         logger.info("Dry run — %s candidate(s) screened, broker untouched.", len(candidates))
         for c in candidates:
             logger.info("  %s %s target=%.4f pred_return=%.4f agreement=%.2f", c.symbol, c.side, c.target_position_pct, c.predicted_return, c.direction_agreement)
         return CycleResult("dry_run", len(candidates), 0, None, broker.get_portfolio_value())
 
+    # Full rebalance to the new target book, not just adjustments layered on
+    # top of whatever was already open: anything currently held that isn't
+    # one of this cycle's candidates gets closed. Without this, "top 2"
+    # would only ever mean "2 new positions added," while last cycle's
+    # picks — no longer confident, by definition, since they didn't make
+    # this cycle's shortlist — would sit open indefinitely.
     portfolio_value = broker.get_portfolio_value()
-    prices = _latest_prices([c.symbol for c in candidates])
+    current_positions = broker.get_positions()
+    candidate_symbols = {c.symbol for c in candidates}
+    closing_symbols = [s for s, qty in current_positions.items() if s not in candidate_symbols and qty != 0]
+
+    if not candidates and not closing_symbols:
+        logger.info("No candidates cleared the confidence bar, and nothing open to close — staying in cash.")
+        send_slack_alert("No confident candidates this cycle — nothing traded.", severity="info")
+        return CycleResult("no_candidates", 0, 0, None, portfolio_value)
+
+    prices = _latest_prices([c.symbol for c in candidates] + closing_symbols)
 
     intended_shares: dict[str, float] = {}
     orders_placed = 0
+
+    for symbol in closing_symbols:
+        intended_shares[symbol] = 0.0
+        try:
+            order = broker.submit_target_position(symbol, 0.0)
+            if order is not None:
+                orders_placed += 1
+        except Exception:
+            logger.exception("Failed to close out-of-book position %s — continuing with the rest of the cycle.", symbol)
+
     for c in candidates:
         price = prices.get(c.symbol)
         if not price:
@@ -201,6 +221,8 @@ def run_cycle(
     new_portfolio_value = broker.get_portfolio_value()
     record_equity_snapshot(new_portfolio_value, mode=broker.mode)
 
+    total_attempted = len(candidates) + len(closing_symbols)
+
     post_trade_triggers = _run_breaker_check(broker, engine)
     if post_trade_triggers:
         reasons = "; ".join(r.reason for r in post_trade_triggers)
@@ -208,7 +230,8 @@ def run_cycle(
         return CycleResult("flattened_post_trade", len(candidates), orders_placed, reconciliation_summary, broker.get_portfolio_value())
 
     send_slack_alert(
-        f"Trading cycle complete: {orders_placed}/{len(candidates)} order(s) placed. "
+        f"Trading cycle complete: {orders_placed}/{total_attempted} order(s) placed "
+        f"({len(candidates)} candidate(s), {len(closing_symbols)} position(s) closed). "
         f"Portfolio value ${new_portfolio_value:,.2f}. {reconciliation_summary}",
         severity="info",
     )
