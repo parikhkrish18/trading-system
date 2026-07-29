@@ -25,6 +25,14 @@ class Settings(BaseSettings):
 
     trading_mode: str = Field(default="paper", alias="TRADING_MODE")  # "paper" | "live"
     broker: str = Field(default="ibkr", alias="BROKER")  # "ibkr" | "alpaca"
+    # Outside regular trading hours, market orders aren't accepted at all —
+    # only limit orders with extended_hours=True. When this is on,
+    # execution/broker_alpaca.py switches order types automatically outside
+    # RTH; when off, orders submitted outside RTH just queue as normal DAY
+    # market orders until the next open (the old, pre-extended-hours
+    # behavior). IBKR support for this isn't implemented yet — see
+    # execution/broker_ibkr.py.
+    allow_extended_hours_trading: bool = Field(default=True, alias="ALLOW_EXTENDED_HOURS_TRADING")
 
     # --- IBKR (TWS / IB Gateway socket — no REST keys) ---
     ibkr_host: str = Field(default="127.0.0.1", alias="IBKR_HOST")

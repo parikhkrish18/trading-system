@@ -17,6 +17,17 @@ class _FakePosition:
     qty: float
 
 
+@dataclass
+class _FakeClock:
+    is_open: bool = True
+
+
+@dataclass
+class _FakeQuote:
+    ask_price: float | None = 100.0
+    bid_price: float | None = 99.5
+
+
 class _FakeOrder:
     def __init__(self, **kwargs):
         self._data = kwargs
@@ -26,9 +37,10 @@ class _FakeOrder:
 
 
 class _FakeTradingClient:
-    def __init__(self, asset: _FakeAsset | None = None, positions: dict | None = None):
+    def __init__(self, asset: _FakeAsset | None = None, positions: dict | None = None, is_open: bool = True):
         self._asset = asset
         self._positions = positions or {}
+        self._is_open = is_open
         self.submitted_orders = []
 
     def get_asset(self, symbol):
@@ -37,16 +49,36 @@ class _FakeTradingClient:
     def get_all_positions(self):
         return [_FakePosition(symbol=s, qty=q) for s, q in self._positions.items()]
 
+    def get_clock(self):
+        return _FakeClock(is_open=self._is_open)
+
     def submit_order(self, order_request):
         self.submitted_orders.append(order_request)
         return _FakeOrder(symbol=order_request.symbol, qty=order_request.qty, side=str(order_request.side))
 
 
-def _make_broker(monkeypatch, asset: _FakeAsset | None = None, positions: dict | None = None) -> tuple[AlpacaBroker, _FakeTradingClient]:
+class _FakeDataClient:
+    def __init__(self, quotes: dict | None = None):
+        self._quotes = quotes or {}
+
+    def get_stock_latest_quote(self, request):
+        symbol = request.symbol_or_symbols
+        return {symbol: self._quotes.get(symbol, _FakeQuote())}
+
+
+def _make_broker(
+    monkeypatch,
+    asset: _FakeAsset | None = None,
+    positions: dict | None = None,
+    is_open: bool = True,
+    quotes: dict | None = None,
+) -> tuple[AlpacaBroker, _FakeTradingClient]:
     monkeypatch.setattr("execution.broker_alpaca.settings.alpaca_paper_api_key", "key")
     monkeypatch.setattr("execution.broker_alpaca.settings.alpaca_paper_secret_key", "secret")
-    client = _FakeTradingClient(asset, positions)
+    client = _FakeTradingClient(asset, positions, is_open=is_open)
+    data_client = _FakeDataClient(quotes)
     monkeypatch.setattr("execution.broker_alpaca.TradingClient", lambda *a, **k: client)
+    monkeypatch.setattr("execution.broker_alpaca.StockHistoricalDataClient", lambda *a, **k: data_client)
     return AlpacaBroker(mode="paper"), client
 
 
@@ -109,3 +141,84 @@ def test_live_broker_requires_confirm_live(monkeypatch):
     monkeypatch.setattr("execution.broker_alpaca.settings.alpaca_live_secret_key", "secret")
     with pytest.raises(RuntimeError, match="confirm_live"):
         AlpacaBroker(mode="live")
+
+
+def test_submit_target_position_uses_limit_order_outside_rth(monkeypatch):
+    monkeypatch.setattr("execution.broker_alpaca.settings.allow_extended_hours_trading", True)
+    broker, client = _make_broker(monkeypatch, is_open=False, quotes={"AAPL": _FakeQuote(ask_price=100.0, bid_price=99.5)})
+
+    broker.submit_target_position("AAPL", 5.0)
+
+    order = client.submitted_orders[0]
+    assert order.extended_hours is True
+    assert order.qty == 5.0  # long, whole number anyway here
+
+
+def test_submit_target_position_extended_hours_buy_prices_above_ask(monkeypatch):
+    monkeypatch.setattr("execution.broker_alpaca.settings.allow_extended_hours_trading", True)
+    broker, client = _make_broker(monkeypatch, is_open=False, quotes={"AAPL": _FakeQuote(ask_price=100.0, bid_price=99.5)})
+
+    broker.submit_target_position("AAPL", 5.0)  # BUY
+
+    order = client.submitted_orders[0]
+    assert order.limit_price == pytest.approx(round(100.0 * 1.005, 2), abs=1e-6)
+
+
+def test_submit_target_position_extended_hours_sell_prices_below_bid(monkeypatch):
+    monkeypatch.setattr("execution.broker_alpaca.settings.allow_extended_hours_trading", True)
+    broker, client = _make_broker(
+        monkeypatch, is_open=False, positions={"AAPL": 10.0}, quotes={"AAPL": _FakeQuote(ask_price=100.0, bid_price=99.5)}
+    )
+
+    broker.submit_target_position("AAPL", 5.0)  # SELL, trims long
+
+    order = client.submitted_orders[0]
+    assert order.limit_price == pytest.approx(round(99.5 * 0.995, 2), abs=1e-6)
+
+
+def test_submit_target_position_extended_hours_rounds_fractional_to_whole_shares(monkeypatch):
+    """
+    Extended-hours orders must be whole shares even when going long (unlike
+    RTH) — and must round DOWN, never up: rounding up an order that reduces
+    an existing position (see the next test) can exceed what's actually
+    held and gets rejected outright by Alpaca.
+    """
+    monkeypatch.setattr("execution.broker_alpaca.settings.allow_extended_hours_trading", True)
+    broker, client = _make_broker(monkeypatch, is_open=False, quotes={"AAPL": _FakeQuote()})
+
+    broker.submit_target_position("AAPL", 5.7)
+
+    assert client.submitted_orders[0].qty == 5.0
+
+
+def test_submit_target_position_extended_hours_closing_order_never_exceeds_held_shares(monkeypatch):
+    """
+    Regression test: hit live. Closing a 30.8892-share position outside RTH
+    was rounding the sell order up to 31 shares — more than actually held —
+    and Alpaca rejected it with "insufficient qty available for order".
+    """
+    monkeypatch.setattr("execution.broker_alpaca.settings.allow_extended_hours_trading", True)
+    broker, client = _make_broker(monkeypatch, is_open=False, positions={"BAC": 30.8892}, quotes={"BAC": _FakeQuote()})
+
+    broker.submit_target_position("BAC", 0.0)  # close to flat
+
+    assert client.submitted_orders[0].qty == 30.0  # floored, not rounded up to 31
+
+
+def test_submit_target_position_falls_back_to_market_order_when_extended_hours_disabled(monkeypatch):
+    monkeypatch.setattr("execution.broker_alpaca.settings.allow_extended_hours_trading", False)
+    broker, client = _make_broker(monkeypatch, is_open=False, quotes={"AAPL": _FakeQuote()})
+
+    broker.submit_target_position("AAPL", 5.7)
+
+    order = client.submitted_orders[0]
+    assert not hasattr(order, "extended_hours") or order.extended_hours is None
+    assert order.qty == 5.7  # old behavior: fractional market order, queues until next open
+
+
+def test_submit_target_position_extended_hours_raises_without_a_quote(monkeypatch):
+    monkeypatch.setattr("execution.broker_alpaca.settings.allow_extended_hours_trading", True)
+    broker, _ = _make_broker(monkeypatch, is_open=False, quotes={"AAPL": _FakeQuote(ask_price=None, bid_price=None)})
+
+    with pytest.raises(RuntimeError, match="No quote available"):
+        broker.submit_target_position("AAPL", 5.0)
