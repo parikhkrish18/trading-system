@@ -91,6 +91,36 @@ def test_fetch_fundamentals_skips_reports_without_a_date(monkeypatch):
     assert df.empty
 
 
+def test_fetch_fundamentals_dedupes_same_key_across_reports(monkeypatch):
+    """
+    Regression test, hit live on the full S&P 500 universe: Polygon can
+    return more than one report resolving to the same (symbol, filing_date,
+    metric) key (e.g. a restated filing published the same day as the
+    original). Two such rows in one batch make upsert_dataframe's
+    ON CONFLICT DO UPDATE fail with a CardinalityViolation — the exact bug
+    class already fixed for news.py's shared-story case.
+    """
+    reports = [
+        {
+            "end_date": "2026-06-30",
+            "filing_date": "2026-08-04",
+            "financials": {"income_statement": {"diluted_earnings_per_share": {"value": 2.5}}},
+        },
+        {
+            "end_date": "2026-06-30",
+            "filing_date": "2026-08-04",
+            "financials": {"income_statement": {"diluted_earnings_per_share": {"value": 2.6}}},
+        },
+    ]
+    monkeypatch.setattr(fundamentals, "polygon_get", lambda *a, **k: _FakeResponse({"results": reports}))
+    monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
+
+    df = fundamentals.fetch_fundamentals(["SPY"])
+
+    assert len(df) == 1  # deduped, not one row per report
+    assert df.iloc[0]["value"] == 2.6  # keeps the later (revised) value
+
+
 def test_ingest_fundamentals_upserts_with_correct_conflict_cols(monkeypatch):
     monkeypatch.setattr(
         fundamentals,

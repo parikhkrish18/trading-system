@@ -88,6 +88,14 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
     df = pd.DataFrame(rows, columns=["symbol", "ts", "metric", "value", "source"])
     if not df.empty:
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        # Polygon can return more than one report with the same filing_date
+        # for the same symbol (e.g. a restated/amended filing) — two rows
+        # with an identical (symbol, ts, metric) key in one batch makes
+        # upsert_dataframe's ON CONFLICT DO UPDATE fail outright (a single
+        # statement can't "affect the same row twice"), the same class of
+        # bug fixed for news.py's shared-story case. Keep the last one
+        # (Polygon returns revisions after the original in practice).
+        df = df.drop_duplicates(subset=["symbol", "ts", "metric"], keep="last")
     return df
 
 
