@@ -32,7 +32,7 @@ from data.ingest.universe import resolve_symbols
 from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND
 from models.train import load_feature_frame, load_training_frame
-from risk.sizing import regime_adjusted_size, target_position_size
+from risk.sizing import target_position_size
 
 _MODEL_VERSION = "ensemble_v1"
 
@@ -294,11 +294,16 @@ def run_screen(
     Trains a fresh ensemble on all available history, scores today's
     snapshot, and concentrates the full deployable capital into the top 2
     highest-conviction picks (select_concentrated_trades) rather than
-    spreading across many names. Total capital deployed is dampened in a
-    choppy regime the same way risk.sizing.regime_adjusted_size would for a
-    single position — concentration makes regime risk matter more, not
-    less, so this still backs off in chop even though sizing between the
-    two legs is otherwise purely confidence-driven.
+    spreading across many names.
+
+    Total capital deployed is always 100% across the two legs — regime is
+    still used to gate which candidates clear the confidence bar upstream,
+    but no longer dampens total deployment on top of that. The old
+    chop-dampening of total size (via risk.sizing.regime_adjusted_size) was
+    inherited from the leveraged-ETF strategy, where chop causes real daily-
+    reset decay independent of confidence; that rationale doesn't carry over
+    to plain equity/short positions, and it was silently sitting most of the
+    portfolio in cash (35% deployed) whenever the market read as choppy.
     """
     train_df = load_training_frame(feature_set_id, symbols, target_horizon_days)
     feature_cols = [c for c in train_df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
@@ -309,7 +314,7 @@ def run_screen(
     latest = load_latest_features(feature_set_id, symbols)
     scored = score_universe(ensemble, latest, feature_cols, min_direction_agreement, min_abs_return)
 
-    total_deploy_pct = regime_adjusted_size(1.0, regime)
+    total_deploy_pct = 1.0
 
     candidates = select_concentrated_trades(
         scored,

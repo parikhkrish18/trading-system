@@ -1,17 +1,28 @@
 # macOS scheduling (launchd)
 
-`infra/systemd/` only works on Linux — this machine is macOS, so the weekly
-trading cycle is scheduled via `launchd` instead. A LaunchAgent (not a
+`infra/systemd/` only works on Linux — this machine is macOS, so the jobs
+below are scheduled via `launchd` instead. A LaunchAgent (not a
 LaunchDaemon) is used deliberately: it only runs while you're logged in,
 which is the right scope for a personal-machine paper-trading job — no root,
 no running unattended before anyone's confirmed the Mac is actually on.
+
+Two jobs:
+- **`weekly-cycle`** — full universe refresh, re-ingest, retrain, screen and
+  trade. Runs once a week.
+- **`contradiction-monitor`** — checks currently held positions against
+  fresh news sentiment and short-term price momentum, closing anything the
+  evidence has turned against. Runs hourly, no-ops itself outside market
+  hours (see `execution/contradiction_monitor.py`) rather than relying on a
+  DST-sensitive fixed schedule.
 
 ## Install
 
 ```bash
 mkdir -p logs
 cp infra/launchd/com.trading-system.weekly-cycle.plist ~/Library/LaunchAgents/
+cp infra/launchd/com.trading-system.contradiction-monitor.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.trading-system.weekly-cycle.plist
+launchctl load ~/Library/LaunchAgents/com.trading-system.contradiction-monitor.plist
 ```
 
 ## Verify it's loaded
@@ -20,11 +31,14 @@ launchctl load ~/Library/LaunchAgents/com.trading-system.weekly-cycle.plist
 launchctl list | grep trading-system
 ```
 
-## Trigger it manually once (don't wait for the schedule to prove it works)
+## Trigger a job manually once (don't wait for the schedule to prove it works)
 
 ```bash
 launchctl start com.trading-system.weekly-cycle
 tail -f logs/weekly-cycle.log logs/weekly-cycle.error.log
+
+launchctl start com.trading-system.contradiction-monitor
+tail -f logs/contradiction-monitor.log logs/contradiction-monitor.error.log
 ```
 
 ## Uninstall
@@ -32,6 +46,9 @@ tail -f logs/weekly-cycle.log logs/weekly-cycle.error.log
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.trading-system.weekly-cycle.plist
 rm ~/Library/LaunchAgents/com.trading-system.weekly-cycle.plist
+
+launchctl unload ~/Library/LaunchAgents/com.trading-system.contradiction-monitor.plist
+rm ~/Library/LaunchAgents/com.trading-system.contradiction-monitor.plist
 ```
 
 ## Notes
