@@ -60,6 +60,13 @@ def test_explain_feature_event_narrative_reflects_urgency():
     assert "not yet a near-term factor" in distant
 
 
+def test_explain_feature_event_narrative_preserves_acronym_capitalization():
+    """Regression test: str.capitalize() lowercases the rest of the string, turning "CPI" into "cpi"."""
+    line = reasoning.explain_feature("days_to_next_cpi", 10.0, contribution=-0.01)
+    assert "CPI" in line
+    assert "cpi" not in line
+
+
 def test_explain_feature_sentiment_narrative_reflects_polarity():
     negative = reasoning.explain_feature("sentiment_mean_3d", -0.5, contribution=-0.01)
     assert "clearly negative" in negative

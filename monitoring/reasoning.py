@@ -226,7 +226,7 @@ def _event_narrative(label: str) :
             "approaching": "starting to factor into near-term positioning",
             "not yet a near-term factor": "still far enough out that it isn't driving near-term risk yet",
         }[urgency]
-        return f"{label.capitalize()} is {value:.0f} day(s) away ({urgency}) — {colour}."
+        return f"{label[0].upper()}{label[1:]} is {value:.0f} day(s) away ({urgency}) — {colour}."
 
     return fn
 
