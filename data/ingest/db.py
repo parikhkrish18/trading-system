@@ -21,13 +21,25 @@ def get_engine() -> Engine:
     return _engine
 
 
-def upsert_dataframe(df: pd.DataFrame, table: str, conflict_cols: list[str]) -> int:
+# Hit live: a single ~9M-row upsert (full 5-year feature rebuild across the
+# S&P 500) ran as one INSERT...SELECT...ON CONFLICT inside one transaction
+# and stalled for 3+ hours doing random-I/O conflict-checks against a large
+# table on default (un-tuned) Postgres settings. Splitting into chunks keeps
+# each transaction's working set small enough to stay cache-friendly and
+# gives every chunk an independent commit point instead of one all-or-nothing
+# multi-hour transaction.
+_DEFAULT_CHUNK_ROWS = 200_000
+
+
+def upsert_dataframe(df: pd.DataFrame, table: str, conflict_cols: list[str], chunk_rows: int = _DEFAULT_CHUNK_ROWS) -> int:
     """
     Upsert a dataframe into `table`, doing nothing on conflict of
     `conflict_cols` (the table's primary key). Returns rows attempted.
 
     Uses a temp staging table + INSERT ... ON CONFLICT so it works for
-    arbitrary column sets without hand-writing SQL per caller.
+    arbitrary column sets without hand-writing SQL per caller. Large
+    dataframes are split into `chunk_rows`-sized pieces, each staged/inserted/
+    committed independently, rather than one giant single-transaction upsert.
     """
     if df.empty:
         return 0
@@ -35,28 +47,30 @@ def upsert_dataframe(df: pd.DataFrame, table: str, conflict_cols: list[str]) -> 
     engine = get_engine()
     staging_table = f"_staging_{table}"
 
-    with engine.begin() as conn:
-        df.to_sql(staging_table, conn, if_exists="replace", index=False, method="multi", chunksize=1000)
+    cols = list(df.columns)
+    col_list = ", ".join(cols)
+    conflict_list = ", ".join(conflict_cols)
+    update_cols = [c for c in cols if c not in conflict_cols]
+    update_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols) or "NOTHING"
 
-        cols = list(df.columns)
-        col_list = ", ".join(cols)
-        conflict_list = ", ".join(conflict_cols)
-        update_cols = [c for c in cols if c not in conflict_cols]
-        update_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols) or "NOTHING"
+    if update_cols:
+        sql = f"""
+            INSERT INTO {table} ({col_list})
+            SELECT {col_list} FROM {staging_table}
+            ON CONFLICT ({conflict_list}) DO UPDATE SET {update_clause}
+        """
+    else:
+        sql = f"""
+            INSERT INTO {table} ({col_list})
+            SELECT {col_list} FROM {staging_table}
+            ON CONFLICT ({conflict_list}) DO NOTHING
+        """
 
-        if update_cols:
-            sql = f"""
-                INSERT INTO {table} ({col_list})
-                SELECT {col_list} FROM {staging_table}
-                ON CONFLICT ({conflict_list}) DO UPDATE SET {update_clause}
-            """
-        else:
-            sql = f"""
-                INSERT INTO {table} ({col_list})
-                SELECT {col_list} FROM {staging_table}
-                ON CONFLICT ({conflict_list}) DO NOTHING
-            """
-        conn.exec_driver_sql(sql)
-        conn.exec_driver_sql(f"DROP TABLE {staging_table}")
+    for start in range(0, len(df), chunk_rows):
+        chunk = df.iloc[start : start + chunk_rows]
+        with engine.begin() as conn:
+            chunk.to_sql(staging_table, conn, if_exists="replace", index=False, method="multi", chunksize=1000)
+            conn.exec_driver_sql(sql)
+            conn.exec_driver_sql(f"DROP TABLE {staging_table}")
 
     return len(df)

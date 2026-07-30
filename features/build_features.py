@@ -190,11 +190,22 @@ def build_fundamentals_features(prices: pd.DataFrame, fundamentals: pd.DataFrame
     return pd.concat(frames, ignore_index=True)
 
 
-def build_and_store(symbols: list[str], feature_set_id: str) -> int:
+# How far back feature computation looks, regardless of how much price
+# history the `prices` table actually holds. Hit live: an unbounded pull of
+# the full 5-year backfill (503 symbols x ~5yrs) produced a features batch
+# large enough to stall a single-transaction upsert for 3+ hours (see
+# data/ingest/db.py). 3 years is plenty for the rolling-window quant features
+# (max window is 20 days) and the model's own training lookback.
+FEATURE_LOOKBACK_YEARS = 3
+
+
+def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int = FEATURE_LOOKBACK_YEARS) -> int:
     engine = get_engine()
     symbol_list = ", ".join(f"'{s}'" for s in symbols)
     prices = pd.read_sql(
-        f"SELECT symbol, ts, open, high, low, close, volume FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts",
+        f"""SELECT symbol, ts, open, high, low, close, volume FROM prices
+            WHERE symbol IN ({symbol_list}) AND ts >= now() - interval '{lookback_years} years'
+            ORDER BY ts""",
         engine,
     )
     if prices.empty:

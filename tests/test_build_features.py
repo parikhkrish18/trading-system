@@ -1,7 +1,9 @@
 import pandas as pd
 import pytest
 
+from features import build_features
 from features.build_features import (
+    build_and_store,
     build_event_risk_features,
     build_fundamentals_features,
     build_qualitative_features,
@@ -88,3 +90,39 @@ def test_build_fundamentals_features_as_of_joins_latest_known_value():
 
 def test_build_fundamentals_features_empty_inputs():
     assert build_fundamentals_features(pd.DataFrame(), pd.DataFrame()).empty
+
+
+def test_build_and_store_defaults_to_a_bounded_lookback_window(monkeypatch):
+    """
+    Regression test, hit live: build_and_store used to pull *all* price
+    history with no date filter -- against a 5-year full-universe backfill
+    that produced a features batch large enough to stall a single-transaction
+    upsert for 3+ hours. The prices query must always carry a lookback bound.
+    """
+    captured = {}
+
+    def fake_read_sql(query, engine, **kwargs):
+        captured.setdefault("queries", []).append(query)
+        return pd.DataFrame(columns=["symbol", "ts", "open", "high", "low", "close", "volume"])
+
+    monkeypatch.setattr(build_features, "get_engine", lambda: object())
+    monkeypatch.setattr(build_features.pd, "read_sql", fake_read_sql)
+
+    build_and_store(["AAPL"], "v3")
+
+    prices_query = captured["queries"][0]
+    assert "interval '3 years'" in prices_query
+
+
+def test_build_and_store_lookback_years_is_configurable(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(build_features, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        build_features.pd,
+        "read_sql",
+        lambda query, engine, **kwargs: (captured.setdefault("queries", []).append(query), pd.DataFrame())[1],
+    )
+
+    build_and_store(["AAPL"], "v3", lookback_years=1)
+
+    assert "interval '1 years'" in captured["queries"][0]

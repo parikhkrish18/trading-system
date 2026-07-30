@@ -23,6 +23,69 @@ def test_explain_feature_handles_missing_value():
     assert "unavailable" in line
 
 
+def test_explain_feature_momentum_narrative_reflects_magnitude():
+    sharp_drop = reasoning.explain_feature("mom_ret_20d", -0.195, contribution=-0.01)
+    assert "sold off sharply" in sharp_drop
+    flat = reasoning.explain_feature("mom_ret_5d", 0.01, contribution=0.01)
+    assert "roughly flat" in flat
+
+
+def test_explain_feature_rsi_narrative_reflects_zone():
+    oversold = reasoning.explain_feature("meanrev_rsi_14", 22.0, contribution=0.01)
+    assert "oversold" in oversold
+    overbought = reasoning.explain_feature("meanrev_rsi_14", 78.0, contribution=-0.01)
+    assert "overbought" in overbought
+    neutral = reasoning.explain_feature("meanrev_rsi_14", 50.0, contribution=0.01)
+    assert "neutral" in neutral
+
+
+def test_explain_feature_adx_narrative_reflects_trend_strength():
+    weak = reasoning.explain_feature("adx_14", 12.0, contribution=-0.01)
+    assert "choppy" in weak
+    strong = reasoning.explain_feature("adx_14", 45.0, contribution=0.01)
+    assert "strong" in strong.lower()
+
+
+def test_explain_feature_volatility_narrative_reflects_level():
+    calm = reasoning.explain_feature("vol_realized_20d", 0.10, contribution=0.01)
+    assert "calmly" in calm
+    turbulent = reasoning.explain_feature("vol_realized_20d", 1.11, contribution=-0.01)
+    assert "unstable" in turbulent
+
+
+def test_explain_feature_event_narrative_reflects_urgency():
+    imminent = reasoning.explain_feature("days_to_next_cpi", 2.0, contribution=-0.01)
+    assert "imminent" in imminent
+    distant = reasoning.explain_feature("days_to_next_fomc", 40.0, contribution=0.01)
+    assert "not yet a near-term factor" in distant
+
+
+def test_explain_feature_sentiment_narrative_reflects_polarity():
+    negative = reasoning.explain_feature("sentiment_mean_3d", -0.5, contribution=-0.01)
+    assert "clearly negative" in negative
+    positive = reasoning.explain_feature("sentiment_mean_10d", 0.5, contribution=0.01)
+    assert "clearly positive" in positive
+
+
+def test_explain_feature_all_known_features_produce_narratives_for_typical_values():
+    """Every feature the model actually uses should get a real narrative, not the generic fallback."""
+    sample_values = {
+        "mom_ret_5d": 0.02, "mom_ret_20d": -0.05, "adx_14": 22.0, "vol_realized_20d": 0.3,
+        "vol_atr_14": 3.5, "vol_of_vol": 0.02, "meanrev_zscore_20d": 0.5, "meanrev_bollinger_pctb": 0.5,
+        "meanrev_rsi_14": 50.0, "sentiment_mean_10d": 0.1, "sentiment_mean_3d": 0.1,
+        "sentiment_momentum_3v10": 0.05, "news_volume_3d": 4.0, "days_to_next_fomc": 10.0,
+        "days_to_next_cpi": 10.0, "days_to_next_jobs": 10.0, "fund_eps_actual_latest": 2.5,
+        "fund_revenue_actual_latest": 1_000_000.0, "fund_net_income_latest": 500_000.0,
+        "fund_gross_profit_latest": 700_000.0, "fund_total_assets_latest": 5_000_000.0,
+        "fund_total_liabilities_latest": 2_000_000.0,
+    }
+    assert set(sample_values) == set(reasoning._NARRATIVE_FNS)
+    for feature_name, value in sample_values.items():
+        line = reasoning.explain_feature(feature_name, value, contribution=0.01)
+        assert "This pushed the forecast up" in line
+        assert len(line) > 40  # a real sentence, not a bare number dump
+
+
 def test_phase_pretrade_risk_clear():
     phase = reasoning.phase_pretrade_risk([])
     assert phase["phase"] == 1
@@ -35,11 +98,11 @@ def test_phase_pretrade_risk_triggered():
 
 
 def test_phase_signals_includes_regime_and_features():
-    top_features = [{"feature_name": "mom_ret_5d", "value": 0.05, "contribution": 0.02}]
+    top_features = [{"feature_name": "mom_ret_5d", "value": 0.08, "contribution": 0.02}]
     phase = reasoning.phase_signals("trend", top_features)
     assert phase["phase"] == 2
     assert "TREND" in phase["lines"][0]
-    assert any("momentum" in line for line in phase["lines"])
+    assert any("climbed steadily" in line for line in phase["lines"])
 
 
 def test_phase_forecast_reports_agreement_against_threshold():
