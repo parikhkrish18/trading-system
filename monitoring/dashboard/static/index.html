@@ -22,8 +22,24 @@
       <div id="positions-list" class="positions-grid"></div>
     </section>
 
+    <section id="closed-trades-section">
+      <h2>Closed Trades <span class="muted">(realized P&amp;L)</span></h2>
+      <div class="summary-row" id="closed-trades-summary"></div>
+      <div class="table-wrap">
+        <table id="closed-trades-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
+              <th>Shares</th><th>Entry px</th><th>Exit px</th><th>Realized P/L</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="equity-section">
-      <h2>Equity &amp; Drawdown</h2>
+      <h2>Equity &amp; Drawdown <span class="muted">(background shading = CHOP regime)</span></h2>
       <div class="summary-row" id="equity-summary"></div>
       <div class="chart-pair">
         <div class="chart-box">
@@ -59,6 +75,11 @@
           <tbody></tbody>
         </table>
       </div>
+    </section>
+
+    <section id="feature-importance-section">
+      <h2>Feature Importance Over Time <span class="muted">(last 200 decisions)</span></h2>
+      <div id="feature-importance-list" class="feature-freq-list"></div>
     </section>
 
     <section id="decisions-section">

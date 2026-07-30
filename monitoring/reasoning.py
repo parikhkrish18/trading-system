@@ -312,7 +312,15 @@ def phase_pretrade_risk(triggers: list) -> dict:
 
 
 def phase_signals(regime: str | None, top_features: list[dict]) -> dict:
-    """Phase 2. `top_features`: [{feature_name, value, contribution}, ...], strongest first."""
+    """
+    Phase 2. `top_features`: [{feature_name, value, contribution}, ...], strongest first.
+
+    Carries `top_features` verbatim in the returned dict (alongside the
+    rendered `lines` prose) so downstream analysis -- e.g. a feature-
+    importance-over-time chart -- can query the raw attribution without
+    re-parsing sentences. `lines`/`summary` are for humans; `top_features`
+    is for machines.
+    """
     lines = []
     if regime:
         lines.append(f"Market regime read as {regime.upper()} (based on trend strength on SPY).")
@@ -323,6 +331,7 @@ def phase_signals(regime: str | None, top_features: list[dict]) -> dict:
         "title": "Market Regime & Signals",
         "summary": f"Regime: {regime or 'n/a'}. Strongest driver: {top_label}.",
         "lines": lines or ["No feature contributions available for this decision."],
+        "top_features": top_features,
     }
 
 

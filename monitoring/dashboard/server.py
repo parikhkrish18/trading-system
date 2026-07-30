@@ -28,6 +28,8 @@ from sqlalchemy import text
 from config.settings import settings
 from data.ingest.db import get_engine
 from execution.broker import get_broker
+from features.quant.momentum import adx as compute_adx
+from models.regime.trend_chop_classifier import RuleBasedRegime
 from monitoring.breaker_state import load_latest_breaker_state
 from monitoring.equity import load_equity_curve
 from monitoring.forecast_accuracy import compute_forecast_accuracy
@@ -178,6 +180,159 @@ def get_live_accuracy(limit: int = 500) -> dict:
         "n_matured": len(result),
         "rows": _clean_records(result.sort_values("ts", ascending=False).head(50)),
     }
+
+
+def _price_at_or_before(sym_prices: pd.DataFrame, ts) -> float | None:
+    """Nearest known close at or before `ts`; falls back to the earliest known close if none exists."""
+    before = sym_prices[sym_prices["ts"] <= ts]
+    if not before.empty:
+        return float(before.iloc[-1]["close"])
+    if not sym_prices.empty:
+        return float(sym_prices.iloc[0]["close"])
+    return None
+
+
+@app.get("/api/trades/closed")
+def get_closed_trades(limit: int = 100) -> list[dict]:
+    """
+    Reconstructs realized round-trip trades from the decisions log: an
+    episode starts at the first decision that opens a nonzero position for a
+    symbol and ends at the next decision that flattens it (executed_position
+    == 0), using nearest-known prices at each end for entry/exit. This is an
+    approximation, not a broker-verified fill record -- if a position was
+    resized mid-episode (e.g. re-picked at a different weight the following
+    week), the original entry size/price is used for the whole episode
+    rather than tracking each resize individually.
+    """
+    engine = get_engine()
+    decisions = pd.read_sql(
+        text("SELECT symbol, ts, target_position, executed_position, mode FROM decisions WHERE mode = 'paper' ORDER BY symbol, ts"),
+        engine,
+    )
+    if decisions.empty:
+        return []
+
+    symbols = decisions["symbol"].unique().tolist()
+    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts", engine)
+
+    trades: list[dict] = []
+    for symbol, group in decisions.groupby("symbol"):
+        group = group.sort_values("ts").reset_index(drop=True)
+        sym_prices = prices[prices["symbol"] == symbol].sort_values("ts")
+        entry = None
+        for _, row in group.iterrows():
+            executed = row["executed_position"]
+            if executed is None or pd.isna(executed):
+                continue
+            if entry is None:
+                if executed != 0:
+                    entry = row
+                continue
+            if executed == 0:
+                entry_price = _price_at_or_before(sym_prices, entry["ts"])
+                exit_price = _price_at_or_before(sym_prices, row["ts"])
+                shares = entry["executed_position"]
+                if entry_price is not None and exit_price is not None and shares:
+                    pnl = (exit_price - entry_price) * shares
+                    trades.append(
+                        {
+                            "symbol": symbol,
+                            "side": "long" if shares > 0 else "short",
+                            "entry_ts": entry["ts"].isoformat(),
+                            "exit_ts": row["ts"].isoformat(),
+                            "shares": float(shares),
+                            "entry_price": entry_price,
+                            "exit_price": exit_price,
+                            "realized_pnl": float(pnl),
+                            "realized_pnl_pct": float((exit_price / entry_price - 1) * (1 if shares > 0 else -1)),
+                        }
+                    )
+                entry = None
+            # else: still open (possibly resized) -- keep the original entry, see docstring.
+
+    trades.sort(key=lambda t: t["exit_ts"], reverse=True)
+    return trades[:limit]
+
+
+@app.get("/api/positions/news")
+def get_positions_news(limit_per_symbol: int = 8) -> dict[str, list[dict]]:
+    """Recent headlines feeding each held position's sentiment score, not just the aggregated number."""
+    broker = get_broker()
+    symbols = [s for s, q in broker.get_positions().items() if q != 0]
+    if not symbols:
+        return {}
+
+    engine = get_engine()
+    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    df = pd.read_sql(
+        f"""SELECT symbol, ts, headline, sentiment, source FROM news_events
+            WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC""",
+        engine,
+    )
+    result: dict[str, list[dict]] = {s: [] for s in symbols}
+    for symbol, group in df.groupby("symbol"):
+        result[symbol] = _clean_records(group.head(limit_per_symbol))
+    return result
+
+
+@app.get("/api/regime_history")
+def get_regime_history(market_proxy: str = "SPY") -> list[dict]:
+    """Dense daily trend/chop classification (ADX on the market proxy) for overlaying on the equity chart."""
+    engine = get_engine()
+    df = pd.read_sql(
+        text("SELECT ts, high, low, close FROM prices WHERE symbol = :symbol ORDER BY ts"),
+        engine,
+        params={"symbol": market_proxy},
+    )
+    if len(df) < 20:
+        return []
+    df["adx"] = compute_adx(df["high"], df["low"], df["close"])
+    df = df.dropna(subset=["adx"]).copy()
+    if df.empty:
+        return []
+    df["regime"] = RuleBasedRegime().predict(df["adx"])
+    return _clean_records(df[["ts", "regime", "adx"]])
+
+
+@app.get("/api/analysis/feature_frequency")
+def get_feature_frequency(limit: int = 200) -> list[dict]:
+    """
+    How often each feature has shown up in the top-5 SHAP drivers across
+    recent decisions, and its average |contribution| when it does -- catches
+    the model leaning on one signal (e.g. always the CPI countdown) rather
+    than genuinely varying its reasoning. Only decisions logged after the
+    7-phase reasoning model shipped carry the structured `top_features` data
+    this needs; older rows are silently skipped.
+    """
+    engine = get_engine()
+    df = pd.read_sql(
+        text("SELECT reasoning FROM decisions WHERE reasoning IS NOT NULL ORDER BY ts DESC LIMIT :limit"),
+        engine,
+        params={"limit": limit},
+    )
+
+    counts: dict[str, int] = {}
+    total_abs_contribution: dict[str, float] = {}
+    for reasoning in df["reasoning"]:
+        if isinstance(reasoning, str):
+            reasoning = json.loads(reasoning)
+        if not isinstance(reasoning, list):
+            continue
+        phase2 = next((p for p in reasoning if p.get("phase") == 2), None)
+        if not phase2:
+            continue
+        for f in phase2.get("top_features", []):
+            name = f["feature_name"]
+            counts[name] = counts.get(name, 0) + 1
+            total_abs_contribution[name] = total_abs_contribution.get(name, 0.0) + abs(f["contribution"])
+
+    result = [
+        {"feature_name": name, "times_in_top5": count, "avg_abs_contribution": total_abs_contribution[name] / count}
+        for name, count in counts.items()
+    ]
+    result.sort(key=lambda r: r["times_in_top5"], reverse=True)
+    return result
 
 
 @app.get("/api/tests/last")

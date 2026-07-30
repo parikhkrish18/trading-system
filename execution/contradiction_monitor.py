@@ -6,11 +6,12 @@ next scheduled screen would otherwise notice. This module checks every
 currently held position against both signals and closes out any position
 that's now fighting the evidence it was opened on.
 
-Deliberately close-only, not close-and-reverse: reversing requires a fresh
-conviction call (which candidate, how large), which is exactly what the
-weekly screen already does properly with a trained ensemble. This module's
-job is narrower and more mechanical — stop the bleeding, don't re-guess the
-next trade.
+Close-only for the contradiction check itself -- reversing requires a fresh
+conviction call, which is exactly what a screen does. But after a close
+frees up capital, this module immediately re-screens (same 80% confidence
+bar, same selection logic as the weekly cycle) to redeploy it right away
+rather than leaving it in cash until next week -- see _attempt_reactivation.
+The strategy doesn't change, it just doesn't have to wait for Monday.
 
 Safety boundary, same as trading_loop.py: only ever calls get_broker()
 without confirm_live=True.
@@ -30,9 +31,11 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from data.ingest.db import get_engine
 from data.ingest.news import ingest_news
+from data.ingest.universe import load_active_universe
 from execution.broker import get_broker
 from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
+from models.screener import run_screen
 from monitoring import reasoning
 from monitoring.alerts import send_slack_alert
 
@@ -40,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _FEATURE_SET_ID = "contradiction_monitor"
 _MODEL_VERSION = "rule_based_v1"
+_REACTIVATION_MODEL_VERSION = "ensemble_v1"
 
 # News lookback for the sentiment read — wider than the check interval so a
 # position isn't judged on a single stale article between checks.
@@ -49,6 +53,9 @@ _SENTIMENT_CONTRADICTION_THRESHOLD = 0.4  # mean sentiment must be this strongly
 
 _MOMENTUM_WINDOW_DAYS = 5
 _MOMENTUM_CONTRADICTION_THRESHOLD = 0.04  # 4% move against the position over the window
+
+# Don't bother re-screening for a sliver of freed capital too small to matter.
+_MIN_REACTIVATION_FRACTION = 0.05
 
 
 @dataclasses.dataclass
@@ -149,12 +156,125 @@ def _log_closure(result: ContradictionResult, mode: str, executed_position: floa
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
 
+def _latest_prices(engine, symbols: list[str]) -> dict[str, float]:
+    if not symbols:
+        return {}
+    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    df = pd.read_sql(
+        f"""SELECT DISTINCT ON (symbol) symbol, close FROM prices
+            WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC""",
+        engine,
+    )
+    return dict(zip(df["symbol"], df["close"], strict=False))
+
+
+def _freed_capital_fraction(broker, engine) -> float:
+    """Fraction of portfolio_value currently sitting idle (not allocated to any open position)."""
+    positions = {s: q for s, q in broker.get_positions().items() if q != 0}
+    portfolio_value = broker.get_portfolio_value()
+    if portfolio_value <= 0:
+        return 0.0
+    if not positions:
+        return 1.0
+    prices = _latest_prices(engine, list(positions.keys()))
+    held_value = sum(abs(qty) * prices[sym] for sym, qty in positions.items() if sym in prices)
+    return max(0.0, 1.0 - held_value / portfolio_value)
+
+
+def _log_reactivation(candidate, executed_position: float | None, mode: str, target_shares: float) -> None:
+    # Phases 2/3/4 already come fully built from run_screen (same selection
+    # logic as the weekly cycle) -- just note on phase 4 that this fired
+    # mid-week rather than at the normal weekly screen, then add phases 5/7.
+    phases = list(candidate.reasoning or [])
+    phases = [
+        {**p, "lines": [*p["lines"], "Picked mid-week to redeploy capital freed by a contradiction close, using the same confidence bar as the weekly screen."]}
+        if p["phase"] == 4
+        else p
+        for p in phases
+    ]
+    phase5 = reasoning.phase_execution(candidate.symbol, "opened", target_shares, "market")
+    phase7 = reasoning.phase_ongoing_monitoring(closed=False)
+    full_reasoning = reasoning.combine_phases(*phases, phase5, phase7)
+
+    row = {
+        "ts": dt.datetime.now(tz=dt.UTC),
+        "symbol": candidate.symbol,
+        "feature_set_id": _FEATURE_SET_ID,
+        "model_version": _REACTIVATION_MODEL_VERSION,
+        "forecast": candidate.predicted_return,
+        "regime": None,
+        "target_position": candidate.target_position_pct,
+        "executed_position": executed_position,
+        "mode": mode,
+        "reasoning": json.dumps(full_reasoning),
+    }
+    pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
+
+
+def _attempt_reactivation(broker, engine) -> None:
+    """
+    After a contradiction close, checks whether meaningful capital is now
+    sitting idle and, if so, immediately re-screens for a new candidate to
+    redeploy it -- same 80% confidence bar and top-2-concentrated selection
+    logic as the weekly cycle (models.screener.run_screen), just scoped to
+    the freed fraction of capital instead of the whole book, and restricted
+    to symbols not currently held. No-ops if the freed slice is too small to
+    bother with, or nothing confident turns up.
+    """
+    freed_fraction = _freed_capital_fraction(broker, engine)
+    if freed_fraction < _MIN_REACTIVATION_FRACTION:
+        return
+
+    held_symbols = {s for s, q in broker.get_positions().items() if q != 0}
+    candidate_pool = [s for s in load_active_universe() if s not in held_symbols]
+    if not candidate_pool:
+        return
+
+    is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
+    try:
+        candidates = run_screen("v3", candidate_pool, is_shortable_fn=is_shortable_fn, total_deploy_pct=freed_fraction)
+    except Exception:
+        logger.exception("Reactivation screen failed — leaving freed capital in cash until the next check.")
+        return
+
+    if not candidates:
+        logger.info("No confident candidate to redeploy %.1f%% freed capital — staying in cash for now.", freed_fraction * 100)
+        return
+
+    portfolio_value = broker.get_portfolio_value()
+    prices = _latest_prices(engine, [c.symbol for c in candidates])
+
+    for c in candidates:
+        price = prices.get(c.symbol)
+        if not price:
+            logger.warning("No price for reactivation candidate %s — skipping.", c.symbol)
+            continue
+        target_shares = (c.target_position_pct * portfolio_value) / price
+        logger.warning("Reactivating freed capital: %s %s, %.1f%% of portfolio.", c.symbol, c.side, abs(c.target_position_pct) * 100)
+        send_slack_alert(
+            f"Phase 4 — Candidate Selection & Sizing: Mid-week reactivation — {c.symbol} ({c.side}), "
+            f"{abs(c.target_position_pct):.1%} of capital.",
+            severity="info",
+        )
+        try:
+            broker.submit_target_position(c.symbol, target_shares)
+        except Exception:
+            logger.exception("Failed to open reactivation position %s.", c.symbol)
+            continue
+
+        executed = broker.get_positions().get(c.symbol, 0.0)
+        _log_reactivation(c, executed, broker.mode, target_shares)
+        send_slack_alert(f"Phase 5 — Execution: {c.symbol} opened mid-week (reactivation) — {target_shares:+.4g} shares.", severity="info")
+
+
 def run_contradiction_check() -> list[ContradictionResult]:
     """
     Checks every currently held position for news/momentum contradicting the
     side it's held on, closes any that trip either threshold, logs a
-    decisions row for each closure, and alerts Slack. No-ops cleanly if
-    nothing is held or nothing contradicts.
+    decisions row for each closure, and alerts Slack. If anything closed,
+    immediately attempts to redeploy the freed capital (_attempt_reactivation)
+    rather than leaving it idle until next week. No-ops cleanly if nothing is
+    held or nothing contradicts.
     """
     broker = get_broker()  # never passes confirm_live=True — paper-only by construction
     engine = get_engine()
@@ -196,6 +316,9 @@ def run_contradiction_check() -> list[ContradictionResult]:
         executed = broker.get_positions().get(symbol, 0.0)
         _log_closure(result, broker.mode, executed)
         send_slack_alert(f"Phase 5 — Execution: {symbol} closed mid-week (contradiction).", severity="warning")
+
+    if any(r.closed for r in results):
+        _attempt_reactivation(broker, engine)
 
     return results
 

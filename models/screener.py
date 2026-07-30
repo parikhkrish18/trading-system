@@ -314,21 +314,23 @@ def run_screen(
     min_abs_return: float = 0.0,
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
+    total_deploy_pct: float = 1.0,
 ) -> list[TradeCandidate]:
     """
     Trains a fresh ensemble on all available history, scores today's
-    snapshot, and concentrates the full deployable capital into the top 2
+    snapshot, and concentrates `total_deploy_pct` of capital into the top 2
     highest-conviction picks (select_concentrated_trades) rather than
     spreading across many names.
 
-    Total capital deployed is always 100% across the two legs — regime is
-    still used to gate which candidates clear the confidence bar upstream,
-    but no longer dampens total deployment on top of that. The old
-    chop-dampening of total size (via risk.sizing.regime_adjusted_size) was
-    inherited from the leveraged-ETF strategy, where chop causes real daily-
-    reset decay independent of confidence; that rationale doesn't carry over
-    to plain equity/short positions, and it was silently sitting most of the
-    portfolio in cash (35% deployed) whenever the market read as choppy.
+    `total_deploy_pct` defaults to 1.0 (the normal weekly-cycle behavior --
+    100% of the book, both legs). execution/contradiction_monitor.py's
+    mid-week reactivation passes a smaller value: the fraction of capital a
+    contradiction-close just freed up, so it can redeploy only that slice
+    via this exact same selection logic rather than reshuffling the whole
+    book. Regime is still used to gate which candidates clear the confidence
+    bar upstream, but no longer dampens total deployment on top of that (see
+    git history -- the old chop-dampening was leveraged-ETF-specific decay
+    protection that doesn't apply to plain equity/short positions).
     """
     train_df = load_training_frame(feature_set_id, symbols, target_horizon_days)
     feature_cols = [c for c in train_df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
@@ -338,8 +340,6 @@ def run_screen(
 
     latest = load_latest_features(feature_set_id, symbols)
     scored = score_universe(ensemble, latest, feature_cols, min_direction_agreement, min_abs_return)
-
-    total_deploy_pct = 1.0
 
     candidates = select_concentrated_trades(
         scored,

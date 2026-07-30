@@ -184,6 +184,161 @@ def test_live_accuracy_computes_hit_rate_from_matured_decisions(monkeypatch, cli
     assert body["n_matured"] == 1
 
 
+def test_closed_trades_reconstructs_a_round_trip(monkeypatch, client):
+    decisions = pd.DataFrame(
+        [
+            {"symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "target_position": 0.5, "executed_position": 10.0, "mode": "paper"},
+            {"symbol": "AAPL", "ts": pd.Timestamp("2026-07-08T00:00:00Z"), "target_position": 0.0, "executed_position": 0.0, "mode": "paper"},
+        ]
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "ts": pd.to_datetime(["2026-07-01T00:00:00Z", "2026-07-08T00:00:00Z"]),
+            "close": [100.0, 110.0],
+        }
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/closed")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    trade = body[0]
+    assert trade["symbol"] == "AAPL"
+    assert trade["side"] == "long"
+    assert trade["shares"] == 10.0
+    assert trade["realized_pnl"] == pytest.approx(100.0)  # (110-100) * 10 shares
+
+
+def test_closed_trades_computes_short_pnl_correctly(monkeypatch, client):
+    decisions = pd.DataFrame(
+        [
+            {"symbol": "IBM", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "target_position": -0.5, "executed_position": -10.0, "mode": "paper"},
+            {"symbol": "IBM", "ts": pd.Timestamp("2026-07-08T00:00:00Z"), "target_position": 0.0, "executed_position": 0.0, "mode": "paper"},
+        ]
+    )
+    prices = pd.DataFrame(
+        {"symbol": ["IBM", "IBM"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z", "2026-07-08T00:00:00Z"]), "close": [100.0, 90.0]}
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/closed")
+    trade = resp.json()[0]
+    assert trade["side"] == "short"
+    assert trade["realized_pnl"] == pytest.approx(100.0)  # price dropped $10, short profits
+
+
+def test_closed_trades_no_decisions_returns_empty(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
+
+    resp = client.get("/api/trades/closed")
+    assert resp.json() == []
+
+
+def test_closed_trades_still_open_position_is_not_a_trade(monkeypatch, client):
+    decisions = pd.DataFrame(
+        [{"symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "target_position": 0.5, "executed_position": 10.0, "mode": "paper"}]
+    )
+    prices = pd.DataFrame({"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z"]), "close": [100.0]})
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/closed")
+    assert resp.json() == []
+
+
+def test_positions_news_returns_empty_when_nothing_held(monkeypatch, client):
+    class _NoPositionsBroker:
+        def get_positions(self):
+            return {}
+
+    monkeypatch.setattr(server, "get_broker", lambda: _NoPositionsBroker())
+    resp = client.get("/api/positions/news")
+    assert resp.json() == {}
+
+
+def test_positions_news_groups_headlines_by_symbol(monkeypatch, client):
+    class _HeldBroker:
+        def get_positions(self):
+            return {"AAPL": 10.0, "MSFT": -5.0}
+
+    monkeypatch.setattr(server, "get_broker", lambda: _HeldBroker())
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    news = pd.DataFrame(
+        [
+            {"symbol": "AAPL", "ts": pd.Timestamp("2026-07-29T00:00:00Z"), "headline": "AAPL beats earnings", "sentiment": 0.6, "source": "polygon"},
+            {"symbol": "MSFT", "ts": pd.Timestamp("2026-07-28T00:00:00Z"), "headline": "MSFT antitrust probe", "sentiment": -0.4, "source": "polygon"},
+        ]
+    )
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: news)
+
+    resp = client.get("/api/positions/news")
+    body = resp.json()
+    assert set(body.keys()) == {"AAPL", "MSFT"}
+    assert body["AAPL"][0]["headline"] == "AAPL beats earnings"
+
+
+def test_regime_history_returns_empty_with_insufficient_data(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["ts", "high", "low", "close"]))
+
+    resp = client.get("/api/regime_history")
+    assert resp.json() == []
+
+
+def test_regime_history_classifies_trend_vs_chop(monkeypatch, client):
+    idx = pd.bdate_range("2026-01-01", periods=40, tz="UTC")
+    trend = pd.Series(range(40), dtype=float) + 100
+    df = pd.DataFrame({"ts": idx, "high": trend + 1, "low": trend - 1, "close": trend})
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/regime_history")
+    body = resp.json()
+    assert len(body) > 0
+    assert all(r["regime"] in ("trend", "chop") for r in body)
+
+
+def test_feature_frequency_counts_across_decisions(monkeypatch, client):
+    df = pd.DataFrame(
+        {
+            "reasoning": [
+                json.dumps(
+                    [{"phase": 2, "title": "x", "summary": "x", "lines": [], "top_features": [{"feature_name": "mom_ret_5d", "value": 0.1, "contribution": 0.02}]}]
+                ),
+                json.dumps(
+                    [{"phase": 2, "title": "x", "summary": "x", "lines": [], "top_features": [{"feature_name": "mom_ret_5d", "value": 0.05, "contribution": 0.01}]}]
+                ),
+            ]
+        }
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/analysis/feature_frequency")
+    body = resp.json()
+    assert body[0]["feature_name"] == "mom_ret_5d"
+    assert body[0]["times_in_top5"] == 2
+    assert body[0]["avg_abs_contribution"] == pytest.approx(0.015)
+
+
+def test_feature_frequency_skips_old_decisions_without_top_features(monkeypatch, client):
+    """Decisions logged before the 7-phase reasoning model don't have structured top_features -- skip, don't crash."""
+    df = pd.DataFrame({"reasoning": [json.dumps([{"feature_name": "f1", "value": 1.0, "contribution": 0.02}])]})
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/analysis/feature_frequency")
+    assert resp.json() == []
+
+
 def test_run_tests_executes_subprocess_and_caches(monkeypatch, client, tmp_path):
     class _FakeResult:
         returncode = 0

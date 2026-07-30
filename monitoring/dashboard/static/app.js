@@ -14,7 +14,11 @@ async function fetchJSON(url, opts) {
 }
 
 // ---------- SVG line chart (no dependencies) ----------
-function renderLineChart(container, points, { color = "#5b8cff", height = 160, zeroLine = false } = {}) {
+// `regimeAt(label)` is an optional function mapping a point's label (ts) to
+// 'chop'|'trend'|null -- when given, shades the background behind each
+// point-to-point segment so regime is visible directly on the chart instead
+// of only in a separate table.
+function renderLineChart(container, points, { color = "#5b8cff", height = 160, zeroLine = false, regimeAt = null } = {}) {
   container.innerHTML = "";
   if (!points || points.length < 2) {
     container.innerHTML = '<div class="empty-state">Not enough data yet.</div>';
@@ -40,8 +44,23 @@ function renderLineChart(container, points, { color = "#5b8cff", height = 160, z
     zeroY = pad + (height - pad * 2) * (1 - (0 - minV) / range);
   }
 
+  let bandsSvg = "";
+  if (regimeAt) {
+    bandsSvg = points
+      .slice(0, -1)
+      .map((p, i) => {
+        const regime = regimeAt(p.label);
+        if (regime !== "chop") return "";
+        const x0 = coords[i][0];
+        const x1 = coords[i + 1][0];
+        return `<rect x="${x0.toFixed(1)}" y="0" width="${(x1 - x0).toFixed(1)}" height="${height}" fill="#e5484d" opacity="0.08" />`;
+      })
+      .join("");
+  }
+
   const svg = `
     <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      ${bandsSvg}
       ${zeroLine ? `<line x1="${pad}" y1="${zeroY}" x2="${width - pad}" y2="${zeroY}" stroke="#8b92a6" stroke-dasharray="3,3" stroke-width="1" />` : ""}
       <path d="${path}" fill="none" stroke="${color}" stroke-width="2" />
     </svg>
@@ -94,7 +113,24 @@ function reasoningPhasesHTML(reasoning) {
     .join("");
 }
 
-function positionCardHTML(p, idx) {
+function newsFeedHTML(items) {
+  if (!items || items.length === 0) {
+    return '<div class="no-decision">No recent news found for this symbol.</div>';
+  }
+  return items
+    .map((n) => {
+      const sentClass = n.sentiment === null || n.sentiment === undefined ? "" : n.sentiment >= 0 ? "pl-pos" : "pl-neg";
+      const sentLabel = n.sentiment === null || n.sentiment === undefined ? "unscored" : fmt.num(n.sentiment, 2);
+      return `
+        <div class="news-row">
+          <div class="news-headline">${n.headline}</div>
+          <div class="news-meta"><span class="${sentClass}">${sentLabel}</span> · ${fmt.time(n.ts)} · ${n.source || ""}</div>
+        </div>`;
+    })
+    .join("");
+}
+
+function positionCardHTML(p, idx, newsBySymbol) {
   const plClass = p.unrealized_pl >= 0 ? "pl-pos" : "pl-neg";
   const d = p.decision;
   const decisionBlock = d
@@ -110,6 +146,12 @@ function positionCardHTML(p, idx) {
     `
     : '<div class="no-decision">No matching decision found for this position.</div>';
 
+  const news = (newsBySymbol && newsBySymbol[p.symbol]) || [];
+  const newsBlock = `
+      <div class="reasoning-toggle" data-news-idx="${idx}">▸ Recent news (${news.length})</div>
+      <div class="reasoning-body" id="news-${idx}">${newsFeedHTML(news)}</div>
+    `;
+
   return `
     <div class="position-card">
       <div class="position-card-head">
@@ -124,11 +166,15 @@ function positionCardHTML(p, idx) {
         <div><div class="label">Unrealized P/L</div><span class="${plClass}">${fmt.money(p.unrealized_pl)} (${fmt.pct(p.unrealized_plpc)})</span></div>
       </div>
       ${decisionBlock}
+      ${newsBlock}
     </div>`;
 }
 
 async function loadPositions() {
-  const positions = await fetchJSON("/api/positions");
+  const [positions, newsBySymbol] = await Promise.all([
+    fetchJSON("/api/positions"),
+    fetchJSON("/api/positions/news").catch(() => ({})),
+  ]);
   document.getElementById("positions-count").textContent = `(${positions.length})`;
 
   const totalValue = positions.reduce((s, p) => s + p.market_value, 0);
@@ -144,19 +190,29 @@ async function loadPositions() {
     list.innerHTML = '<div class="empty-state">No open positions.</div>';
     return;
   }
-  list.innerHTML = positions.map(positionCardHTML).join("");
-  list.querySelectorAll(".reasoning-toggle").forEach((el) => {
+  list.innerHTML = positions.map((p, i) => positionCardHTML(p, i, newsBySymbol)).join("");
+  list.querySelectorAll(".reasoning-toggle[data-idx]").forEach((el) => {
     el.addEventListener("click", () => {
       const body = document.getElementById(`reasoning-${el.dataset.idx}`);
       body.classList.toggle("open");
       el.textContent = (body.classList.contains("open") ? "▾ " : "▸ ") + "Why this trade";
     });
   });
+  list.querySelectorAll(".reasoning-toggle[data-news-idx]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const body = document.getElementById(`news-${el.dataset.newsIdx}`);
+      body.classList.toggle("open");
+      el.textContent = (body.classList.contains("open") ? "▾ " : "▸ ") + el.textContent.replace(/^[▾▸]\s*/, "");
+    });
+  });
 }
 
 // ---------- Equity & drawdown ----------
 async function loadEquity() {
-  const rows = await fetchJSON("/api/equity_curve?mode=paper");
+  const [rows, regimeRows] = await Promise.all([
+    fetchJSON("/api/equity_curve?mode=paper"),
+    fetchJSON("/api/regime_history").catch(() => []),
+  ]);
   if (rows.length === 0) {
     document.getElementById("equity-summary").innerHTML = '<div class="empty-state">No equity snapshots recorded yet.</div>';
     renderLineChart(document.getElementById("equity-chart"), []);
@@ -174,10 +230,24 @@ async function loadEquity() {
     <div class="stat-card ${drawdown >= 0 ? "good" : "bad"}"><div class="value">${fmt.pct(drawdown)}</div><div class="label">Current drawdown</div></div>
   `;
 
+  // regime_history is dense (daily); equity snapshots are sparser -- for each
+  // equity point, find the regime on or before that date rather than requiring
+  // an exact timestamp match.
+  const sortedRegimes = [...regimeRows].sort((a, b) => new Date(a.ts) - new Date(b.ts));
+  const regimeAt = (label) => {
+    const t = new Date(label).getTime();
+    let match = null;
+    for (const r of sortedRegimes) {
+      if (new Date(r.ts).getTime() > t) break;
+      match = r.regime;
+    }
+    return match;
+  };
+
   renderLineChart(
     document.getElementById("equity-chart"),
     rows.map((r) => ({ y: r.equity_value, label: r.ts })),
-    { color: "#5b8cff" }
+    { color: "#5b8cff", regimeAt: sortedRegimes.length ? regimeAt : null }
   );
 
   let runningPeak = -Infinity;
@@ -186,6 +256,65 @@ async function loadEquity() {
     return { y: runningPeak > 0 ? r.equity_value / runningPeak - 1 : 0, label: r.ts };
   });
   renderLineChart(document.getElementById("drawdown-chart"), ddPoints, { color: "#e5484d", zeroLine: true });
+}
+
+// ---------- Closed trades ----------
+async function loadClosedTrades() {
+  const rows = await fetchJSON("/api/trades/closed");
+  const tbody = document.querySelector("#closed-trades-table tbody");
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No closed trades yet.</td></tr>';
+    document.getElementById("closed-trades-summary").innerHTML = "";
+    return;
+  }
+
+  const totalPnl = rows.reduce((s, t) => s + t.realized_pnl, 0);
+  const wins = rows.filter((t) => t.realized_pnl > 0).length;
+  const winRate = wins / rows.length;
+  document.getElementById("closed-trades-summary").innerHTML = `
+    <div class="stat-card ${totalPnl >= 0 ? "good" : "bad"}"><div class="value">${fmt.money(totalPnl)}</div><div class="label">Total realized P/L</div></div>
+    <div class="stat-card"><div class="value">${rows.length}</div><div class="label">Closed trades</div></div>
+    <div class="stat-card ${winRate >= 0.5 ? "good" : "bad"}"><div class="value">${fmt.pct(winRate, 0)}</div><div class="label">Win rate</div></div>
+  `;
+
+  tbody.innerHTML = rows
+    .map((t) => {
+      const plClass = t.realized_pnl >= 0 ? "pl-pos" : "pl-neg";
+      return `
+      <tr>
+        <td><strong>${t.symbol}</strong></td>
+        <td><span class="side-badge ${t.side}">${t.side}</span></td>
+        <td>${fmt.time(t.entry_ts)}</td>
+        <td>${fmt.time(t.exit_ts)}</td>
+        <td>${fmt.num(t.shares, 2)}</td>
+        <td>${fmt.money(t.entry_price)}</td>
+        <td>${fmt.money(t.exit_price)}</td>
+        <td class="${plClass}">${fmt.money(t.realized_pnl)} (${fmt.pct(t.realized_pnl_pct)})</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+// ---------- Feature importance over time ----------
+async function loadFeatureImportance() {
+  const rows = await fetchJSON("/api/analysis/feature_frequency");
+  const box = document.getElementById("feature-importance-list");
+  if (rows.length === 0) {
+    box.innerHTML = '<div class="empty-state">No structured feature data yet (only decisions logged after the 7-phase reasoning model count).</div>';
+    return;
+  }
+  const maxCount = Math.max(...rows.map((r) => r.times_in_top5));
+  box.innerHTML = rows
+    .map((r) => {
+      const pct = (r.times_in_top5 / maxCount) * 100;
+      return `
+      <div class="feature-freq-row">
+        <div class="feature-freq-name" title="${r.feature_name}">${r.feature_name}</div>
+        <div class="feature-freq-bar-track"><div class="feature-freq-bar" style="width:${pct}%"></div></div>
+        <div class="feature-freq-count">${r.times_in_top5}×</div>
+      </div>`;
+    })
+    .join("");
 }
 
 // ---------- Circuit breakers ----------
@@ -351,9 +480,11 @@ async function loadAll() {
   await Promise.allSettled([
     loadModeBadge(),
     loadPositions(),
+    loadClosedTrades(),
     loadEquity(),
     loadBreakers(),
     loadAnalysis(),
+    loadFeatureImportance(),
     loadLiveAccuracy(),
     loadDecisions(),
     loadLastTestRun(),
