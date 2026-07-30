@@ -255,10 +255,8 @@ def test_select_concentrated_trades_skips_unshortable_and_falls_through_ranking(
 
 
 def test_attach_reasoning_picks_top_features_by_absolute_contribution():
-    candidates = select_concentrated_trades(
-        _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]),
-        max_leg_pct=0.70, min_leg_pct=0.30,
-    )
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [1.5], "f2": [-0.5], "f3": [0.1]})
     # Indexed by symbol, matching what _attach_reasoning's X (latest.set_index("symbol")) actually looks like.
     contributions = pd.DataFrame(
@@ -266,17 +264,24 @@ def test_attach_reasoning_picks_top_features_by_absolute_contribution():
     )
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
 
-    _attach_reasoning(candidates, ensemble, latest, feature_cols=["f1", "f2", "f3"], top_n=2)
+    _attach_reasoning(
+        candidates, ensemble, latest, feature_cols=["f1", "f2", "f3"], scored=scored, regime=TREND,
+        max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8, top_n=2,
+    )
 
-    reasoning = candidates[0].reasoning
-    assert [r["feature_name"] for r in reasoning] == ["f2", "f1"]  # ranked by |contribution|, f3 excluded (top_n=2)
-    assert reasoning[0]["contribution"] == pytest.approx(-0.08)
-    assert reasoning[0]["value"] == pytest.approx(-0.5)
+    phases = {p["phase"]: p for p in candidates[0].reasoning}
+    assert set(phases) == {2, 3, 4}
+    lines = " ".join(phases[2]["lines"]).lower()
+    assert lines.index("f2") < lines.index("f1")  # ranked by |contribution|, f3 excluded (top_n=2)
+    assert "f3" not in lines
 
 
 def test_attach_reasoning_empty_candidates_is_noop():
     ensemble = _FakeEnsemble(mean_prediction=[], direction_agreement=[])
-    _attach_reasoning([], ensemble, pd.DataFrame(), feature_cols=[])  # should not raise
+    _attach_reasoning(
+        [], ensemble, pd.DataFrame(), feature_cols=[], scored=pd.DataFrame({"confident": []}),
+        regime=TREND, max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8,
+    )  # should not raise
 
 
 def test_build_correlation_matrix_from_prices():

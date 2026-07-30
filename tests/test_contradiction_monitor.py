@@ -135,6 +135,32 @@ def test_recent_momentum_computed_from_price_history(monkeypatch):
     assert momentum < -0.09
 
 
+def test_log_closure_builds_valid_phase_reasoning(monkeypatch):
+    captured = {}
+
+    class _FakeDF:
+        def to_sql(self, *a, **k):
+            captured["rows"] = a, k
+
+    monkeypatch.setattr(cm.pd, "DataFrame", lambda rows: (captured.setdefault("raw_rows", rows), _FakeDF())[1])
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+
+    result = cm.ContradictionResult(
+        symbol="AAPL",
+        side="long",
+        closed=True,
+        reasons=[{"signal": "news_sentiment", "value": -0.8, "news_count": 5, "detail": "sentiment turned negative"}],
+    )
+    cm._log_closure(result, mode="paper", executed_position=0.0)
+
+    row = captured["raw_rows"][0]
+    import json
+
+    phases = json.loads(row["reasoning"])
+    assert [p["phase"] for p in phases] == [2, 4, 5, 7]
+    assert "sentiment turned negative" in phases[0]["lines"]
+
+
 def test_news_refresh_failure_does_not_abort_the_check(monkeypatch):
     """If Polygon/Anthropic is down, still check against whatever sentiment is already in the DB."""
     broker = _FakeBroker({"AAPL": 10})

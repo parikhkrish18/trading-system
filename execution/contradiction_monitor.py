@@ -33,6 +33,7 @@ from data.ingest.news import ingest_news
 from execution.broker import get_broker
 from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
+from monitoring import reasoning
 from monitoring.alerts import send_slack_alert
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,24 @@ def _check_position(engine, symbol: str, qty: float) -> ContradictionResult:
 
 
 def _log_closure(result: ContradictionResult, mode: str, executed_position: float | None) -> None:
+    # Phases 1/3/6 don't apply here (this isn't the weekly screen — no fresh
+    # risk gate, forecast, or fill reconciliation to report); phases 2/4/5/7
+    # cover what actually happened: what contradicted, why it wasn't part of
+    # normal selection, what order got sent, and what happens next.
+    phase2 = reasoning.phase_contradiction(result.reasons)
+    phase4 = {
+        "phase": 4,
+        "title": "Candidate Selection & Sizing",
+        "summary": f"{result.symbol} closed outside the weekly screen — no new position opened.",
+        "lines": [
+            "This wasn't a weekly screen decision — the hourly contradiction check triggered mid-week.",
+            "Re-entry (if any) is left to the next weekly screen, not decided here.",
+        ],
+    }
+    phase5 = reasoning.phase_execution(result.symbol, "closed", None, "market")
+    phase7 = reasoning.phase_ongoing_monitoring(closed=True)
+    full_reasoning = reasoning.combine_phases(phase2, phase4, phase5, phase7)
+
     row = {
         "ts": dt.datetime.now(tz=dt.UTC),
         "symbol": result.symbol,
@@ -125,7 +144,7 @@ def _log_closure(result: ContradictionResult, mode: str, executed_position: floa
         "target_position": 0.0,
         "executed_position": executed_position,
         "mode": mode,
-        "reasoning": json.dumps(result.reasons),
+        "reasoning": json.dumps(full_reasoning),
     }
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
@@ -166,6 +185,8 @@ def run_contradiction_check() -> list[ContradictionResult]:
 
         detail = "; ".join(r["detail"] for r in result.reasons)
         logger.warning("Contradiction detected for %s (%s) — closing position. %s", symbol, result.side, detail)
+        send_slack_alert(f"Phase 2 — Market Regime & Signals: {symbol} ({result.side}) — {detail}", severity="warning")
+
         try:
             broker.submit_target_position(symbol, 0.0)
         except Exception:
@@ -174,10 +195,7 @@ def run_contradiction_check() -> list[ContradictionResult]:
 
         executed = broker.get_positions().get(symbol, 0.0)
         _log_closure(result, broker.mode, executed)
-        send_slack_alert(
-            f"Contradiction close: {symbol} ({result.side}) closed mid-week. {detail}",
-            severity="warning",
-        )
+        send_slack_alert(f"Phase 5 — Execution: {symbol} closed mid-week (contradiction).", severity="warning")
 
     return results
 

@@ -33,6 +33,7 @@ from execution.reconciliation import reconcile_positions, summarize
 from features.quant.momentum import adx
 from models.regime.trend_chop_classifier import CHOP, RuleBasedRegime
 from models.screener import build_correlation_matrix, run_screen
+from monitoring import reasoning
 from monitoring.alerts import alert_circuit_breaker, send_slack_alert
 from monitoring.breaker_state import check_and_record_breakers
 from monitoring.equity import load_equity_curve, record_equity_snapshot
@@ -120,25 +121,82 @@ def _flatten_and_alert(broker, reason: str) -> None:
     record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
 
 
-def _log_decisions(candidates, executed: dict[str, float], feature_set_id: str, mode: str, regime: str) -> None:
-    if not candidates:
-        return
+def _send_phase_alert(phase: dict) -> None:
+    send_slack_alert(f"Phase {phase['phase']} — {phase['title']}: {phase['summary']}", severity="info")
+
+
+def _order_type(broker) -> str:
+    if hasattr(broker, "client") and not broker.client.get_clock().is_open:
+        return "limit (extended hours)"
+    return "market"
+
+
+def _log_decisions(
+    candidates,
+    closing_symbols: list[str],
+    executed: dict[str, float],
+    intended_shares: dict[str, float],
+    feature_set_id: str,
+    mode: str,
+    regime: str,
+    phase1: dict,
+    phase6_by_symbol: dict[str, dict],
+    order_type: str,
+) -> None:
+    """
+    Logs one decisions row per symbol touched this cycle — both new/adjusted
+    candidates and anything closed for falling out of the shortlist (which
+    previously went completely unlogged). Every row carries the full 7-phase
+    reasoning: phases 1/5/6/7 are cycle-level facts merged in here, phases
+    2/3/4 come from run_screen for real candidates (see monitoring/reasoning.py).
+    """
     now = dt.datetime.now(tz=dt.UTC)
-    rows = [
-        {
-            "ts": now,
-            "symbol": c.symbol,
-            "feature_set_id": feature_set_id,
-            "model_version": _MODEL_VERSION,
-            "forecast": c.predicted_return,
-            "regime": regime,
-            "target_position": c.target_position_pct,
-            "executed_position": executed.get(c.symbol),
-            "mode": mode,
-            "reasoning": json.dumps(c.reasoning) if c.reasoning is not None else None,
-        }
-        for c in candidates
-    ]
+    rows = []
+
+    for c in candidates:
+        shares = intended_shares.get(c.symbol, 0.0)
+        phase5 = reasoning.phase_execution(c.symbol, "opened", shares, order_type)
+        phase6 = phase6_by_symbol.get(c.symbol) or reasoning.phase_reconciliation(c.symbol, shares, executed.get(c.symbol, 0.0), False)
+        phase7 = reasoning.phase_ongoing_monitoring(closed=False)
+        full_reasoning = reasoning.combine_phases(phase1, *(c.reasoning or []), phase5, phase6, phase7)
+        rows.append(
+            {
+                "ts": now,
+                "symbol": c.symbol,
+                "feature_set_id": feature_set_id,
+                "model_version": _MODEL_VERSION,
+                "forecast": c.predicted_return,
+                "regime": regime,
+                "target_position": c.target_position_pct,
+                "executed_position": executed.get(c.symbol),
+                "mode": mode,
+                "reasoning": json.dumps(full_reasoning),
+            }
+        )
+
+    for symbol in closing_symbols:
+        phase4 = reasoning.phase_selection_closed(symbol)
+        phase5 = reasoning.phase_execution(symbol, "closed", None, order_type)
+        phase6 = phase6_by_symbol.get(symbol) or reasoning.phase_reconciliation(symbol, 0.0, executed.get(symbol, 0.0), False)
+        phase7 = reasoning.phase_ongoing_monitoring(closed=True)
+        full_reasoning = reasoning.combine_phases(phase1, phase4, phase5, phase6, phase7)
+        rows.append(
+            {
+                "ts": now,
+                "symbol": symbol,
+                "feature_set_id": feature_set_id,
+                "model_version": _MODEL_VERSION,
+                "forecast": None,
+                "regime": regime,
+                "target_position": 0.0,
+                "executed_position": executed.get(symbol),
+                "mode": mode,
+                "reasoning": json.dumps(full_reasoning),
+            }
+        )
+
+    if not rows:
+        return
     pd.DataFrame(rows).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
 
@@ -153,6 +211,8 @@ def run_cycle(
     send_slack_alert(f"Trading cycle starting (mode={broker.mode}, {len(symbols)} symbols).", severity="info")
 
     pre_trade_triggers = _run_breaker_check(broker, engine)
+    phase1 = reasoning.phase_pretrade_risk(pre_trade_triggers)
+    _send_phase_alert(phase1)
     if pre_trade_triggers:
         reasons = "; ".join(r.reason for r in pre_trade_triggers)
         _flatten_and_alert(broker, reasons)
@@ -161,6 +221,19 @@ def run_cycle(
     regime = _market_regime(engine)
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
     candidates = run_screen(feature_set_id, symbols, regime=regime, is_shortable_fn=is_shortable_fn)
+
+    # Phases 2-4 (signals, forecast, selection/sizing) were built per-candidate
+    # inside run_screen — surface a one-line summary per phase here so Slack
+    # gets the same 7-phase breakdown the dashboard shows per position.
+    for phase_num in (2, 3, 4):
+        summaries = [
+            f"{c.symbol}: {next(p['summary'] for p in c.reasoning if p['phase'] == phase_num)}"
+            for c in candidates
+            if c.reasoning
+        ]
+        if summaries:
+            title = next(p["title"] for c in candidates for p in (c.reasoning or []) if p["phase"] == phase_num)
+            send_slack_alert(f"Phase {phase_num} — {title}: " + " | ".join(summaries), severity="info")
 
     if dry_run:
         logger.info("Dry run — %s candidate(s) screened, broker untouched.", len(candidates))
@@ -212,14 +285,37 @@ def run_cycle(
         except Exception:
             logger.exception("Order failed for %s — continuing with the rest of the cycle.", c.symbol)
 
+    order_type = _order_type(broker)
+    execution_summaries = [f"{s}: closed" for s in closing_symbols]
+    execution_summaries += [f"{c.symbol}: {intended_shares.get(c.symbol, 0.0):+.4g} sh via {order_type}" for c in candidates]
+    send_slack_alert("Phase 5 — Execution: " + " | ".join(execution_summaries), severity="info")
+
     time.sleep(5)  # let paper fills settle before reading positions back
     actual_positions = broker.get_positions()
-    _log_decisions(candidates, actual_positions, feature_set_id, broker.mode, regime)
 
     reconciliation = reconcile_positions(intended_shares, actual_positions)
     reconciliation_summary = summarize(reconciliation)
-    if any(r.flagged for r in reconciliation):
-        send_slack_alert(f"Reconciliation flagged divergence:\n{reconciliation_summary}", severity="warning")
+    phase6_by_symbol = {
+        r.symbol: reasoning.phase_reconciliation(r.symbol, r.intended_shares, r.actual_shares, r.flagged) for r in reconciliation
+    }
+    phase6_summaries = [p["summary"] for p in phase6_by_symbol.values()]
+    send_slack_alert(
+        "Phase 6 — Reconciliation & Post-Trade Check: " + " | ".join(phase6_summaries),
+        severity="warning" if any(r.flagged for r in reconciliation) else "info",
+    )
+
+    _log_decisions(
+        candidates, closing_symbols, actual_positions, intended_shares, feature_set_id, broker.mode, regime,
+        phase1, phase6_by_symbol, order_type,
+    )
+
+    phase7_open = len(candidates)
+    phase7_closed = len(closing_symbols)
+    send_slack_alert(
+        f"Phase 7 — Ongoing Monitoring: {phase7_open} position(s) now under hourly contradiction watch, "
+        f"{phase7_closed} closed position(s) need no further monitoring.",
+        severity="info",
+    )
 
     new_portfolio_value = broker.get_portfolio_value()
     record_equity_snapshot(new_portfolio_value, mode=broker.mode)

@@ -1,8 +1,16 @@
+import json
+
+import pandas as pd
 import pytest
 
 from execution import trading_loop
 from models.screener import TradeCandidate
+from monitoring import reasoning
 from risk.circuit_breakers import BreakerResult
+
+# Grabbed before the autouse _no_real_db_writes fixture replaces the module
+# attribute with a no-op, so tests can still exercise the real function.
+_real_log_decisions = trading_loop._log_decisions
 
 
 class _FakeBroker:
@@ -61,6 +69,50 @@ def _no_real_equity_writes(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     monkeypatch.setattr(trading_loop.time, "sleep", lambda s: None)
+
+
+def test_log_decisions_builds_full_phase_reasoning_for_candidates_and_closures(monkeypatch):
+    """
+    Exercises the real _log_decisions (not the autouse no-op mock) to check
+    that candidates get phases 1-7 merged in, and closed-out positions —
+    previously not logged as decisions at all — get a phase-4 explanation
+    of why they weren't picked, plus phases 1/5/6/7.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+
+    candidate = TradeCandidate(
+        symbol="AAPL", side="long", predicted_return=0.03, direction_agreement=0.9,
+        conviction_score=0.027, target_position_pct=0.6,
+        reasoning=[
+            reasoning.phase_signals("trend", [{"feature_name": "mom_ret_5d", "value": 0.05, "contribution": 0.02}]),
+            reasoning.phase_forecast(0.03, 0.9, 0.027),
+            reasoning.phase_selection("AAPL", "long", 0.6, n_confident=2, n_selected=2, max_leg_pct=0.7, min_leg_pct=0.3),
+        ],
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+
+    _real_log_decisions(
+        candidates=[candidate],
+        closing_symbols=["OLD1"],
+        executed={"AAPL": 10.0, "OLD1": 0.0},
+        intended_shares={"AAPL": 10.0, "OLD1": 0.0},
+        feature_set_id="v3",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+    )
+
+    rows = {r["symbol"]: r for r in captured["rows"]}
+    aapl_phases = [p["phase"] for p in json.loads(rows["AAPL"]["reasoning"])]
+    old1_phases = [p["phase"] for p in json.loads(rows["OLD1"]["reasoning"])]
+    assert aapl_phases == [1, 2, 3, 4, 5, 6, 7]
+    assert old1_phases == [1, 4, 5, 6, 7]  # no 2/3 -- no fresh forecast for a symbol that wasn't screened as a pick
 
 
 def test_run_cycle_flattens_and_skips_trading_on_pretrade_breaker(monkeypatch):

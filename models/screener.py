@@ -32,6 +32,7 @@ from data.ingest.universe import resolve_symbols
 from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND
 from models.train import load_feature_frame, load_training_frame
+from monitoring import reasoning
 from risk.sizing import target_position_size
 
 _MODEL_VERSION = "ensemble_v1"
@@ -45,10 +46,10 @@ class TradeCandidate:
     direction_agreement: float
     conviction_score: float
     target_position_pct: float
-    # Top contributing features (LightGBM pred_contrib — genuine per-prediction
-    # Tree SHAP, not just global feature importance), populated by run_screen.
-    # None for candidates built via the legacy select_trades() path, which
-    # doesn't have an ensemble/feature frame in scope to compute this from.
+    # Plain-English phase 2-4 reasoning (see monitoring/reasoning.py), populated
+    # by run_screen. trading_loop.py merges in phases 1/5/6/7 once execution
+    # facts exist. None for candidates built via the legacy select_trades()
+    # path, which doesn't have an ensemble/feature frame in scope for this.
     reasoning: list[dict] | None = None
 
 
@@ -252,12 +253,20 @@ def _attach_reasoning(
     ensemble: EnsembleForecastModel,
     latest_features: pd.DataFrame,
     feature_cols: list[str],
+    scored: pd.DataFrame,
+    regime: str,
+    max_leg_pct: float,
+    min_leg_pct: float,
+    min_direction_agreement: float,
     top_n: int = 5,
 ) -> None:
     """
-    Mutates each candidate in place, attaching the top `top_n` features by
-    |contribution| (LightGBM pred_contrib) — this is what actually answers
-    "why did the model pick this," not just the final forecast number.
+    Mutates each candidate in place, attaching plain-English reasoning for
+    phases 2-4 of the decision (see monitoring/reasoning.py for the full
+    7-phase model; phases 1/5/6/7 get merged in later by trading_loop.py,
+    once execution/reconciliation facts exist). Phase 2/3 are built from
+    the top `top_n` SHAP feature contributions (LightGBM pred_contrib) —
+    genuine per-prediction attribution, not just global feature importance.
     """
     if not candidates:
         return
@@ -266,17 +275,33 @@ def _attach_reasoning(
     rows = latest_features.set_index("symbol").loc[symbols]
     X = rows.reindex(columns=feature_cols)
     contributions = ensemble.predict_contributions(X)
+    n_confident = int(scored["confident"].sum())
 
     for candidate in candidates:
         contrib_row = contributions.loc[candidate.symbol].drop("base_value")
-        top_features = contrib_row.abs().sort_values(ascending=False).head(top_n).index
-        candidate.reasoning = [
+        top_feature_names = contrib_row.abs().sort_values(ascending=False).head(top_n).index
+        top_features = [
             {
                 "feature_name": feat,
                 "value": None if pd.isna(rows.loc[candidate.symbol, feat]) else float(rows.loc[candidate.symbol, feat]),
                 "contribution": float(contrib_row[feat]),
             }
-            for feat in top_features
+            for feat in top_feature_names
+        ]
+        candidate.reasoning = [
+            reasoning.phase_signals(regime, top_features),
+            reasoning.phase_forecast(
+                candidate.predicted_return, candidate.direction_agreement, candidate.conviction_score, min_direction_agreement
+            ),
+            reasoning.phase_selection(
+                candidate.symbol,
+                candidate.side,
+                candidate.target_position_pct,
+                n_confident,
+                len(candidates),
+                max_leg_pct,
+                min_leg_pct,
+            ),
         ]
 
 
@@ -323,7 +348,17 @@ def run_screen(
         total_deploy_pct=total_deploy_pct,
         is_shortable_fn=is_shortable_fn,
     )
-    _attach_reasoning(candidates, ensemble, latest, feature_cols)
+    _attach_reasoning(
+        candidates,
+        ensemble,
+        latest,
+        feature_cols,
+        scored,
+        regime,
+        settings.max_concentrated_position_pct,
+        settings.min_concentrated_position_pct,
+        min_direction_agreement,
+    )
     return candidates
 
 

@@ -53,23 +53,44 @@ function renderLineChart(container, points, { color = "#5b8cff", height = 160, z
 }
 
 // ---------- Positions ----------
-function reasoningBarsHTML(reasoning) {
-  if (!reasoning || reasoning.length === 0) {
-    return '<div class="no-decision">No reasoning captured for this decision (logged before reasoning tracking was added).</div>';
-  }
+
+// Legacy fallback for decisions logged before the 7-phase reasoning model —
+// a flat list of {feature_name, value, contribution} SHAP contributions.
+function legacyReasoningBarsHTML(reasoning) {
   const maxAbs = Math.max(...reasoning.map((r) => Math.abs(r.contribution))) || 1;
   return reasoning
     .map((r) => {
       const pct = (Math.abs(r.contribution) / maxAbs) * 50;
       const cls = r.contribution >= 0 ? "pos" : "neg";
-      const style = r.contribution >= 0 ? `width:${pct}%` : `width:${pct}%`;
       return `
         <div class="reasoning-row">
           <div class="reasoning-feature" title="${r.feature_name}">${r.feature_name}</div>
-          <div class="reasoning-bar-track"><div class="reasoning-bar ${cls}" style="${style}"></div></div>
+          <div class="reasoning-bar-track"><div class="reasoning-bar ${cls}" style="width:${pct}%"></div></div>
           <div class="reasoning-value">${fmt.num(r.contribution, 4)}</div>
         </div>`;
     })
+    .join("");
+}
+
+// Current format: a list of phase dicts {phase, title, summary, lines[]},
+// one per stage of the decision (see monitoring/reasoning.py). Rendered as
+// plain-English cards in phase order, not a features/contribution chart.
+function reasoningPhasesHTML(reasoning) {
+  if (!reasoning || reasoning.length === 0) {
+    return '<div class="no-decision">No reasoning captured for this decision (logged before reasoning tracking was added).</div>';
+  }
+  if (reasoning[0].phase === undefined) {
+    return legacyReasoningBarsHTML(reasoning);
+  }
+  return reasoning
+    .map(
+      (p) => `
+      <div class="phase-card">
+        <div class="phase-head">Phase ${p.phase} — ${p.title}</div>
+        <div class="phase-summary">${p.summary}</div>
+        <ul class="phase-lines">${p.lines.map((line) => `<li>${line}</li>`).join("")}</ul>
+      </div>`
+    )
     .join("");
 }
 
@@ -84,8 +105,8 @@ function positionCardHTML(p, idx) {
         <div><div class="label">Target %</div>${fmt.pct(d.target_position, 1)}</div>
         <div><div class="label">Decided</div>${fmt.time(d.ts)}</div>
       </div>
-      <div class="reasoning-toggle" data-idx="${idx}">▸ Why this trade</div>
-      <div class="reasoning-body" id="reasoning-${idx}">${reasoningBarsHTML(d.reasoning)}</div>
+      <div class="reasoning-toggle" data-idx="${idx}">▸ Why this trade — all 7 phases</div>
+      <div class="reasoning-body" id="reasoning-${idx}">${reasoningPhasesHTML(d.reasoning)}</div>
     `
     : '<div class="no-decision">No matching decision found for this position.</div>';
 
@@ -252,7 +273,7 @@ async function loadDecisions(symbol) {
   tbody.innerHTML = rows
     .map((r, i) => {
       const reasoningCell = r.reasoning && r.reasoning.length
-        ? `<span class="reasoning-link" data-decision-idx="${i}">${r.reasoning.length} feature(s)</span>`
+        ? `<span class="reasoning-link" data-decision-idx="${i}">${r.reasoning.length} phase(s)</span>`
         : '<span class="muted">—</span>';
       return `
       <tr>
@@ -271,7 +292,10 @@ async function loadDecisions(symbol) {
   tbody.querySelectorAll(".reasoning-link").forEach((el) => {
     el.addEventListener("click", () => {
       const r = rows[Number(el.dataset.decisionIdx)];
-      alert(r.reasoning.map((f) => `${f.feature_name}: ${fmt.num(f.contribution, 4)} (value=${fmt.num(f.value, 3)})`).join("\n"));
+      const text = r.reasoning[0].phase !== undefined
+        ? r.reasoning.map((p) => `Phase ${p.phase} — ${p.title}\n${p.lines.map((l) => `  • ${l}`).join("\n")}`).join("\n\n")
+        : r.reasoning.map((f) => `${f.feature_name}: ${fmt.num(f.contribution, 4)} (value=${fmt.num(f.value, 3)})`).join("\n");
+      alert(text);
     });
   });
 }
