@@ -91,6 +91,28 @@ def test_fetch_fundamentals_skips_reports_without_a_date(monkeypatch):
     assert df.empty
 
 
+def test_fetch_fundamentals_skips_a_symbol_that_errors_instead_of_losing_the_whole_batch(monkeypatch):
+    """
+    Regression test, hit live: a single transient network error on one
+    symbol used to propagate out of fetch_fundamentals entirely, discarding
+    every other symbol already successfully fetched. One bad symbol must
+    not take down the whole batch.
+    """
+    import requests
+
+    def fake_get(url, params=None, timeout=None):
+        if params["ticker"] == "BAD":
+            raise requests.exceptions.ConnectionError("read timed out")
+        return _FakeResponse({"results": [_polygon_report("2026-06-30", eps=2.5, revenue=1_000_000.0)]})
+
+    monkeypatch.setattr(fundamentals, "polygon_get", fake_get)
+    monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
+
+    df = fundamentals.fetch_fundamentals(["SPY", "BAD", "MSFT"], sleep_seconds=0)
+
+    assert set(df["symbol"]) == {"SPY", "MSFT"}  # BAD skipped, the rest survived
+
+
 def test_fetch_fundamentals_dedupes_same_key_across_reports(monkeypatch):
     """
     Regression test, hit live on the full S&P 500 universe: Polygon can
