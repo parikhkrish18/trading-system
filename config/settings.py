@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     # --- Alerts ---
     slack_webhook_url: str = Field(default="", alias="SLACK_WEBHOOK_URL")
 
+    # --- Trade approval (Telegram) ---
+    # Used by execution/approval_loop.py to send trade proposals to a human
+    # and read back approve/reject replies. Blank = approval transport
+    # unconfigured; the loop's Telegram step is a stub either way today.
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+
     # --- Risk limits ---
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
     max_single_position_pct: float = Field(default=0.25, alias="MAX_SINGLE_POSITION_PCT")
