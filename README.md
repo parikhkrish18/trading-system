@@ -68,9 +68,12 @@ Fully working now:
   sizing, and the highest-risk modules (decay sim, validators, circuit breakers)
 
 Stubbed with a clear interface, needs a vendor/API key + your judgment calls:
-- Regime (trend-vs-chop) classifier (rule-based ADX stub — swap in a trained
-  model once you have walk-forward infra validated and labeled regime history;
-  no vendor needed, this one's a training-data problem, not an API problem)
+- Regime (trend-vs-chop) classifier — the rule-based ADX version is now wired
+  into the screener per symbol (each name is tagged trend/chop from its latest
+  `adx_14` and chop names get their position damped via `risk/sizing.py`;
+  the tag is also logged to `decisions.regime`). The trainable variant is
+  still unwired — swap it in once you have labeled regime history; no vendor
+  needed, this one's a training-data problem, not an API problem
 
 Explicitly **not built yet**: nothing wires the screener's output to
 `execution/broker.py` — it produces and logs candidates, it doesn't place

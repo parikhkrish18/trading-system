@@ -2,8 +2,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from models.regime.trend_chop_classifier import TREND
-from models.screener import build_correlation_matrix, score_universe, select_trades
+from models.regime.trend_chop_classifier import CHOP, TREND
+from models.screener import (
+    TradeCandidate,
+    build_correlation_matrix,
+    log_candidates,
+    per_symbol_regimes,
+    score_universe,
+    select_trades,
+)
 
 
 class _FakeEnsemble:
@@ -148,6 +155,83 @@ def test_select_trades_shortable_check_does_not_affect_longs():
     )
 
     assert len(candidates) == 1
+
+
+def test_per_symbol_regimes_splits_on_adx_threshold():
+    latest = pd.DataFrame({"symbol": ["AAPL", "TSLA", "MMM"], "adx_14": [30.0, 10.0, np.nan]})
+
+    regimes = per_symbol_regimes(latest, adx_threshold=25.0)
+
+    assert regimes == {"AAPL": TREND, "TSLA": CHOP}  # NaN ADX omitted -> caller falls back to TREND
+
+
+def test_per_symbol_regimes_without_adx_column_returns_empty():
+    assert per_symbol_regimes(pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})) == {}
+
+
+def test_select_trades_damps_chop_symbols_and_tags_regime():
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "MMM", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    corr = pd.DataFrame(
+        {"AAPL": [1.0, 0.0], "MMM": [0.0, 1.0]}, index=["AAPL", "MMM"]
+    )
+
+    candidates = select_trades(
+        scored,
+        regime=TREND,
+        forecast_scale=0.05,
+        max_position_pct=0.25,
+        max_short_position_pct=0.15,
+        max_correlated_exposure_pct=0.50,
+        correlation_matrix=corr,
+        regime_by_symbol={"AAPL": TREND, "MMM": CHOP},
+    )
+
+    by_symbol = {c.symbol: c for c in candidates}
+    assert by_symbol["AAPL"].regime == TREND
+    assert by_symbol["MMM"].regime == CHOP
+    # identical forecasts, but the chop symbol must be sized strictly smaller
+    assert abs(by_symbol["MMM"].target_position_pct) < abs(by_symbol["AAPL"].target_position_pct)
+
+
+def test_select_trades_falls_back_to_global_regime_for_unmapped_symbols():
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    )
+    corr = pd.DataFrame({"AAPL": [1.0]}, index=["AAPL"])
+
+    candidates = select_trades(
+        scored, regime=TREND, forecast_scale=0.05, max_position_pct=0.25,
+        max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr,
+        regime_by_symbol={"TSLA": CHOP},  # AAPL not in the map
+    )
+
+    assert candidates[0].regime == TREND
+
+
+def test_log_candidates_writes_regime(monkeypatch):
+    captured = {}
+
+    def fake_to_sql(self, name, engine, **kwargs):
+        captured["table"] = name
+        captured["df"] = self
+
+    monkeypatch.setattr("models.screener.get_engine", lambda: object())
+    monkeypatch.setattr(pd.DataFrame, "to_sql", fake_to_sql)
+
+    candidate = TradeCandidate(
+        symbol="MMM", side="long", predicted_return=0.03, direction_agreement=0.9,
+        conviction_score=0.027, target_position_pct=0.05, regime=CHOP,
+    )
+    n = log_candidates([candidate], feature_set_id="v3")
+
+    assert n == 1
+    assert captured["table"] == "decisions"
+    assert list(captured["df"]["regime"]) == [CHOP]
 
 
 def test_build_correlation_matrix_from_prices():

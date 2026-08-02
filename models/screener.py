@@ -27,7 +27,7 @@ from config.settings import settings
 from data.ingest.db import get_engine
 from data.ingest.universe import resolve_symbols
 from models.forecast.ensemble import EnsembleForecastModel
-from models.regime.trend_chop_classifier import TREND
+from models.regime.trend_chop_classifier import TREND, RuleBasedRegime
 from models.train import load_feature_frame, load_training_frame
 from risk.sizing import target_position_size
 
@@ -42,6 +42,30 @@ class TradeCandidate:
     direction_agreement: float
     conviction_score: float
     target_position_pct: float
+    regime: str = TREND  # "trend" | "chop", per-symbol (see per_symbol_regimes)
+
+
+def per_symbol_regimes(
+    latest_features: pd.DataFrame,
+    adx_threshold: float = 25.0,
+    adx_col: str = "adx_14",
+) -> dict[str, str]:
+    """
+    Tag each symbol trend/chop from its latest ADX via RuleBasedRegime, so
+    risk.sizing's chop dampening actually engages per symbol instead of the
+    whole book being sized as if everything were trending.
+
+    Symbols with a missing/NaN ADX (not enough price history yet) fall back
+    to TREND — full size, matching the behavior before regimes were wired in —
+    rather than silently getting damped by a NaN comparison.
+    """
+    if adx_col not in latest_features.columns:
+        return {}
+    known = latest_features.loc[latest_features[adx_col].notna(), ["symbol", adx_col]]
+    if known.empty:
+        return {}
+    labels = RuleBasedRegime(adx_threshold=adx_threshold).predict(known[adx_col])
+    return dict(zip(known["symbol"], labels))
 
 
 def load_latest_features(feature_set_id: str, symbols: list[str]) -> pd.DataFrame:
@@ -108,12 +132,16 @@ def select_trades(
     top_k: int = 10,
     current_positions: dict[str, float] | None = None,
     is_shortable_fn: Callable[[str], bool] | None = None,
+    regime_by_symbol: dict[str, str] | None = None,
 ) -> list[TradeCandidate]:
     """
     Filters `scored` down to the top_k confident candidates and sizes each
     via risk.sizing.target_position_size — reused unchanged; it already
     handles signed forecasts, regime damping, and correlation caps
     generically, nothing here is symbol- or ETF-specific.
+
+    `regime_by_symbol` (see per_symbol_regimes) overrides `regime` for the
+    symbols it contains; `regime` is the fallback for everything else.
 
     Short candidates that fail `is_shortable_fn` (when given — pass e.g.
     execution.broker_alpaca.AlpacaBroker.is_shortable) are dropped rather
@@ -122,6 +150,7 @@ def select_trades(
     with no live broker connection).
     """
     current_positions = current_positions or {}
+    regime_by_symbol = regime_by_symbol or {}
     confident = scored.loc[scored["confident"]].sort_values("conviction_score", ascending=False)
 
     candidates: list[TradeCandidate] = []
@@ -136,10 +165,11 @@ def select_trades(
         if side == "short" and is_shortable_fn is not None and not is_shortable_fn(symbol):
             continue
 
+        symbol_regime = regime_by_symbol.get(symbol, regime)
         size = target_position_size(
             forecast=forecast,
             forecast_scale=forecast_scale,
-            regime=regime,
+            regime=symbol_regime,
             symbol=symbol,
             current_positions=current_positions,
             correlation_matrix=correlation_matrix,
@@ -158,6 +188,7 @@ def select_trades(
                 direction_agreement=float(row["direction_agreement"]),
                 conviction_score=float(row["conviction_score"]),
                 target_position_pct=float(size),
+                regime=symbol_regime,
             )
         )
 
@@ -187,10 +218,12 @@ def run_screen(
     scored = score_universe(ensemble, latest, feature_cols, min_direction_agreement, min_abs_return)
 
     correlation_matrix = build_correlation_matrix(train_df[["symbol", "ts", "close"]])
+    regime_by_symbol = per_symbol_regimes(latest)
 
     return select_trades(
         scored,
         regime=regime,
+        regime_by_symbol=regime_by_symbol,
         forecast_scale=forecast_scale,
         max_position_pct=settings.max_single_position_pct,
         max_short_position_pct=settings.max_short_position_pct,
@@ -213,7 +246,7 @@ def log_candidates(candidates: list[TradeCandidate], feature_set_id: str, mode: 
             "feature_set_id": feature_set_id,
             "model_version": _MODEL_VERSION,
             "forecast": c.predicted_return,
-            "regime": None,
+            "regime": c.regime,
             "target_position": c.target_position_pct,
             "executed_position": None,
             "mode": mode,
@@ -254,9 +287,12 @@ def main() -> None:
         print("No candidates cleared the confidence bar this run.")
         return
 
-    print(f"{'symbol':<8}{'side':<7}{'pred_return':>13}{'agreement':>12}{'target_pct':>12}")
+    print(f"{'symbol':<8}{'side':<7}{'regime':<7}{'pred_return':>13}{'agreement':>12}{'target_pct':>12}")
     for c in candidates:
-        print(f"{c.symbol:<8}{c.side:<7}{c.predicted_return:>13.4f}{c.direction_agreement:>12.2f}{c.target_position_pct:>12.4f}")
+        print(
+            f"{c.symbol:<8}{c.side:<7}{c.regime:<7}"
+            f"{c.predicted_return:>13.4f}{c.direction_agreement:>12.2f}{c.target_position_pct:>12.4f}"
+        )
 
     if args.log:
         n = log_candidates(candidates, args.feature_set_id)
