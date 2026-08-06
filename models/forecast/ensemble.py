@@ -69,6 +69,24 @@ class EnsembleForecastModel:
             index=X.index,
         )
 
+    def predict_contributions(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Per-row, per-feature contributions averaged across ensemble members —
+        the row-level counterpart to predict(). Returns shape
+        (n_rows, n_features + 1) with the base value in the trailing column,
+        matching ForecastModel.predict_contributions.
+
+        Averaging is the right aggregation here precisely because predict()
+        averages too: the mean of the members' contributions sums to the mean
+        of their predictions, so the numbers shown as evidence add up to the
+        forecast the screener actually acted on rather than to some other
+        model's answer.
+        """
+        if not self.models:
+            raise RuntimeError("Ensemble not trained yet — call fit() first.")
+        per_model = np.stack([m.predict_contributions(X) for m in self.models])  # (n_models, n_rows, n_feat+1)
+        return per_model.mean(axis=0)
+
     def feature_importance(self) -> pd.Series:
         """Average gain-based feature importance across ensemble members."""
         if not self.models:

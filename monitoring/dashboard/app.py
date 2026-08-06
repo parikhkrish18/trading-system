@@ -21,6 +21,12 @@ from sqlalchemy import bindparam, text
 from data.ingest.db import get_engine
 from models.regime.trend_chop_classifier import CHOP, TREND
 from monitoring.breaker_state import load_latest_breaker_state
+from monitoring.dashboard.evidence import (
+    confidence_note,
+    evidence_table,
+    news_sentiment_note,
+    regime_note,
+)
 from monitoring.dashboard.picks import (
     COL_FORECAST,
     COL_REGIME,
@@ -80,11 +86,29 @@ COLORS = _palette()
 @st.cache_data(ttl=60)
 def load_recent_decisions(limit: int = 500) -> pd.DataFrame:
     query = text(
-        "SELECT ts, symbol, forecast, regime, target_position, executed_position, mode, "
-        "feature_set_id, model_version "
+        "SELECT ts, symbol, forecast, direction_agreement, regime, target_position, "
+        "executed_position, mode, feature_set_id, model_version "
         "FROM decisions ORDER BY ts DESC LIMIT :limit"
     )
     return pd.read_sql(query, engine, params={"limit": limit})
+
+
+@st.cache_data(ttl=60)
+def load_batch_evidence(batch_ts) -> pd.DataFrame:
+    """
+    Every "why this pick" row belonging to one screener run (see
+    data/schema/004_decision_evidence.sql). Loaded per batch rather than per
+    symbol so the panel opens without a round trip per expander.
+    """
+    if batch_ts is None or pd.isna(batch_ts):
+        return pd.DataFrame(
+            columns=["symbol", "feature_name", "feature_value", "contribution", "contribution_rank"]
+        )
+    query = text(
+        "SELECT symbol, feature_name, feature_value, contribution, contribution_rank "
+        "FROM decision_evidence WHERE ts = :ts ORDER BY symbol, contribution_rank"
+    )
+    return pd.read_sql(query, engine, params={"ts": pd.Timestamp(batch_ts).to_pydatetime()})
 
 
 @st.cache_data(ttl=300)
@@ -267,6 +291,43 @@ else:
         f"**Placed?** says whether the trade was actually sent to the broker — "
         f"the screener only proposes."
     )
+
+    # --- Why this pick? ------------------------------------------------------
+    st.markdown("##### Why this pick?")
+    st.caption(
+        "Open a stock to see what the model was actually reacting to. Each line is "
+        "one thing it measured, what it saw, and which way that pushed the "
+        "prediction. The factors are ranked — the top one is the biggest single "
+        "reason the stock made the shortlist."
+    )
+
+    batch_evidence = load_batch_evidence(summary["last_run"])
+    batch_by_symbol = batch.set_index("symbol")
+
+    for symbol in table["Symbol"]:
+        pick = batch_by_symbol.loc[symbol]
+        # A symbol can in principle appear twice in one batch; take the first.
+        if isinstance(pick, pd.DataFrame):
+            pick = pick.iloc[0]
+
+        direction = "Long" if float(pick["target_position"]) > 0 else "Short"
+        with st.expander(f"{symbol} — {direction}, why?"):
+            symbol_evidence = batch_evidence[batch_evidence["symbol"] == symbol]
+
+            st.write(regime_note(pick.get("regime")))
+            st.write(confidence_note(pick.get("direction_agreement")))
+
+            rows = evidence_table(symbol_evidence)
+            if rows.empty:
+                st.info(
+                    "No per-factor evidence stored for this pick. Evidence is recorded "
+                    "from the screener run that logged it — picks logged before this "
+                    "panel existed won't have any."
+                )
+            else:
+                st.dataframe(rows, width="stretch", hide_index=True)
+
+            st.caption(news_sentiment_note(symbol_evidence))
 
     with st.expander("Full decision history (all logged runs)"):
         st.dataframe(decisions, width="stretch", hide_index=True)

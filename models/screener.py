@@ -11,6 +11,13 @@ This module does NOT place orders — it produces candidates and logs them
 to the `decisions` table (mode="paper", executed_position left null).
 Wiring the output to execution/broker.py is a separate step.
 
+Alongside each logged candidate it records *why* the model picked it —
+the per-feature contributions behind that symbol's forecast, into the
+`decision_evidence` table (see models/evidence.py). That evidence is
+captured at screening time on purpose: the ensemble is retrained on every
+run, so a contribution recomputed a day later would be a different model's
+answer to a question about this model's decision.
+
 Usage:
     python -m models.screener --feature-set-id v3 --universe --top-k 10
 """
@@ -19,6 +26,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import logging
 from collections.abc import Callable
 
 import pandas as pd
@@ -26,10 +34,13 @@ import pandas as pd
 from config.settings import settings
 from data.ingest.db import get_engine
 from data.ingest.universe import resolve_symbols
+from models.evidence import PickEvidence, evidence_rows, extract_evidence
 from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND, RuleBasedRegime
 from models.train import load_feature_frame, load_training_frame
 from risk.sizing import target_position_size
+
+logger = logging.getLogger(__name__)
 
 _MODEL_VERSION = "ensemble_v1"
 
@@ -43,6 +54,9 @@ class TradeCandidate:
     conviction_score: float
     target_position_pct: float
     regime: str = TREND  # "trend" | "chop", per-symbol (see per_symbol_regimes)
+    # Why the model wanted this symbol — attached after sizing, and None when
+    # the ensemble can't report contributions. Never gates the trade itself.
+    evidence: PickEvidence | None = None
 
 
 def per_symbol_regimes(
@@ -220,7 +234,7 @@ def run_screen(
     correlation_matrix = build_correlation_matrix(train_df[["symbol", "ts", "close"]])
     regime_by_symbol = per_symbol_regimes(latest)
 
-    return select_trades(
+    candidates = select_trades(
         scored,
         regime=regime,
         regime_by_symbol=regime_by_symbol,
@@ -233,12 +247,56 @@ def run_screen(
         is_shortable_fn=is_shortable_fn,
     )
 
+    return attach_evidence(candidates, ensemble, latest, feature_cols)
 
-def log_candidates(candidates: list[TradeCandidate], feature_set_id: str, mode: str = "paper") -> int:
-    """Writes the shortlist to the decisions table — proposed, not executed (executed_position left null)."""
+
+def attach_evidence(
+    candidates: list[TradeCandidate],
+    ensemble: EnsembleForecastModel,
+    latest_features: pd.DataFrame,
+    feature_cols: list[str],
+) -> list[TradeCandidate]:
+    """
+    Fill in each candidate's `evidence` from the ensemble's per-feature
+    contributions, for the shortlist only.
+
+    Explaining a decision must never be able to change or block it, so this
+    runs after sizing and swallows any failure: a broken or contribution-less
+    model costs the "Why this pick?" panel, not the trade.
+    """
+    if not candidates:
+        return candidates
+    try:
+        evidence = extract_evidence(
+            ensemble, latest_features, feature_cols, symbols=[c.symbol for c in candidates]
+        )
+    except Exception:  # noqa: BLE001 — evidence is explanatory, never load-bearing
+        logger.exception("Could not extract per-feature evidence; picks are unaffected.")
+        return candidates
+
+    for candidate in candidates:
+        candidate.evidence = evidence.get(candidate.symbol)
+    return candidates
+
+
+def log_candidates(
+    candidates: list[TradeCandidate],
+    feature_set_id: str,
+    mode: str = "paper",
+    ts: dt.datetime | None = None,
+) -> int:
+    """
+    Writes the shortlist to the decisions table — proposed, not executed
+    (executed_position left null).
+
+    `ts` stamps every candidate in the run identically, which is what makes a
+    "batch" a well-defined set downstream (the approval loop's pending query,
+    the dashboard's latest_batch). Pass the same value to log_evidence so the
+    evidence rows link back to these decisions.
+    """
     if not candidates:
         return 0
-    now = dt.datetime.now(tz=dt.UTC)
+    now = ts or dt.datetime.now(tz=dt.UTC)
     rows = [
         {
             "ts": now,
@@ -246,6 +304,7 @@ def log_candidates(candidates: list[TradeCandidate], feature_set_id: str, mode: 
             "feature_set_id": feature_set_id,
             "model_version": _MODEL_VERSION,
             "forecast": c.predicted_return,
+            "direction_agreement": c.direction_agreement,
             "regime": c.regime,
             "target_position": c.target_position_pct,
             "executed_position": None,
@@ -256,6 +315,32 @@ def log_candidates(candidates: list[TradeCandidate], feature_set_id: str, mode: 
     df = pd.DataFrame(rows)
     engine = get_engine()
     df.to_sql("decisions", engine, if_exists="append", index=False)
+    return len(rows)
+
+
+def log_evidence(
+    candidates: list[TradeCandidate], feature_set_id: str, ts: dt.datetime | None = None
+) -> int:
+    """
+    Writes each candidate's per-feature evidence to `decision_evidence`,
+    keyed by the same (ts, symbol) the matching decisions rows carry — so
+    `ts` must be the value log_candidates was given for this batch.
+
+    Candidates without evidence (see attach_evidence) are simply skipped;
+    the decision row still stands on its own, the panel just has nothing to
+    show for it.
+    """
+    now = ts or dt.datetime.now(tz=dt.UTC)
+    rows = [
+        row
+        for candidate in candidates
+        if candidate.evidence is not None
+        for row in evidence_rows(candidate.evidence, now, feature_set_id, _MODEL_VERSION)
+    ]
+    if not rows:
+        return 0
+    engine = get_engine()
+    pd.DataFrame(rows).to_sql("decision_evidence", engine, if_exists="append", index=False)
     return len(rows)
 
 
@@ -295,8 +380,13 @@ def main() -> None:
         )
 
     if args.log:
-        n = log_candidates(candidates, args.feature_set_id)
+        # One timestamp for both writes — it's the link between a decision and
+        # the evidence explaining it.
+        batch_ts = dt.datetime.now(tz=dt.UTC)
+        n = log_candidates(candidates, args.feature_set_id, ts=batch_ts)
+        n_evidence = log_evidence(candidates, args.feature_set_id, ts=batch_ts)
         print(f"\nLogged {n} candidate(s) to decisions (mode=paper, not executed).")
+        print(f"Logged {n_evidence} evidence row(s) to decision_evidence.")
 
 
 if __name__ == "__main__":

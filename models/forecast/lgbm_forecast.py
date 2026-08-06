@@ -61,6 +61,23 @@ class ForecastModel:
             raise RuntimeError("Model not trained yet — call fit() first.")
         return self.model.predict(X, num_iteration=self.model.best_iteration or None)
 
+    def predict_contributions(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Per-row, per-feature SHAP contributions for this model's predictions —
+        LightGBM's `pred_contrib=True`. Returns shape (n_rows, n_features + 1);
+        the trailing column is the base value (the model's expected output
+        before any feature moves it), so each row sums exactly to that row's
+        prediction. That exact-sum property is why this is used for the "why
+        this pick" evidence rather than feature_importance(), which is a
+        model-wide average and can't say anything about one symbol.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not trained yet — call fit() first.")
+        contributions = self.model.predict(
+            X, num_iteration=self.model.best_iteration or None, pred_contrib=True
+        )
+        return np.asarray(contributions)
+
     def feature_importance(self) -> pd.Series:
         if self.model is None:
             raise RuntimeError("Model not trained yet.")
