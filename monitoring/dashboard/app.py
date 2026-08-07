@@ -58,7 +58,7 @@ from monitoring.dashboard.whatif import (
     whatif_table,
 )
 from monitoring.equity import load_equity_curve
-from monitoring.forecast_accuracy import compute_forecast_accuracy
+from monitoring.forecast_accuracy import BACKFILL_MODE, accuracy_by_mode, compute_forecast_accuracy
 
 st.set_page_config(page_title="Trading System Monitor", layout="wide")
 
@@ -117,6 +117,26 @@ def load_recent_decisions(limit: int = 500) -> pd.DataFrame:
         "FROM decisions ORDER BY ts DESC LIMIT :limit"
     )
     return pd.read_sql(query, engine, params={"limit": limit})
+
+
+@st.cache_data(ttl=60)
+def load_forecasted_decisions(lookback_days: int = 1095) -> pd.DataFrame:
+    """
+    Every decision with a forecast in the trailing window, for the accuracy
+    panel — all modes, including the historical replays written by
+    scripts/backfill_decisions.py.
+
+    Deliberately not load_recent_decisions(): that one is capped for display
+    and sorted newest-first, so the matured predictions this panel needs are
+    exactly the rows it would drop first. Accuracy asks a different question
+    from "what happened lately" and gets its own query.
+    """
+    cutoff = dt.datetime.now(tz=dt.UTC) - dt.timedelta(days=lookback_days)
+    query = text(
+        "SELECT ts, symbol, forecast, mode FROM decisions "
+        "WHERE forecast IS NOT NULL AND ts >= :cutoff ORDER BY ts"
+    )
+    return pd.read_sql(query, engine, params={"cutoff": cutoff})
 
 
 @st.cache_data(ttl=60)
@@ -586,8 +606,8 @@ st.caption(
     "often than a coin flip — the grey line on the chart marks that 50% mark."
 )
 
-forecasted = decisions.dropna(subset=["forecast"])[["symbol", "ts", "forecast"]] if not decisions.empty else decisions
-if decisions.empty or forecasted.empty:
+forecasted = load_forecasted_decisions()
+if forecasted.empty:
     st.info("Needs logged picks with forecasts before accuracy can be measured.")
 else:
     accuracy = compute_forecast_accuracy(
@@ -600,6 +620,25 @@ else:
         )
     else:
         st.metric("Directional hit rate", f"{accuracy['hit'].mean():.1%}")
+
+        # Most of this panel's history comes from replaying the screener over
+        # past dates, not from picks anyone acted on. Saying so is the whole
+        # difference between a measurement and a claim.
+        by_mode = accuracy_by_mode(accuracy)
+        if not by_mode.empty:
+            st.caption(
+                "Scored predictions by source — "
+                + " · ".join(
+                    f"**{row.label}**: {row.n} scored, {row.hit_rate:.1%} hit rate"
+                    for row in by_mode.itertuples()
+                )
+            )
+            if BACKFILL_MODE in set(by_mode["mode"]):
+                st.caption(
+                    "Backfilled rows come from `scripts/backfill_decisions.py`, which re-runs "
+                    "the screener on past Mondays using only data that existed on each of those "
+                    "dates. They are real out-of-sample predictions, but they were never traded."
+                )
         rolling = (
             accuracy.sort_values("ts")
             .assign(hit_rate=lambda d: d["hit"].astype(float).rolling(20, min_periods=5).mean())
