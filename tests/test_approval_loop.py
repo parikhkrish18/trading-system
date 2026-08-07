@@ -972,3 +972,50 @@ def test_no_cli_mode_can_reach_the_execution_path(monkeypatch):
 
 def _unreachable(*args, **kwargs):
     raise AssertionError("no CLI mode may reach this")
+
+
+# --- the local echo must never be what stops a notification ---------------
+
+
+def test_encodable_replaces_what_a_windows_console_cannot_print():
+    """
+    cp1252 is what Windows picks for a redirected stdout, and it has no 🤖 —
+    which crashed --notify *before* it sent anything, under exactly the
+    redirect-to-a-log-file use this mode is for.
+    """
+    safe = approval_loop._encodable(format_pick_line(_decision(symbol="TSLA")), "cp1252")
+
+    safe.encode("cp1252")  # the point: this no longer raises
+    assert "Pulse proposes" in safe and "TSLA" in safe
+
+
+def test_encodable_leaves_a_utf8_console_untouched():
+    line = format_pick_line(_decision())
+
+    assert approval_loop._encodable(line, "utf-8") == line
+    assert "🤖" in approval_loop._encodable(line, "utf-8")
+
+
+def test_encodable_survives_an_unknown_or_missing_encoding():
+    line = format_pick_line(_decision())
+
+    assert approval_loop._encodable(line, None) == line
+    assert approval_loop._encodable(line, "not-a-real-codec") == line
+
+
+def test_notify_and_setup_default_to_the_safe_printer():
+    """A default of plain print() is what made the crash reachable."""
+    import inspect
+
+    for fn in (run_notify, run_telegram_setup):
+        assert inspect.signature(fn).parameters["print_fn"].default is approval_loop._print_encodable
+
+
+def test_the_phone_still_gets_the_real_characters(monkeypatch, telegram_configured):
+    """Sanitising is for the console only — the message itself is untouched."""
+    sender = _Sender()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [_decision()])
+
+    run_notify(print_fn=lambda line: None, send_fn=sender)
+
+    assert "🤖" in sender.messages[0]["text"]

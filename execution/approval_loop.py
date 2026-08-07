@@ -664,6 +664,37 @@ def run_dry_run(
 # request_approvals (chokepoint 1) is still a stub for exactly that reason.
 
 
+def _encodable(text: str, encoding: str | None) -> str:
+    """
+    `text` with anything the target encoding cannot represent replaced.
+
+    Only ever applied to what is echoed locally. What goes to Telegram is sent
+    as JSON over HTTPS and is unaffected — the phone gets the real characters
+    even when the console gets a "?".
+    """
+    enc = encoding or "utf-8"
+    try:
+        text.encode(enc)
+    except UnicodeEncodeError:
+        return text.encode(enc, errors="replace").decode(enc, errors="replace")
+    except LookupError:
+        pass  # unknown encoding name; leave it alone rather than mangle it
+    return text
+
+
+def _print_encodable(line: str) -> None:
+    """
+    print(), but it cannot be the reason a notification fails to go out.
+
+    Windows picks cp1252 for a redirected stdout, and cp1252 cannot encode the
+    🤖 in a pick line — so `--notify > run.log`, or the same command under a
+    scheduler, died on the local echo *before* sending anything. That is the
+    one way this mode was most likely to actually be run. Found by running it
+    with the output piped, not by a test.
+    """
+    print(_encodable(str(line), getattr(sys.stdout, "encoding", None)))
+
+
 NOTIFY_FOOTER = (
     "Replies to this chat are NOT read — this is a notification, not an approval "
     "prompt. Nothing has been sent to a broker.\n"
@@ -695,7 +726,7 @@ def format_notification(decisions: list[PendingDecision]) -> str:
 
 
 def run_telegram_setup(
-    print_fn: Callable[[str], None] = print,
+    print_fn: Callable[[str], None] = _print_encodable,
     fetch_fn: Callable[..., list[dict]] = telegram.fetch_updates,
 ) -> int:
     """
@@ -754,7 +785,7 @@ def run_telegram_setup(
 
 
 def run_notify(
-    print_fn: Callable[[str], None] = print,
+    print_fn: Callable[[str], None] = _print_encodable,
     send_fn: Callable[..., dict] = telegram.send_message,
     engine: Engine | None = None,
 ) -> int:
