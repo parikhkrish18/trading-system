@@ -9,11 +9,13 @@ that human explicitly approves. Nothing here decides *what* to trade; the
 screener already did that. This decides *whether* an already-made proposal
 becomes an order, and records the answer.
 
-STATUS: EXECUTION IS WIRED TO THE ALPACA PAPER ACCOUNT; THE HUMAN STEP IS
-STILL STUBBED. There were two chokepoints where a side effect could leave
-this process. One of them is now real:
+STATUS: EXECUTION IS WIRED TO THE ALPACA PAPER ACCOUNT; TELEGRAM CAN SEND BUT
+NOT LISTEN. There were two chokepoints where a side effect could leave this
+process. One of them is now real:
 
-  1. request_approvals()   — STILL A STUB. Would talk to the Telegram API.
+  1. request_approvals()   — STILL A STUB. Sending to Telegram now works
+                             (execution/telegram.py, --notify), but nothing
+                             reads replies, so a chat message cannot approve.
   2. submit_paper_order()  — LIVE (paper account). The ONLY place
                              broker.submit_target_position is called.
 
@@ -24,13 +26,24 @@ stub is filled in — an order really is placed against the Alpaca paper
 account, executed_position really is written back, and the equity/breaker
 snapshots really are recorded.
 
-The one CLI entrypoint remains `python -m execution.approval_loop --dry-run`:
-a read-only walkthrough that shows the pending batch as the messages the real
-loop would send and asks y/n on the console. It routes *around* both the
-Telegram stub and the (now live) submit path — it never contacts Telegram,
-never constructs a broker, and never writes to the database, so answering "y"
-there still cannot move anything. There is deliberately no non-dry-run CLI
-mode: adding one would mean adding an unattended call site for real orders.
+Telegram is a one-way notification channel here, deliberately. `--notify`
+pushes the pending batch to a phone so a human knows there is something to
+look at; the answer still has to be given at the console. Nothing in the
+Telegram path parses a reply, so nobody who can write into that chat can cause
+a trade.
+
+The CLI has three modes and not one of them can place an order:
+
+  --dry-run        a read-only walkthrough that shows the pending batch as the
+                   messages the real loop would send and asks y/n on the
+                   console. It never contacts Telegram, never constructs a
+                   broker, and never writes to the database, so answering "y"
+                   there cannot move anything.
+  --telegram-setup prints the chat id of whoever has messaged the bot, for .env.
+  --notify         sends the pending batch to that chat as one message.
+
+There is deliberately no executing CLI mode: adding one would mean adding an
+unattended call site for real orders.
 
 PAPER MODE ONLY, BY DESIGN, AND MORE SO NOW THAT ORDERS ARE REAL. `MODE` is
 hardcoded to "paper" and paper_broker() constructs AlpacaBroker(mode=MODE)
@@ -63,6 +76,7 @@ from sqlalchemy.engine import Engine
 
 from config.settings import settings
 from data.ingest.db import get_engine
+from execution import telegram
 from execution.broker_alpaca import AlpacaBroker
 from monitoring.breaker_state import check_and_record_breakers
 from monitoring.equity import load_equity_curve, record_equity_snapshot
@@ -204,6 +218,27 @@ def _format_ts(ts) -> str:
     return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def format_pick_line(decision: PendingDecision) -> str:
+    """
+    One candidate as the single line a human reads on a phone.
+
+    Direction lives in the LONG/SHORT word, so the size is shown unsigned —
+    "SHORT TSLA — -8.0%" reads like a double negative on a small screen. The
+    expected return keeps its sign, since that is the number the human is being
+    asked to disagree with.
+
+    Shared by the console dry run and the Telegram notification so the two can
+    never drift into describing the same pick differently: whichever one you
+    read, you are reading this string.
+    """
+    return (
+        f"🤖 Pulse proposes: {decision.side.upper()} {decision.symbol} — "
+        f"{abs(decision.target_position):.1%} of portfolio | "
+        f"regime: {decision.regime} | "
+        f"expected: {decision.forecast:+.1%}"
+    )
+
+
 # --------------------------------------------------------------------------
 # 3. Ask the human — CHOKEPOINT 1 (stub)
 # --------------------------------------------------------------------------
@@ -214,22 +249,28 @@ def request_approvals(message: str, decisions: list[PendingDecision]) -> dict[in
     Send `message` to the Telegram group and block until every candidate has
     an answer, returning {decision_id: approved}.
 
-    STUB — the only function in this repo that would touch the Telegram API.
-    A real implementation would: POST the message via sendMessage with
-    TELEGRAM_BOT_TOKEN to TELEGRAM_CHAT_ID, poll getUpdates for replies,
-    parse "approve <id>" / "reject <id>" / "approve all" / "reject all",
-    ignore replies from unknown chats, and time out into all-rejected rather
-    than hanging or defaulting to approval.
+    STILL A STUB, and now a stub for a narrower reason. The send half exists:
+    execution/telegram.py can put this message on a phone, and --notify does.
+    What is missing is the half that turns a chat reply into consent — poll
+    getUpdates, parse "approve <id>" / "reject <id>" / "approve all" /
+    "reject all", ignore replies from any chat but the configured one, and time
+    out into all-rejected rather than hanging or defaulting to approval.
+
+    That half is left unbuilt on purpose. Filling it in makes a message from a
+    phone sufficient to place an order, which is a security question (who can
+    write into that chat?) that deserves its own review rather than arriving as
+    a side effect of wiring up notifications. Until then approval happens at
+    the console.
 
     Callers must treat a missing decision_id in the returned mapping as
     rejected — never as approved.
     """
     raise NotImplementedError(
-        "Telegram approval transport is not implemented — this module is a "
-        "reviewable skeleton. Implement request_approvals() (send + poll via "
-        "settings.telegram_bot_token / settings.telegram_chat_id) to enable it. "
-        "It must fail closed: any timeout, parse failure, or unknown sender "
-        "means rejected."
+        "Telegram approval read-back is not implemented. Sending works — see "
+        "execution.telegram.send_message and --notify — but nothing parses "
+        "replies, so no chat message can approve a trade. Approve at the "
+        "console with --dry-run. Any implementation here must fail closed: any "
+        "timeout, parse failure, or unknown sender means rejected."
     )
 
 
@@ -546,18 +587,11 @@ class DryRunSummary:
 
 def format_dry_run_proposal(decision: PendingDecision) -> str:
     """
-    One candidate as the single-line message the real loop would push to a
-    phone. Direction lives in the LONG/SHORT word, so the size is shown
-    unsigned — "SHORT TSLA — -8.0%" reads like a double negative on a small
-    screen. The expected return keeps its sign, since that is the number the
-    human is being asked to disagree with.
+    The shared pick line plus the console's y/n prompt. The line itself is
+    format_pick_line — the same text --notify puts on the phone — so the
+    console preview and the real message stay one string, not two.
     """
-    return (
-        f"🤖 Pulse proposes: {decision.side.upper()} {decision.symbol} — "
-        f"{abs(decision.target_position):.1%} of portfolio | "
-        f"regime: {decision.regime} | "
-        f"expected: {decision.forecast:+.1%} — Approve? [y/n] "
-    )
+    return f"{format_pick_line(decision)} — Approve? [y/n] "
 
 
 def _read_approval(prompt: str, input_fn: Callable[[str], str]) -> bool:
@@ -612,27 +646,199 @@ def run_dry_run(
     return summary
 
 
+# --------------------------------------------------------------------------
+# Notify — put the pending batch on a phone. SEND ONLY.
+# --------------------------------------------------------------------------
+#
+# This section has the same inertness as the dry run above, and gets it the
+# same way: by what it does not call. It shares load_pending_decisions (a
+# SELECT) and the formatting helpers, and touches none of request_approvals,
+# submit_paper_order, paper_broker, record_execution, or
+# record_batch_monitoring. Its only effect that leaves this process is an
+# HTTPS POST to api.telegram.org carrying text.
+#
+# There is deliberately NO read-back. Nothing here looks at replies, so no
+# message anyone sends into that chat — including someone who is not the owner
+# — can approve, size, or place anything. Sending is a one-way notification;
+# approval stays where it already was, at the console in front of a human.
+# request_approvals (chokepoint 1) is still a stub for exactly that reason.
+
+
+NOTIFY_FOOTER = (
+    "Replies to this chat are NOT read — this is a notification, not an approval "
+    "prompt. Nothing has been sent to a broker.\n"
+    "Review and answer at the console: python -m execution.approval_loop --dry-run"
+)
+
+
+def format_notification(decisions: list[PendingDecision]) -> str:
+    """
+    The whole pending batch as ONE plain-text message.
+
+    One message rather than one per pick: a phone that buzzes eight times for
+    eight candidates trains its owner to swipe the notification away, which is
+    the opposite of what a human-in-the-loop step is for.
+
+    Plain text, no markdown — the pick lines are full of %, +, - and | that a
+    Telegram parse_mode would either mangle or reject, and the same string has
+    to stay readable in a log file and a test failure.
+    """
+    if not decisions:
+        return "No pending trade proposals."
+
+    header = (
+        f"Pulse — {len(decisions)} pending proposal(s) | "
+        f"batch {_format_ts(decisions[0].ts)} | {MODE} mode"
+    )
+    body = "\n".join(format_pick_line(d) for d in decisions)
+    return f"{header}\n\n{body}\n\n{NOTIFY_FOOTER}"
+
+
+def run_telegram_setup(
+    print_fn: Callable[[str], None] = print,
+    fetch_fn: Callable[..., list[dict]] = telegram.fetch_updates,
+) -> int:
+    """
+    One-time helper: find the chat id of whoever has messaged the bot.
+
+    A bot cannot start a conversation on Telegram — the human has to message it
+    first, and the chat id only becomes discoverable once they have. So this
+    reads getUpdates and prints what it finds; it never sends anything, and it
+    passes no offset, so it does not consume the updates it looked at.
+    """
+    token, configured_chat_id = telegram.credentials()
+    if not token:
+        print_fn(telegram.MISSING_TOKEN_MESSAGE)
+        return 0
+
+    try:
+        updates = fetch_fn(token)
+    except telegram.TelegramError as exc:
+        print_fn(
+            f"Telegram would not answer getUpdates: {exc}\n"
+            "If that says Unauthorized, the token in .env is wrong or has been revoked — "
+            "ask @BotFather for it again with /mytoken."
+        )
+        return 1
+
+    chats = telegram.chat_candidates(updates)
+    if not chats:
+        print_fn(
+            "No messages found for this bot yet.\n"
+            "Open Telegram, find your bot, send it any message (\"hi\" is fine), then run "
+            "this command again.\n"
+            "Telegram only keeps undelivered updates for about 24 hours, so a conversation "
+            "from days ago will not show up here."
+        )
+        return 0
+
+    print_fn(f"Found {len(chats)} chat(s) that have messaged this bot (most recent first):\n")
+    for chat in chats:
+        print_fn(f"  chat id {chat['chat_id']}   {chat['name']} ({chat['kind']})")
+        if chat["text"]:
+            print_fn(f"      last message: {chat['text'][:80]}")
+    print_fn("")
+
+    best = chats[0]["chat_id"]
+    if configured_chat_id == best:
+        print_fn(f"TELEGRAM_CHAT_ID={best} is already what .env says — nothing to change.")
+    else:
+        if len(chats) > 1:
+            print_fn("More than one chat showed up — pick the one that is your own conversation.")
+        print_fn("Put this line in .env:\n")
+        print_fn(f"  TELEGRAM_CHAT_ID={best}\n")
+        if configured_chat_id:
+            print_fn(f"(.env currently has TELEGRAM_CHAT_ID={configured_chat_id}.)")
+    print_fn("Then: python -m execution.approval_loop --notify")
+    return 0
+
+
+def run_notify(
+    print_fn: Callable[[str], None] = print,
+    send_fn: Callable[..., dict] = telegram.send_message,
+    engine: Engine | None = None,
+) -> int:
+    """
+    Send the latest pending batch to the configured chat as one message.
+
+    Prints the same message locally before sending it, so what landed on the
+    phone can be checked against what left the machine.
+
+    Missing credentials are a clean exit, not an error: this is a notification
+    channel, and a machine with no phone attached to it should carry on quietly
+    rather than fail a scheduled run.
+    """
+    token, chat_id = telegram.credentials()
+    if not token:
+        print_fn(telegram.MISSING_TOKEN_MESSAGE)
+        return 0
+    if not chat_id:
+        print_fn(telegram.MISSING_CHAT_ID_MESSAGE)
+        return 0
+
+    decisions = load_pending_decisions(engine=engine)
+    if not decisions:
+        print_fn("No pending trade proposals — nothing to send.")
+        return 0
+
+    message = format_notification(decisions)
+    print_fn(f"Sending this to Telegram chat {chat_id}:\n")
+    print_fn(message)
+
+    try:
+        send_fn(message, token=token, chat_id=chat_id)
+    except telegram.TelegramError as exc:
+        print_fn(
+            f"\nTelegram refused the message: {exc}\n"
+            "If that says chat not found, the chat id is wrong — rerun "
+            "--telegram-setup. Nothing was executed either way."
+        )
+        return 1
+
+    print_fn(
+        f"\nSent — {len(decisions)} proposal(s) delivered to chat {chat_id}. "
+        "No order was placed and no row was changed; this was a message only."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """
-    CLI entrypoint. --dry-run is required and is the only mode: there is no
-    flag, env var, or argument here that reaches a broker, and adding one
-    would mean adding a call site for submit_paper_order, which is the whole
-    thing this module is arranged to make hard.
+    CLI entrypoint. Exactly one mode must be chosen, and not one of them can
+    reach a broker: --dry-run reads and asks on the console, --telegram-setup
+    reads getUpdates, --notify reads the pending batch and sends text. There is
+    still no flag, env var, or argument here that calls submit_paper_order,
+    which is the whole thing this module is arranged to make hard.
     """
     parser = argparse.ArgumentParser(
         prog="python -m execution.approval_loop",
         description=(
-            "Preview the pending trade proposals on the console. Dry run only — "
-            "this command cannot place an order."
+            "Preview the pending trade proposals, or push them to Telegram. "
+            "None of these modes can place an order."
         ),
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument(
         "--dry-run",
         action="store_true",
-        required=True,
-        help="Required. Print each pending proposal and ask y/n, without executing or writing anything.",
+        help="Print each pending proposal and ask y/n, without executing or writing anything.",
     )
-    parser.parse_args(argv)
+    modes.add_argument(
+        "--telegram-setup",
+        action="store_true",
+        help="Print the chat id of whoever has messaged the bot, to put in .env as TELEGRAM_CHAT_ID.",
+    )
+    modes.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send the latest pending proposals to the configured Telegram chat as one message. Send only.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.telegram_setup:
+        return run_telegram_setup()
+    if args.notify:
+        return run_notify()
 
     run_dry_run()
     return 0

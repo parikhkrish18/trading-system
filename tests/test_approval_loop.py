@@ -14,6 +14,8 @@ from execution.approval_loop import (
     executed_fraction,
     format_candidate,
     format_dry_run_proposal,
+    format_notification,
+    format_pick_line,
     format_proposal,
     load_pending_decisions,
     main,
@@ -24,6 +26,8 @@ from execution.approval_loop import (
     request_approvals,
     run_approval_loop,
     run_dry_run,
+    run_notify,
+    run_telegram_setup,
     submit_paper_order,
     target_shares_for,
 )
@@ -690,3 +694,281 @@ def test_main_runs_the_dry_run_and_exits_clean(monkeypatch):
 
     assert main(["--dry-run"]) == 0
     assert calls == [True]
+
+
+# --- Telegram: the send side only ----------------------------------------
+#
+# No real credentials appear anywhere below, and no test reaches the network:
+# send_fn/fetch_fn are always injected.
+
+FAKE_TOKEN = "123456:fake-test-token"  # not a real credential
+FAKE_CHAT = "424242"
+
+
+@pytest.fixture
+def telegram_configured(monkeypatch):
+    """Pretend .env has a bot token and a chat id."""
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", FAKE_TOKEN)
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_chat_id", FAKE_CHAT)
+
+
+class _Sender:
+    """Captures what would have gone to Telegram."""
+
+    def __init__(self, error=None):
+        self.messages = []
+        self.error = error
+
+    def __call__(self, text, token=None, chat_id=None):
+        if self.error:
+            raise self.error
+        self.messages.append({"text": text, "token": token, "chat_id": chat_id})
+        return {"message_id": len(self.messages)}
+
+
+def test_format_pick_line_is_the_same_string_the_dry_run_shows():
+    """One formatter, so the phone and the console can never disagree."""
+    decision = _decision(symbol="TSLA", forecast=0.038, regime="trend", target_position=0.20)
+
+    line = format_pick_line(decision)
+
+    assert line == (
+        "🤖 Pulse proposes: LONG TSLA — 20.0% of portfolio | regime: trend | expected: +3.8%"
+    )
+    assert format_dry_run_proposal(decision) == f"{line} — Approve? [y/n] "
+
+
+def test_format_notification_puts_every_pick_in_one_message():
+    message = format_notification(
+        [
+            _decision(decision_id=1, symbol="TSLA", target_position=0.20),
+            _decision(decision_id=2, symbol="XOM", target_position=-0.08),
+            _decision(decision_id=3, symbol="KO", target_position=0.05),
+        ]
+    )
+
+    assert message.startswith("Pulse — 3 pending proposal(s) | batch 2026-07-31 14:03 UTC | paper mode")
+    assert "LONG TSLA" in message and "SHORT XOM" in message and "LONG KO" in message
+    assert message.count("🤖 Pulse proposes:") == 3
+
+
+def test_format_notification_says_replies_are_not_read():
+    """The message must not invite an approval it cannot receive."""
+    message = format_notification([_decision()])
+
+    assert "Replies to this chat are NOT read" in message
+    assert "--dry-run" in message  # points at where approval actually happens
+
+
+def test_format_notification_is_plain_text_with_no_markdown_syntax():
+    message = format_notification([_decision(symbol="TSLA", target_position=-0.08)])
+
+    assert "*" not in message and "```" not in message and "<b>" not in message
+
+
+def test_format_notification_on_an_empty_batch():
+    assert format_notification([]) == "No pending trade proposals."
+
+
+def test_run_notify_sends_one_message_containing_the_whole_batch(monkeypatch, telegram_configured):
+    console = _Console()
+    sender = _Sender()
+    monkeypatch.setattr(
+        "execution.approval_loop.load_pending_decisions",
+        lambda engine=None: [_decision(decision_id=1, symbol="TSLA"), _decision(decision_id=2, symbol="KO")],
+    )
+
+    assert run_notify(print_fn=console.print, send_fn=sender) == 0
+
+    assert len(sender.messages) == 1  # one buzz for the batch, not one per pick
+    assert sender.messages[0]["chat_id"] == FAKE_CHAT
+    assert sender.messages[0]["token"] == FAKE_TOKEN
+    assert "TSLA" in sender.messages[0]["text"] and "KO" in sender.messages[0]["text"]
+    assert "Sent — 2 proposal(s)" in console.text
+
+
+def test_run_notify_echoes_the_message_locally_before_sending(monkeypatch, telegram_configured):
+    console = _Console()
+    sender = _Sender()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [_decision()])
+
+    run_notify(print_fn=console.print, send_fn=sender)
+
+    assert sender.messages[0]["text"] in console.text
+
+
+def test_run_notify_exits_cleanly_with_no_token(monkeypatch):
+    console = _Console()
+    sender = _Sender()
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", "")
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_chat_id", FAKE_CHAT)
+
+    assert run_notify(print_fn=console.print, send_fn=sender) == 0
+    assert sender.messages == []
+    assert "TELEGRAM_BOT_TOKEN is not set" in console.text
+    assert "@BotFather" in console.text
+
+
+def test_run_notify_exits_cleanly_with_no_chat_id(monkeypatch):
+    console = _Console()
+    sender = _Sender()
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", FAKE_TOKEN)
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_chat_id", "")
+
+    assert run_notify(print_fn=console.print, send_fn=sender) == 0
+    assert sender.messages == []
+    assert "--telegram-setup" in console.text
+
+
+def test_run_notify_sends_nothing_when_no_batch_is_pending(monkeypatch, telegram_configured):
+    console = _Console()
+    sender = _Sender()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [])
+
+    assert run_notify(print_fn=console.print, send_fn=sender) == 0
+    assert sender.messages == []
+    assert "nothing to send" in console.text
+
+
+def test_run_notify_reports_a_telegram_failure_without_crashing(monkeypatch, telegram_configured):
+    console = _Console()
+    sender = _Sender(error=approval_loop.telegram.TelegramError("sendMessage: chat not found"))
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [_decision()])
+
+    assert run_notify(print_fn=console.print, send_fn=sender) == 1
+    assert "chat not found" in console.text
+    assert "Nothing was executed" in console.text
+
+
+def test_run_notify_never_reaches_the_broker_or_writes_a_row(monkeypatch, telegram_configured):
+    """The safety property: notifying is a message, and a message cannot trade."""
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [_decision()])
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("the notify path must not reach this")
+
+    for name in (
+        "request_approvals",
+        "submit_paper_order",
+        "paper_broker",
+        "AlpacaBroker",
+        "record_execution",
+        "record_batch_monitoring",
+        "run_approval_loop",
+    ):
+        monkeypatch.setattr(f"execution.approval_loop.{name}", _forbidden)
+
+    assert run_notify(print_fn=_Console().print, send_fn=_Sender()) == 0
+
+
+def test_run_telegram_setup_prints_the_chat_id_to_paste_into_env(monkeypatch):
+    console = _Console()
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", FAKE_TOKEN)
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_chat_id", "")
+    updates = [{"message": {"chat": {"id": 424242, "first_name": "Neeraj", "type": "private"}, "text": "hi"}}]
+
+    assert run_telegram_setup(print_fn=console.print, fetch_fn=lambda token: updates) == 0
+
+    assert "chat id 424242" in console.text
+    assert "TELEGRAM_CHAT_ID=424242" in console.text
+    assert "--notify" in console.text
+
+
+def test_run_telegram_setup_passes_the_configured_token_through(monkeypatch):
+    seen = []
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", f"  {FAKE_TOKEN} ")
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_chat_id", "")
+
+    run_telegram_setup(print_fn=_Console().print, fetch_fn=lambda token: seen.append(token) or [])
+
+    assert seen == [FAKE_TOKEN]  # stripped, so a pasted newline is not a mystery 404
+
+
+def test_run_telegram_setup_notices_the_chat_id_is_already_configured(monkeypatch):
+    console = _Console()
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", FAKE_TOKEN)
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_chat_id", "424242")
+    updates = [{"message": {"chat": {"id": 424242, "first_name": "Neeraj", "type": "private"}, "text": "hi"}}]
+
+    run_telegram_setup(print_fn=console.print, fetch_fn=lambda token: updates)
+
+    assert "already what .env says" in console.text
+
+
+def test_run_telegram_setup_tells_the_user_to_message_the_bot_first(monkeypatch):
+    console = _Console()
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", FAKE_TOKEN)
+
+    assert run_telegram_setup(print_fn=console.print, fetch_fn=lambda token: []) == 0
+
+    assert "send it any message" in console.text
+    assert "24 hours" in console.text  # updates expire, so an old chat won't show
+
+
+def test_run_telegram_setup_exits_cleanly_with_no_token(monkeypatch):
+    console = _Console()
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", "")
+
+    def _no_calls(token):
+        raise AssertionError("must not call Telegram without a token")
+
+    assert run_telegram_setup(print_fn=console.print, fetch_fn=_no_calls) == 0
+    assert "TELEGRAM_BOT_TOKEN is not set" in console.text
+
+
+def test_run_telegram_setup_explains_a_rejected_token(monkeypatch):
+    console = _Console()
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", FAKE_TOKEN)
+
+    def _unauthorized(token):
+        raise approval_loop.telegram.TelegramError("getUpdates: HTTP 401 — Unauthorized")
+
+    assert run_telegram_setup(print_fn=console.print, fetch_fn=_unauthorized) == 1
+    assert "Unauthorized" in console.text
+    assert "/mytoken" in console.text
+
+
+def test_main_dispatches_the_telegram_modes(monkeypatch):
+    monkeypatch.setattr("execution.approval_loop.run_telegram_setup", lambda: 0)
+    monkeypatch.setattr("execution.approval_loop.run_notify", lambda: 0)
+    monkeypatch.setattr("execution.approval_loop.run_dry_run", _unreachable)
+
+    assert main(["--telegram-setup"]) == 0
+    assert main(["--notify"]) == 0
+
+
+def test_main_passes_the_mode_exit_code_through(monkeypatch):
+    """A refused send is a non-zero exit, so a scheduled run can notice."""
+    monkeypatch.setattr("execution.approval_loop.run_notify", lambda: 1)
+
+    assert main(["--notify"]) == 1
+
+
+def test_main_refuses_two_modes_at_once(monkeypatch):
+    monkeypatch.setattr("execution.approval_loop.run_dry_run", lambda: None)
+    monkeypatch.setattr("execution.approval_loop.run_notify", lambda: 0)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--dry-run", "--notify"])
+
+    assert excinfo.value.code != 0
+
+
+def test_no_cli_mode_can_reach_the_execution_path(monkeypatch):
+    """
+    The property the whole module is arranged around, restated now that there
+    are three modes: none of them calls anything that places an order.
+    """
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [])
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", "")
+
+    for name in ("submit_paper_order", "paper_broker", "AlpacaBroker", "record_execution", "run_approval_loop"):
+        monkeypatch.setattr(f"execution.approval_loop.{name}", _unreachable)
+
+    assert main(["--dry-run"]) == 0
+    assert main(["--telegram-setup"]) == 0
+    assert main(["--notify"]) == 0
+
+
+def _unreachable(*args, **kwargs):
+    raise AssertionError("no CLI mode may reach this")
