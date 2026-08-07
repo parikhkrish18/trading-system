@@ -8,9 +8,17 @@ execution/broker code.
 """
 from __future__ import annotations
 
+import dataclasses
+import math
+from collections.abc import Mapping
+
 import numpy as np
 
 from models.regime.trend_chop_classifier import CHOP, TREND
+
+# Everything is a fraction of portfolio value, so sizes that differ by less
+# than this are the same size in any currency anyone will actually trade.
+_TOLERANCE = 1e-9
 
 
 def confidence_scaled_size(
@@ -106,3 +114,142 @@ def target_position_size(
         size, symbol, current_positions, correlation_matrix, max_correlated_exposure_pct
     )
     return size
+
+
+# --------------------------------------------------------------------------
+# Full deployment
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class FullDeploymentResult:
+    """
+    What scaling to full deployment actually achieved, and — when it fell
+    short — why. The shortfall is the interesting part: it means the caps
+    bound before the cash ran out, which is a fact about the shortlist that
+    the operator should see rather than a number to quietly round up.
+    """
+
+    sizes: dict[str, float]  # signed fractions of portfolio, same keys as the input
+    deployed_pct: float  # total absolute allocation after scaling
+    target_pct: float
+    capped_symbols: list[str]  # positions sitting exactly on their per-position cap
+    reached_target: bool
+    reason: str = ""  # empty when the target was reached
+
+    @property
+    def scale_applied(self) -> float:
+        """Informational: what the uncapped positions were multiplied by overall."""
+        return self.deployed_pct / self.target_pct if self.target_pct else 0.0
+
+
+def scale_to_full_deployment(
+    sizes: Mapping[str, float],
+    max_position_pct: float,
+    max_short_position_pct: float | None = None,
+    target_allocation: float = 1.0,
+) -> FullDeploymentResult:
+    """
+    Scale a book of signed position sizes proportionally until total absolute
+    allocation reaches `target_allocation` (1.0 = 100% of the portfolio),
+    without any single position exceeding its per-position cap.
+
+    Proportional, so the screener's relative conviction ordering survives: a
+    pick the model liked twice as much stays twice as large, it just gets a
+    bigger share of a fully-deployed book. Signs are preserved, and a short
+    is capped by `max_short_position_pct` rather than `max_position_pct` —
+    the same asymmetry target_position_size applies, for the same reason (a
+    short's loss is structurally uncapped).
+
+    Positions that hit their cap are frozen there and the leftover allocation
+    is redistributed across the ones with headroom, repeatedly, until either
+    the target is met or everything is capped. That redistribution is the
+    whole reason this isn't a single multiply: capping after scaling would
+    silently under-deploy, and scaling after capping would silently breach
+    the caps.
+
+    Caps are hard. If they bind before the target is reached — two picks
+    under a 25% cap can only ever be 50% of a portfolio — this returns the
+    cappable maximum and says why. It will not pad the book with picks the
+    model wasn't confident about, and it will not exceed a cap to hit a
+    round number: the caps exist to bound the damage from one bad forecast,
+    and "we wanted to be fully invested" is not a risk argument.
+
+    Scaling runs in both directions: a book already above the target is
+    scaled *down* to it, since deploying more than 100% would mean leverage
+    that nothing upstream has sized for.
+    """
+    scaled = {symbol: float(size) for symbol, size in sizes.items()}
+    short_cap = max_short_position_pct if max_short_position_pct is not None else max_position_pct
+    caps = {
+        symbol: (max_position_pct if size >= 0 else short_cap) for symbol, size in scaled.items()
+    }
+
+    gross = sum(abs(size) for size in scaled.values())
+    if not scaled or gross <= _TOLERANCE:
+        return FullDeploymentResult(
+            sizes=scaled,
+            deployed_pct=0.0,
+            target_pct=target_allocation,
+            capped_symbols=[],
+            reached_target=False,
+            reason="No sized candidates to deploy — nothing cleared the confidence bar.",
+        )
+    if target_allocation <= 0:
+        return FullDeploymentResult(
+            sizes=dict.fromkeys(scaled, 0.0),
+            deployed_pct=0.0,
+            target_pct=target_allocation,
+            capped_symbols=[],
+            reached_target=True,
+            reason="Target allocation is zero — nothing deployed.",
+        )
+
+    # Water-filling: scale everything that still has headroom by whatever
+    # factor would use up the remaining allocation, freeze whatever that
+    # would push past its cap, and go again with what's left.
+    free = {symbol for symbol, size in scaled.items() if abs(size) > _TOLERANCE}
+    capped: dict[str, float] = {}
+
+    while free:
+        free_gross = sum(abs(scaled[symbol]) for symbol in free)
+        if free_gross <= _TOLERANCE:
+            break
+        headroom = target_allocation - sum(capped.values())
+        factor = headroom / free_gross
+
+        newly_capped = [s for s in free if abs(scaled[s]) * factor > caps[s] + _TOLERANCE]
+        if not newly_capped:
+            for symbol in free:
+                scaled[symbol] = scaled[symbol] * factor
+            break
+
+        for symbol in newly_capped:
+            # copysign, not abs * sign: keeps a short short at exactly its cap.
+            scaled[symbol] = math.copysign(caps[symbol], scaled[symbol])
+            capped[symbol] = caps[symbol]
+            free.discard(symbol)
+
+    deployed = sum(abs(size) for size in scaled.values())
+    capped_symbols = sorted(capped)
+    reached = deployed >= target_allocation - _TOLERANCE
+
+    reason = ""
+    if not reached:
+        reason = (
+            f"Full deployment not reached: {deployed:.1%} of the portfolio allocated, "
+            f"target {target_allocation:.1%}. Every position that could be scaled is now "
+            f"at its per-position cap ({', '.join(capped_symbols)}) — {len(capped_symbols)} "
+            f"pick(s) cannot cover the portfolio on their own. Deploying the rest would "
+            f"need more confident picks, not larger ones; the caps were not raised and the "
+            f"book was not padded with names the model wasn't confident about."
+        )
+
+    return FullDeploymentResult(
+        sizes=scaled,
+        deployed_pct=deployed,
+        target_pct=target_allocation,
+        capped_symbols=capped_symbols,
+        reached_target=reached,
+        reason=reason,
+    )

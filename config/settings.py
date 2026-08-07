@@ -74,6 +74,15 @@ class Settings(BaseSettings):
     max_short_position_pct: float = Field(default=0.15, alias="MAX_SHORT_POSITION_PCT")
     max_correlated_exposure_pct: float = Field(default=0.50, alias="MAX_CORRELATED_EXPOSURE_PCT")
 
+    # --- Deployment ---
+    # When true, the screener scales its shortlist up proportionally until the
+    # book is ~100% allocated instead of leaving the unused remainder in cash
+    # (risk.sizing.scale_to_full_deployment). The per-position caps above still
+    # bind — if they're reached first, the cappable maximum is deployed and the
+    # shortfall is logged. Off by default: being fully invested is a decision
+    # about risk appetite, not a default anyone should inherit by accident.
+    full_deployment: bool = Field(default=False, alias="FULL_DEPLOYMENT")
+
     @property
     def db_url(self) -> str:
         return f"postgresql+psycopg2://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"

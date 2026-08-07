@@ -38,7 +38,7 @@ from models.evidence import PickEvidence, evidence_rows, extract_evidence
 from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND, RuleBasedRegime
 from models.train import load_feature_frame, load_training_frame
-from risk.sizing import target_position_size
+from risk.sizing import scale_to_full_deployment, target_position_size
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +247,52 @@ def run_screen(
         is_shortable_fn=is_shortable_fn,
     )
 
+    if settings.full_deployment:
+        candidates = apply_full_deployment(
+            candidates,
+            max_position_pct=settings.max_single_position_pct,
+            max_short_position_pct=settings.max_short_position_pct,
+        )
+
     return attach_evidence(candidates, ensemble, latest, feature_cols)
+
+
+def apply_full_deployment(
+    candidates: list[TradeCandidate],
+    max_position_pct: float,
+    max_short_position_pct: float,
+    target_allocation: float = 1.0,
+) -> list[TradeCandidate]:
+    """
+    Scale the shortlist up to a fully-allocated book (see
+    risk.sizing.scale_to_full_deployment) and report what happened.
+
+    Runs after select_trades, so every per-symbol adjustment — regime
+    damping, correlation shrinking, the short cap — has already been applied
+    and is preserved proportionally. It changes how much of the portfolio the
+    picks take up, never which symbols were picked or which way they lean.
+    """
+    if not candidates:
+        return candidates
+
+    result = scale_to_full_deployment(
+        {c.symbol: c.target_position_pct for c in candidates},
+        max_position_pct=max_position_pct,
+        max_short_position_pct=max_short_position_pct,
+        target_allocation=target_allocation,
+    )
+
+    for candidate in candidates:
+        candidate.target_position_pct = result.sizes[candidate.symbol]
+
+    if result.reached_target:
+        logger.info(
+            "Full deployment: %.1f%% of the portfolio allocated across %d pick(s).",
+            result.deployed_pct * 100, len(candidates),
+        )
+    else:
+        logger.warning("%s", result.reason)
+    return candidates
 
 
 def attach_evidence(
