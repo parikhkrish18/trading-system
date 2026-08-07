@@ -1,9 +1,12 @@
 import contextlib
 import datetime as dt
+import pathlib
+import re
 
 import pandas as pd
 import pytest
 
+from execution import approval_loop
 from execution.approval_loop import (
     MODE,
     ExecutionResult,
@@ -14,6 +17,8 @@ from execution.approval_loop import (
     format_proposal,
     load_pending_decisions,
     main,
+    paper_broker,
+    paper_keys_present,
     record_batch_monitoring,
     record_execution,
     request_approvals,
@@ -345,25 +350,180 @@ def test_record_batch_monitoring_snapshots_equity_and_runs_breakers(monkeypatch)
     assert breaker_calls[0]["equity_curve"] == [100_000.0, 99_000.0]
 
 
-# --- the two deliberate stubs -------------------------------------------
+# --- the remaining stub, and the now-live submit path --------------------
 
 
-def test_request_approvals_is_a_stub():
+def test_request_approvals_is_still_a_stub():
     with pytest.raises(NotImplementedError, match="Telegram"):
         request_approvals("some proposal", [_decision()])
 
 
-def test_submit_paper_order_is_a_stub():
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        submit_paper_order(_FakeBroker(), "AAPL", 41.0)
+def test_submit_paper_order_places_the_order_through_the_broker():
+    broker = _FakeBroker()
+
+    order = submit_paper_order(broker, "AAPL", 41.0)
+
+    assert broker.submitted == [("AAPL", 41.0)]
+    assert order == {"symbol": "AAPL", "qty": 41.0}
 
 
-def test_run_approval_loop_defaults_to_the_stubs_and_cannot_execute(monkeypatch):
-    """The safety property: with nothing injected, the loop stops at the human step."""
+def test_submit_paper_order_passes_through_a_no_op_from_the_broker():
+    """Already at the target = no order; that's a None, not a failure."""
+
+    class _AlreadyThere:
+        def submit_target_position(self, symbol, target_shares):
+            return None
+
+    assert submit_paper_order(_AlreadyThere(), "AAPL", 41.0) is None
+
+
+def test_run_approval_loop_still_cannot_execute_unattended(monkeypatch):
+    """
+    The safety property that survives un-stubbing the broker: with nothing
+    injected the loop stops at the human step, so orders only ever follow an
+    approval that a human actually gave.
+    """
     monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [_decision()])
 
     with pytest.raises(NotImplementedError, match="Telegram"):
         run_approval_loop(broker=_FakeBroker())
+
+
+# --- paper-only construction ---------------------------------------------
+
+
+def test_paper_broker_pins_mode_to_paper_and_never_confirms_live(monkeypatch):
+    captured = {}
+
+    class _SpyAlpaca:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("execution.approval_loop.AlpacaBroker", _SpyAlpaca)
+
+    paper_broker()
+
+    assert captured["kwargs"] == {"mode": "paper"}
+    assert captured["args"] == ()  # nothing positional that could land on confirm_live
+
+
+def test_module_never_mentions_live_mode_or_confirm_live():
+    """
+    A grep-level guard on the module's central safety claim: live must be
+    unreachable from this file, not merely unreached by today's call graph.
+    """
+    source = pathlib.Path(approval_loop.__file__).read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    # Strip docstrings, which discuss live precisely to explain its absence.
+    code = re.sub(r'""".*?"""', "", code, flags=re.DOTALL)
+
+    assert "confirm_live" not in code
+    assert '"live"' not in code and "'live'" not in code
+    assert approval_loop.MODE == "paper"
+
+
+# --- keys-not-configured path --------------------------------------------
+
+
+def test_run_approval_loop_exits_cleanly_when_no_paper_keys_are_configured(monkeypatch):
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [_decision()])
+    monkeypatch.setattr("execution.approval_loop.paper_keys_present", lambda: False)
+
+    def _should_not_run(*args, **kwargs):
+        raise AssertionError("nothing should be asked, built or submitted without keys")
+
+    monkeypatch.setattr("execution.approval_loop.paper_broker", _should_not_run)
+    monkeypatch.setattr("execution.approval_loop.record_execution", _should_not_run)
+    monkeypatch.setattr("execution.approval_loop.record_batch_monitoring", _should_not_run)
+
+    printed = []
+    results = run_approval_loop(request_fn=_should_not_run, print_fn=printed.append)
+
+    assert results == []
+    message = "\n".join(printed)
+    assert "ALPACA_PAPER_API_KEY" in message and "ALPACA_PAPER_SECRET_KEY" in message
+    assert "not set" in message
+
+
+def test_no_keys_check_is_skipped_when_the_caller_brings_its_own_broker(monkeypatch):
+    """An injected broker needs no credentials of ours — that's the test path."""
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [_decision(decision_id=7)])
+    monkeypatch.setattr("execution.approval_loop.paper_keys_present", lambda: False)
+    monkeypatch.setattr("execution.approval_loop.record_execution", lambda *a, **k: None)
+    monkeypatch.setattr("execution.approval_loop.record_batch_monitoring", lambda broker, **kwargs: [])
+    broker = _FakeBroker()
+
+    run_approval_loop(
+        broker=broker,
+        request_fn=lambda message, decisions: {7: True},
+        price_fn=lambda symbols: {"AAPL": 300.0},
+    )
+
+    assert broker.submitted == [("AAPL", 41.0)]
+
+
+def test_paper_keys_present_requires_both_halves_of_the_pair(monkeypatch):
+    from config.settings import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "alpaca_paper_api_key", "", raising=False)
+    monkeypatch.setattr(live_settings, "alpaca_paper_secret_key", "", raising=False)
+    assert not paper_keys_present()
+
+    monkeypatch.setattr(live_settings, "alpaca_paper_api_key", "key", raising=False)
+    assert not paper_keys_present()  # a key with no secret is not usable
+
+    monkeypatch.setattr(live_settings, "alpaca_paper_secret_key", "secret", raising=False)
+    assert paper_keys_present()
+
+
+# --- approve -> order -> write-back -> monitoring, end to end ------------
+
+
+def test_approving_places_the_order_writes_back_and_records_equity(monkeypatch):
+    """
+    The whole point of the feature in one pass, with the default submit_fn
+    (not the test helper): an approval reaches the broker, the fill is
+    stamped on the decision row, and the dashboard's equity and breaker
+    panels get their snapshot.
+    """
+    decision = _decision(decision_id=7, symbol="AAPL", target_position=0.125)
+    broker = _FakeBroker(portfolio_value=100_000.0)
+    written, snapshots, breaker_calls = [], [], []
+
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [decision])
+    monkeypatch.setattr(
+        "execution.approval_loop.record_execution",
+        lambda decision_id, executed_position, engine=None: written.append((decision_id, executed_position)),
+    )
+    monkeypatch.setattr(
+        "execution.approval_loop.record_equity_snapshot",
+        lambda equity_value, mode: snapshots.append((equity_value, mode)),
+    )
+    monkeypatch.setattr(
+        "execution.approval_loop.load_equity_curve",
+        lambda mode=None: pd.DataFrame({"equity_value": [100_000.0]}),
+    )
+    monkeypatch.setattr(
+        "execution.approval_loop.check_and_record_breakers",
+        lambda **kwargs: breaker_calls.append(kwargs) or [],
+    )
+    results = run_approval_loop(
+        broker=broker,
+        request_fn=lambda message, decisions: {7: True},
+        price_fn=lambda symbols: {"AAPL": 300.0},
+        correlation_fn=lambda symbols: pd.DataFrame(),  # the breakers' correlation read is a real query
+    )
+
+    assert broker.submitted == [("AAPL", 41.0)]
+    assert written == [(7, pytest.approx(0.123))]
+    assert results[0].executed_position == pytest.approx(0.123)
+    # monitoring hooks fire once per batch, in paper mode
+    assert snapshots == [(100_000.0, "paper")]
+    assert len(breaker_calls) == 1
+    assert breaker_calls[0]["portfolio_value"] == 100_000.0
 
 
 def test_execution_result_defaults_are_inert():
@@ -499,7 +659,7 @@ def test_run_dry_run_never_touches_telegram_the_broker_or_the_database(monkeypat
         "request_approvals",
         "submit_paper_order",
         "paper_broker",
-        "get_broker",
+        "AlpacaBroker",
         "record_execution",
         "record_batch_monitoring",
         "run_approval_loop",

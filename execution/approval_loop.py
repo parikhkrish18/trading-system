@@ -9,35 +9,39 @@ that human explicitly approves. Nothing here decides *what* to trade; the
 screener already did that. This decides *whether* an already-made proposal
 becomes an order, and records the answer.
 
-STATUS: REVIEWABLE SKELETON — EXECUTION IS INTENTIONALLY STUBBED.
-All the structure is real, working code: the DB read, the message
-formatting, the fraction-of-portfolio to whole-shares conversion, the
-executed_position write-back, and the post-batch monitoring calls. The two
-functions that would cause a real side effect outside this process are
-deliberately `raise NotImplementedError`:
+STATUS: EXECUTION IS WIRED TO THE ALPACA PAPER ACCOUNT; THE HUMAN STEP IS
+STILL STUBBED. There were two chokepoints where a side effect could leave
+this process. One of them is now real:
 
-  1. request_approvals()   — would talk to the Telegram API (send + poll).
-  2. submit_paper_order()  — the ONLY place broker.submit_target_position
-                             is ever called.
+  1. request_approvals()   — STILL A STUB. Would talk to the Telegram API.
+  2. submit_paper_order()  — LIVE (paper account). The ONLY place
+                             broker.submit_target_position is called.
 
-Every path routes through those two chokepoints, so turning this from a
-skeleton into a working loop is a two-function job with no restructuring.
-Nothing in this module is runnable end to end today.
+So the loop cannot yet run unattended end to end: with nothing injected it
+stops at the human step, exactly as before. What changed is that once an
+approval arrives — from an injected request_fn, or from Telegram when that
+stub is filled in — an order really is placed against the Alpaca paper
+account, executed_position really is written back, and the equity/breaker
+snapshots really are recorded.
 
-The one runnable entrypoint is `python -m execution.approval_loop --dry-run`:
+The one CLI entrypoint remains `python -m execution.approval_loop --dry-run`:
 a read-only walkthrough that shows the pending batch as the messages the real
-loop would send and asks y/n on the console. It exists to demonstrate the
-shape of the loop without any of its side effects, so it routes *around* the
-two stubs rather than un-stubbing them — it never contacts Telegram, never
-constructs a broker, and never writes to the database. There is no non-dry-run
-CLI mode, by design: the flag is required and there is nothing else to pass.
+loop would send and asks y/n on the console. It routes *around* both the
+Telegram stub and the (now live) submit path — it never contacts Telegram,
+never constructs a broker, and never writes to the database, so answering "y"
+there still cannot move anything. There is deliberately no non-dry-run CLI
+mode: adding one would mean adding an unattended call site for real orders.
 
-PAPER MODE ONLY, BY DESIGN. `MODE` is hardcoded to "paper" and the broker
-is constructed via get_broker(mode=MODE) — confirm_live is never passed,
-so the live-broker guard in broker_alpaca.py / broker_ibkr.py can never be
-satisfied from this module. Live trading must stay impossible here even
-after the two stubs are filled in; if live is ever wanted it belongs in a
-separate, separately-reviewed call site.
+PAPER MODE ONLY, BY DESIGN, AND MORE SO NOW THAT ORDERS ARE REAL. `MODE` is
+hardcoded to "paper" and paper_broker() constructs AlpacaBroker(mode=MODE)
+directly — not via get_broker(), which reads settings.broker and so would
+let an .env edit redirect where these orders land. confirm_live is never
+passed and never read here, so the live guard in broker_alpaca.py cannot be
+satisfied from this module no matter what the config says. If live is ever
+wanted it belongs in a separate, separately-reviewed call site.
+
+Alpaca paper keys are optional: with none set, the loop says so and returns
+without asking anyone to approve orders it could not place.
 
 Rejections are recorded too: a rejected candidate gets executed_position
 written as 0.0 rather than left NULL, so it drops out of the "pending"
@@ -59,7 +63,7 @@ from sqlalchemy.engine import Engine
 
 from config.settings import settings
 from data.ingest.db import get_engine
-from execution.broker import get_broker
+from execution.broker_alpaca import AlpacaBroker
 from monitoring.breaker_state import check_and_record_breakers
 from monitoring.equity import load_equity_curve, record_equity_snapshot
 
@@ -68,6 +72,14 @@ logger = logging.getLogger(__name__)
 # Hardcoded on purpose — see the module docstring. Do not make this a
 # parameter, a setting, or anything else a typo can flip to "live".
 MODE = "paper"
+
+MISSING_PAPER_KEYS_MESSAGE = (
+    "Alpaca paper keys not set — add ALPACA_PAPER_API_KEY / ALPACA_PAPER_SECRET_KEY "
+    "to .env to enable paper execution.\n"
+    "Everything up to the order is already wired; there is just no account to send "
+    "it to yet. A paper account is free at https://alpaca.markets (no funding, no "
+    "card). Nothing was proposed, approved, or written."
+)
 
 
 class Broker(Protocol):
@@ -222,7 +234,7 @@ def request_approvals(message: str, decisions: list[PendingDecision]) -> dict[in
 
 
 # --------------------------------------------------------------------------
-# 4. Approved -> shares, and CHOKEPOINT 2 (stub)
+# 4. Approved -> shares, and CHOKEPOINT 2 (live against the paper account)
 # --------------------------------------------------------------------------
 
 
@@ -254,23 +266,23 @@ def submit_paper_order(broker: Broker, symbol: str, target_shares: float) -> dic
     """
     Move `symbol` to `target_shares` at the paper broker.
 
-    STUB — the single, only place broker.submit_target_position is invoked
-    from this module. Everything upstream (approval, sizing, rounding)
-    funnels here, so this one function is the whole blast radius: while it
-    raises, no order can leave the process no matter what the rest of the
-    loop does.
+    The single, only place broker.submit_target_position is invoked from this
+    module. Everything upstream (approval, sizing, rounding) funnels here, so
+    this one function is the whole blast radius — which is exactly why it is
+    worth keeping as its own function now that it really does place orders.
 
-    A real implementation is one line — `return
-    broker.submit_target_position(symbol, target_shares)` — plus whatever
-    logging and order-status checking you want (note IBKR rejects
-    unshortable orders at submission time, see broker_ibkr.py's docstring).
-    The broker handed in here is always paper; see MODE.
+    The broker handed in here is always paper: run_approval_loop either gets
+    one from paper_broker() (mode pinned to MODE) or from a caller that
+    injected its own, and no path in this module constructs anything else.
+
+    Logged before the call as well as after, so an order that is submitted
+    but never returns still leaves a record that it went out.
     """
-    raise NotImplementedError(
-        "Order submission is not implemented — this module is a reviewable "
-        f"skeleton. Would have submitted: {symbol} -> {target_shares} shares "
-        f"(mode={MODE}). Implement submit_paper_order() to enable execution."
-    )
+    logger.info("Submitting %s -> %s shares (mode=%s).", symbol, target_shares, MODE)
+    order = broker.submit_target_position(symbol, target_shares)
+    if order is None:
+        logger.info("%s already at %s shares — no order needed.", symbol, target_shares)
+    return order
 
 
 # --------------------------------------------------------------------------
@@ -388,13 +400,24 @@ def record_batch_monitoring(
 # --------------------------------------------------------------------------
 
 
+def paper_keys_present() -> bool:
+    """
+    Whether there is an Alpaca paper account to talk to at all. Checked
+    before anyone is asked to approve anything — proposing trades that
+    provably cannot be placed just trains a human to rubber-stamp.
+    """
+    return bool(settings.alpaca_paper_api_key and settings.alpaca_paper_secret_key)
+
+
 def paper_broker() -> Broker:
     """
-    The only broker constructor in this module. mode is pinned to MODE and
-    confirm_live is never passed, so the live guard in the broker classes
-    cannot be satisfied from here.
+    The only broker constructor in this module. AlpacaBroker directly rather
+    than get_broker(): the factory picks its class from settings.broker, which
+    would make where these orders land an .env-editable question. mode is
+    pinned to MODE and confirm_live is never passed, so the live guard in
+    broker_alpaca.py cannot be satisfied from here.
     """
-    return get_broker(mode=MODE)
+    return AlpacaBroker(mode=MODE)
 
 
 def run_approval_loop(
@@ -402,22 +425,35 @@ def run_approval_loop(
     request_fn: Callable[[str, list[PendingDecision]], dict[int, bool]] = request_approvals,
     submit_fn: Callable[[Broker, str, float], dict | None] = submit_paper_order,
     price_fn: Callable[[list[str]], dict[str, float]] = latest_close_prices,
+    correlation_fn: Callable[[list[str]], pd.DataFrame] = recent_correlations,
     engine: Engine | None = None,
+    print_fn: Callable[[str], None] = print,
 ) -> list[ExecutionResult]:
     """
     One full pass: pending batch -> proposal -> human answer -> sized orders
     -> write-back -> monitoring snapshot.
 
-    The two side-effecting steps are injected (defaulting to the stubs) so
-    this orchestration can be exercised in tests without either stub being
-    reachable by accident in production — the defaults still raise.
+    Both side-effecting steps are injected so this orchestration can be
+    exercised in tests. The default request_fn is still the Telegram stub and
+    still raises, so calling this with nothing injected stops at the human
+    step rather than trading unattended; the default submit_fn now really
+    places the order once an approval does arrive.
 
     Fails closed at every step: a candidate with no price, no answer, or a
-    size that rounds to zero shares is not traded.
+    size that rounds to zero shares is not traded. With no Alpaca paper keys
+    configured it says so and returns without asking anyone anything.
     """
     decisions = load_pending_decisions(engine=engine)
     if not decisions:
         logger.info("No pending decisions awaiting approval (mode=%s).", MODE)
+        return []
+
+    # Checked before the human is asked, not after: an approval this loop
+    # cannot act on is worse than no approval at all. Only when the caller
+    # didn't bring its own broker — an injected one needs no keys of ours.
+    if broker is None and not paper_keys_present():
+        logger.warning("Alpaca paper credentials are not configured; skipping the batch.")
+        print_fn(MISSING_PAPER_KEYS_MESSAGE)
         return []
 
     approvals = request_fn(format_proposal(decisions), decisions)
@@ -441,7 +477,7 @@ def run_approval_loop(
         for decision in decisions
     ]
 
-    record_batch_monitoring(broker, price_fn=price_fn)
+    record_batch_monitoring(broker, price_fn=price_fn, correlation_fn=correlation_fn)
     return results
 
 
@@ -493,8 +529,10 @@ def _handle_decision(
 # only load_pending_decisions (a SELECT) and the PendingDecision dataclass.
 # It does not call request_approvals, submit_paper_order, paper_broker,
 # record_execution, or record_batch_monitoring — so it stays runnable while
-# those remain stubs, and no amount of answering "y" can move money or mutate
-# a row. The stubs are routed around, never un-stubbed.
+# those stay unreachable from here, and no amount of answering "y" can move
+# money or mutate a row. That mattered when submit_paper_order was a stub and
+# it matters more now that it isn't: this path's inertness comes from what it
+# does not call, not from the other functions being harmless.
 
 
 @dataclasses.dataclass
