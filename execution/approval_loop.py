@@ -41,6 +41,9 @@ The CLI has three modes and not one of them can place an order:
                    there cannot move anything.
   --telegram-setup prints the chat id of whoever has messaged the bot, for .env.
   --notify         sends the pending batch to that chat as one message.
+  --listen         reads replies from that chat, prints what they meant, and
+                   acts on none of them. Understanding an approval and acting
+                   on one are separate things here, and only the first is built.
 
 There is deliberately no executing CLI mode: adding one would mean adding an
 unattended call site for real orders.
@@ -66,6 +69,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import logging
+import re
 import sys
 from collections.abc import Callable
 from typing import Protocol
@@ -696,9 +700,10 @@ def _print_encodable(line: str) -> None:
 
 
 NOTIFY_FOOTER = (
-    "Replies to this chat are NOT read — this is a notification, not an approval "
-    "prompt. Nothing has been sent to a broker.\n"
-    "Review and answer at the console: python -m execution.approval_loop --dry-run"
+    "No reply here can place an order. Nothing has been sent to a broker.\n"
+    'Replying "approve 3" or "reject all" only reaches the demo listener '
+    "(--listen), which prints what it heard and stops there.\n"
+    "Real approval is at the console: python -m execution.approval_loop --dry-run"
 )
 
 
@@ -721,8 +726,226 @@ def format_notification(decisions: list[PendingDecision]) -> str:
         f"Pulse — {len(decisions)} pending proposal(s) | "
         f"batch {_format_ts(decisions[0].ts)} | {MODE} mode"
     )
-    body = "\n".join(format_pick_line(d) for d in decisions)
+    # The [id] prefix is what a reply refers to. Decision ids rather than 1..n
+    # positions: the position of a pick in a message is not stable across runs,
+    # and "approve 3" meaning a different stock than it did an hour ago is the
+    # kind of ambiguity that has no business anywhere near an approval.
+    body = "\n".join(f"[{d.decision_id}] {format_pick_line(d)}" for d in decisions)
     return f"{header}\n\n{body}\n\n{NOTIFY_FOOTER}"
+
+
+# --------------------------------------------------------------------------
+# Reading replies — parsed, shown, and deliberately acted on by nothing
+# --------------------------------------------------------------------------
+#
+# This is the half request_approvals would need, built as far as understanding
+# and no further. It resolves "approve 3" to a decision and prints it. It does
+# not return approvals to run_approval_loop, does not write executed_position,
+# and does not construct a broker — so a chat message still cannot cause a
+# trade or even change a row. request_approvals stays a stub on purpose; the
+# gap between "we understood you" and "we acted on you" is the safety property,
+# and closing it should be its own reviewed change.
+
+APPROVE_WORDS = frozenset({"approve", "approved", "approves", "yes", "ok", "okay", "accept"})
+REJECT_WORDS = frozenset({"reject", "rejected", "rejects", "no", "skip", "deny", "decline"})
+
+
+@dataclasses.dataclass
+class ParsedReply:
+    """What one chat message was understood to mean, if anything."""
+
+    raw: str
+    action: str | None = None  # "approve" | "reject" | None
+    decision_ids: list[int] = dataclasses.field(default_factory=list)
+    unknown_ids: list[int] = dataclasses.field(default_factory=list)
+    targets_all: bool = False
+
+    @property
+    def understood(self) -> bool:
+        """
+        A verb alone is not an instruction. "approve" with nothing to approve
+        is ambiguous, and an ambiguous approval is the one kind this must never
+        resolve in the generous direction.
+        """
+        return self.action is not None and bool(
+            self.decision_ids or self.unknown_ids or self.targets_all
+        )
+
+    @property
+    def approves(self) -> bool:
+        return self.action == "approve"
+
+
+def parse_reply(text: str, decisions: list[PendingDecision]) -> ParsedReply:
+    """
+    Turn a chat message into an intent against `decisions`.
+
+    Grammar, deliberately small: a verb, then either "all" or one or more
+    decision ids. Commas, extra spaces, "#" prefixes and mixed case are all
+    tolerated; anything else in the message is ignored rather than guessed at.
+
+    Fails closed by construction — an unrecognised message produces a
+    ParsedReply whose .understood is False and whose id lists are empty, so a
+    caller that mishandles it approves nothing.
+    """
+    raw = str(text or "").strip()
+    tokens = [t for t in re.split(r"[\s,]+", raw.lower()) if t]
+    if not tokens:
+        return ParsedReply(raw=raw)
+
+    verb = tokens[0].lstrip("/")  # "/approve 3" works too; Telegram loves a slash
+    if verb in APPROVE_WORDS:
+        action = "approve"
+    elif verb in REJECT_WORDS:
+        action = "reject"
+    else:
+        return ParsedReply(raw=raw)
+
+    known = {d.decision_id for d in decisions}
+    rest = tokens[1:]
+
+    if "all" in rest:
+        return ParsedReply(raw=raw, action=action, decision_ids=sorted(known), targets_all=True)
+
+    found, unknown = [], []
+    for token in rest:
+        if not re.fullmatch(r"#?\d+", token):
+            continue  # filler like "please" is ignored, not treated as an id
+        number = int(token.lstrip("#"))
+        (found if number in known else unknown).append(number)
+
+    return ParsedReply(raw=raw, action=action, decision_ids=found, unknown_ids=unknown)
+
+
+def describe_reply(parsed: ParsedReply, decisions: list[PendingDecision]) -> list[str]:
+    """The reply rendered back as console lines, so the demo shows its working."""
+    if not parsed.understood:
+        return [
+            f'  did not understand: "{parsed.raw}"',
+            '  say "approve 3", "reject 3 5", or "approve all"',
+        ]
+
+    by_id = {d.decision_id: d for d in decisions}
+    verb = parsed.action.upper()
+    lines = []
+
+    if parsed.targets_all:
+        lines.append(f"  heard: {verb} ALL — {len(parsed.decision_ids)} pick(s)")
+    for decision_id in parsed.decision_ids:
+        decision = by_id[decision_id]
+        lines.append(
+            f"  heard: {verb} [{decision_id}] {decision.symbol} "
+            f"{decision.side.upper()} {abs(decision.target_position):.1%}"
+        )
+    lines.extend(f"  ignored: [{i}] is not in this batch" for i in parsed.unknown_ids)
+    return lines
+
+
+def run_listen(
+    print_fn: Callable[[str], None] = _print_encodable,
+    fetch_fn: Callable[..., list[dict]] = telegram.fetch_updates,
+    send_fn: Callable[..., dict] = telegram.send_message,
+    engine: Engine | None = None,
+    poll_timeout: int = 20,
+    max_polls: int | None = None,
+    ack: bool = True,
+) -> int:
+    """
+    Read replies from the configured chat, say what they meant, act on none
+    of them.
+
+    Runs until Ctrl+C. max_polls bounds it for tests and for a scripted demo.
+
+    The tally at the end is a tally, not a decision: it is printed and thrown
+    away. Nothing here writes executed_position or reaches a broker, so the
+    pending batch is exactly as pending when this exits as when it started.
+    """
+    token, chat_id = telegram.credentials()
+    if not token:
+        print_fn(telegram.MISSING_TOKEN_MESSAGE)
+        return 0
+    if not chat_id:
+        print_fn(telegram.MISSING_CHAT_ID_MESSAGE)
+        return 0
+
+    decisions = load_pending_decisions(engine=engine)
+    if not decisions:
+        print_fn("No pending trade proposals — nothing to reply about.")
+        return 0
+
+    print_fn(
+        f"Listening for replies from chat {chat_id} — {len(decisions)} pick(s) in the batch.\n"
+        'Reply on your phone with "approve 3", "reject 3 5", or "approve all".\n'
+        "Ctrl+C to stop. Nothing you say here will be executed or recorded.\n"
+    )
+
+    heard: dict[int, bool] = {}
+    offset: int | None = None
+    polls = 0
+
+    try:
+        while max_polls is None or polls < max_polls:
+            polls += 1
+            try:
+                updates = fetch_fn(token, offset=offset, poll_timeout=poll_timeout)
+            except telegram.TelegramError as exc:
+                print_fn(f"Telegram stopped answering: {exc}")
+                return 1
+
+            offset = telegram.next_offset(updates) or offset
+
+            for reply in telegram.replies_from(updates, chat_id):
+                print_fn(f'  you said: "{reply["text"]}"')
+                parsed = parse_reply(reply["text"], decisions)
+                for line in describe_reply(parsed, decisions):
+                    print_fn(line)
+                print_fn("")
+
+                if parsed.understood:
+                    # A later reply about the same pick wins — people change
+                    # their minds mid-conversation.
+                    for decision_id in parsed.decision_ids:
+                        heard[decision_id] = parsed.approves
+                if ack:
+                    _acknowledge(parsed, send_fn, token, chat_id, print_fn)
+    except KeyboardInterrupt:
+        print_fn("\nStopped listening.")
+
+    approved = sum(1 for v in heard.values() if v)
+    rejected = len(heard) - approved
+    print_fn(
+        f"Heard {approved} approval(s) and {rejected} rejection(s) across "
+        f"{len(heard)} pick(s).\n"
+        "None of it was recorded and none of it was executed — this listener only "
+        "reads. To actually decide: python -m execution.approval_loop --dry-run"
+    )
+    return 0
+
+
+def _acknowledge(
+    parsed: ParsedReply,
+    send_fn: Callable[..., dict],
+    token: str,
+    chat_id: str,
+    print_fn: Callable[[str], None],
+) -> None:
+    """
+    Echo back to the phone so the round trip is visible from the couch.
+
+    Best effort: a failed acknowledgement is reported and shrugged off. It is
+    a courtesy message, and it must not be able to take the listener down —
+    especially since the listener is the thing holding the demo open.
+    """
+    if parsed.understood:
+        target = "all picks" if parsed.targets_all else f"{len(parsed.decision_ids)} pick(s)"
+        body = f"Heard you: {parsed.action} {target}. Nothing was executed — I only read."
+    else:
+        body = 'Did not understand that. Try "approve 3", "reject 3 5", or "approve all".'
+
+    try:
+        send_fn(body, token=token, chat_id=chat_id)
+    except telegram.TelegramError as exc:
+        print_fn(f"  (could not send the acknowledgement: {exc})")
 
 
 def run_telegram_setup(
@@ -864,12 +1087,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Send the latest pending proposals to the configured Telegram chat as one message. Send only.",
     )
+    modes.add_argument(
+        "--listen",
+        action="store_true",
+        help=(
+            "Read replies from that chat and print what they meant. Records nothing, "
+            "executes nothing. Ctrl+C to stop."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.telegram_setup:
         return run_telegram_setup()
     if args.notify:
         return run_notify()
+    if args.listen:
+        return run_listen()
 
     run_dry_run()
     return 0

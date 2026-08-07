@@ -196,20 +196,104 @@ def send_message(
     )
 
 
-def fetch_updates(token: str | None = None, limit: int = 100, call_fn=call) -> list[dict]:
+def fetch_updates(
+    token: str | None = None,
+    limit: int = 100,
+    offset: int | None = None,
+    poll_timeout: int = 0,
+    call_fn=call,
+) -> list[dict]:
     """
-    Recent updates for the bot — the raw material for chat-id discovery.
+    Updates for the bot — the raw material for chat-id discovery and for
+    reading replies.
 
-    No offset and no long-poll timeout: this must not consume updates or block,
-    it just looks at what is already queued. Telegram keeps unretrieved updates
-    for about 24 hours, which is why setup asks the user to message the bot
-    first rather than assuming an old conversation is still visible.
+    Two modes, both driven by the caller:
+
+    offset=None (the default, used by --telegram-setup) consumes nothing.
+    Telegram keeps an unacknowledged update for about 24 hours and will keep
+    handing it back, which is what setup wants: look, don't disturb.
+
+    offset=N (used by the reply listener) acknowledges everything below N, so a
+    poll loop sees each message once instead of re-reading the same "approve 3"
+    on every pass. Acknowledging is irreversible — Telegram drops those updates
+    — so it is opt-in rather than the default.
+
+    poll_timeout > 0 asks Telegram to hold the connection open until something
+    arrives, which is far cheaper than hammering it in a tight loop. The HTTP
+    timeout is stretched past it so the client does not give up first.
     """
     resolved_token, _ = credentials(token, "")
     if not resolved_token:
         raise TelegramError("getUpdates: no bot token configured")
-    result = call_fn("getUpdates", resolved_token, {"limit": limit, "timeout": 0})
+
+    payload: dict = {"limit": limit, "timeout": int(poll_timeout)}
+    if offset is not None:
+        payload["offset"] = int(offset)
+
+    result = call_fn(
+        "getUpdates", resolved_token, payload, timeout=DEFAULT_TIMEOUT + int(poll_timeout)
+    )
     return list(result or [])
+
+
+def next_offset(updates: list[dict]) -> int | None:
+    """
+    The offset that acknowledges everything in `updates`, or None if empty.
+
+    Telegram's contract is "one past the highest update_id you have handled".
+    Computed from the max rather than the last element because the list order
+    is not something worth trusting for a value that silently drops messages
+    when it is too high.
+    """
+    ids = [u["update_id"] for u in updates if isinstance(u, dict) and "update_id" in u]
+    return max(ids) + 1 if ids else None
+
+
+def _message_of(update: dict) -> dict | None:
+    """The message-ish payload of an update, whichever of the four shapes it is."""
+    if not isinstance(update, dict):
+        return None
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        candidate = update.get(key)
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def replies_from(updates: list[dict], chat_id: str) -> list[dict]:
+    """
+    Text messages in `updates` that came from `chat_id`, as
+    {"update_id", "text", "name"} — everything else dropped.
+
+    THE FILTER IS THE POINT. A bot's username is public and anyone who finds it
+    can message it, so "a reply arrived" and "the owner replied" are different
+    claims. Only the configured chat is ever returned, so a stranger's
+    "approve all" is not merely rejected downstream — it never becomes a reply
+    at all. Nothing reads approvals today, but this is the function that would
+    feed them, and it should already be the narrow one.
+    """
+    wanted = str(chat_id).strip()
+    replies = []
+    for update in updates:
+        message = _message_of(update)
+        if not message:
+            continue
+        chat = message.get("chat")
+        if not isinstance(chat, dict) or str(chat.get("id")) != wanted:
+            continue
+        text = message.get("text")
+        if not text:
+            continue  # a sticker is not an approval
+        name = (
+            chat.get("title")
+            or " ".join(p for p in (chat.get("first_name"), chat.get("last_name")) if p)
+            or chat.get("username")
+            or "(no name)"
+        )
+        replies.append(
+            {"update_id": update.get("update_id"), "text": str(text), "name": str(name)}
+        )
+    return replies
 
 
 def chat_candidates(updates: list[dict]) -> list[dict]:
@@ -224,12 +308,7 @@ def chat_candidates(updates: list[dict]) -> list[dict]:
     """
     seen: dict[str, dict] = {}
     for update in reversed(list(updates)):
-        message = None
-        for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
-            candidate = update.get(key) if isinstance(update, dict) else None
-            if isinstance(candidate, dict):
-                message = candidate
-                break
+        message = _message_of(update)
         if not message:
             continue
 

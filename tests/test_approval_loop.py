@@ -11,6 +11,7 @@ from execution.approval_loop import (
     MODE,
     ExecutionResult,
     PendingDecision,
+    describe_reply,
     executed_fraction,
     format_candidate,
     format_dry_run_proposal,
@@ -21,11 +22,13 @@ from execution.approval_loop import (
     main,
     paper_broker,
     paper_keys_present,
+    parse_reply,
     record_batch_monitoring,
     record_execution,
     request_approvals,
     run_approval_loop,
     run_dry_run,
+    run_listen,
     run_notify,
     run_telegram_setup,
     submit_paper_order,
@@ -752,14 +755,6 @@ def test_format_notification_puts_every_pick_in_one_message():
     assert message.count("🤖 Pulse proposes:") == 3
 
 
-def test_format_notification_says_replies_are_not_read():
-    """The message must not invite an approval it cannot receive."""
-    message = format_notification([_decision()])
-
-    assert "Replies to this chat are NOT read" in message
-    assert "--dry-run" in message  # points at where approval actually happens
-
-
 def test_format_notification_is_plain_text_with_no_markdown_syntax():
     message = format_notification([_decision(symbol="TSLA", target_position=-0.08)])
 
@@ -1009,6 +1004,334 @@ def test_notify_and_setup_default_to_the_safe_printer():
 
     for fn in (run_notify, run_telegram_setup):
         assert inspect.signature(fn).parameters["print_fn"].default is approval_loop._print_encodable
+
+
+def test_notification_lines_carry_the_id_a_reply_refers_to():
+    message = format_notification([_decision(decision_id=7, symbol="XOM", target_position=-0.08)])
+
+    assert "[7] 🤖 Pulse proposes: SHORT XOM" in message
+
+
+def test_notification_footer_is_honest_about_what_a_reply_reaches():
+    message = format_notification([_decision()])
+
+    assert "No reply here can place an order" in message
+    assert "--listen" in message  # replies do reach something; say which
+    assert "--dry-run" in message  # and where the real decision happens
+
+
+# --- reply grammar --------------------------------------------------------
+
+BATCH = [
+    _decision(decision_id=3, symbol="XOM", target_position=-0.071),
+    _decision(decision_id=5, symbol="TSLA", target_position=0.20),
+    _decision(decision_id=8, symbol="KO", target_position=0.021),
+]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["approve 5", "APPROVE 5", "  approve   5  ", "/approve 5", "approve #5", "yes 5", "ok 5"],
+)
+def test_parse_reply_understands_the_usual_ways_to_approve_one_pick(text):
+    parsed = parse_reply(text, BATCH)
+
+    assert parsed.understood and parsed.approves
+    assert parsed.decision_ids == [5]
+    assert parsed.targets_all is False
+
+
+@pytest.mark.parametrize("text", ["reject 5", "no 5", "skip 5", "deny 5", "/reject 5"])
+def test_parse_reply_understands_the_usual_ways_to_reject(text):
+    parsed = parse_reply(text, BATCH)
+
+    assert parsed.understood and not parsed.approves
+    assert parsed.decision_ids == [5]
+
+
+@pytest.mark.parametrize("text", ["approve 3 5", "approve 3,5", "approve 3, 5", "approve #3 #5"])
+def test_parse_reply_takes_several_ids_however_they_are_separated(text):
+    assert parse_reply(text, BATCH).decision_ids == [3, 5]
+
+
+def test_parse_reply_expands_all_to_the_whole_batch():
+    parsed = parse_reply("approve all", BATCH)
+
+    assert parsed.targets_all is True
+    assert parsed.decision_ids == [3, 5, 8]
+
+
+def test_parse_reply_separates_ids_that_are_not_in_this_batch():
+    """A stale id from yesterday's message must not silently hit today's pick."""
+    parsed = parse_reply("approve 5 99", BATCH)
+
+    assert parsed.decision_ids == [5]
+    assert parsed.unknown_ids == [99]
+
+
+@pytest.mark.parametrize(
+    "text", ["", "   ", "hi", "what are these", "3", "5 approve", "maybe approve 5"]
+)
+def test_parse_reply_refuses_anything_outside_the_grammar(text):
+    parsed = parse_reply(text, BATCH)
+
+    assert not parsed.understood
+    assert parsed.decision_ids == []
+
+
+def test_parse_reply_treats_a_bare_verb_as_not_understood():
+    """"approve" with nothing to approve is ambiguous, and ambiguity is never a yes."""
+    parsed = parse_reply("approve", BATCH)
+
+    assert not parsed.understood
+    assert parsed.decision_ids == []
+
+
+def test_parse_reply_ignores_filler_words_around_the_ids():
+    assert parse_reply("approve 5 please", BATCH).decision_ids == [5]
+
+
+def test_describe_reply_names_the_stock_behind_the_id():
+    lines = "\n".join(describe_reply(parse_reply("approve 3", BATCH), BATCH))
+
+    assert "APPROVE [3] XOM SHORT 7.1%" in lines
+
+
+def test_describe_reply_explains_a_message_it_could_not_parse():
+    lines = "\n".join(describe_reply(parse_reply("lol", BATCH), BATCH))
+
+    assert "did not understand" in lines and "approve 3" in lines
+
+
+def test_describe_reply_calls_out_an_id_from_another_batch():
+    lines = "\n".join(describe_reply(parse_reply("approve 99", BATCH), BATCH))
+
+    assert "[99] is not in this batch" in lines
+
+
+# --- the listener ---------------------------------------------------------
+
+
+def _updates(*texts, chat_id="424242", start=100):
+    return [
+        {
+            "update_id": start + i,
+            "message": {"chat": {"id": int(chat_id), "first_name": "Neeraj", "type": "private"}, "text": t},
+        }
+        for i, t in enumerate(texts)
+    ]
+
+
+class _Listener:
+    """Hands the poll loop one batch of updates per call, then nothing."""
+
+    def __init__(self, *batches):
+        self.batches = list(batches)
+        self.calls = []
+
+    def __call__(self, token, offset=None, poll_timeout=0):
+        self.calls.append({"token": token, "offset": offset})
+        return self.batches.pop(0) if self.batches else []
+
+
+def test_run_listen_reports_what_each_reply_meant(monkeypatch, telegram_configured):
+    console = _Console()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    run_listen(
+        print_fn=console.print,
+        fetch_fn=_Listener(_updates("approve 5", "reject 3")),
+        send_fn=_Sender(),
+        max_polls=1,
+    )
+
+    assert 'you said: "approve 5"' in console.text
+    assert "APPROVE [5] TSLA LONG 20.0%" in console.text
+    assert "REJECT [3] XOM SHORT 7.1%" in console.text
+    assert "Heard 1 approval(s) and 1 rejection(s)" in console.text
+
+
+def test_run_listen_records_nothing_and_says_so(monkeypatch, telegram_configured):
+    console = _Console()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    run_listen(
+        print_fn=console.print,
+        fetch_fn=_Listener(_updates("approve all")),
+        send_fn=_Sender(),
+        max_polls=1,
+    )
+
+    assert "none of it was executed" in console.text.lower()
+
+
+def test_run_listen_never_reaches_the_broker_or_writes_a_row(monkeypatch, telegram_configured):
+    """The whole point of the choice to build understanding without action."""
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("the listener must not reach this")
+
+    for name in (
+        "request_approvals",
+        "submit_paper_order",
+        "paper_broker",
+        "AlpacaBroker",
+        "record_execution",
+        "record_batch_monitoring",
+        "run_approval_loop",
+    ):
+        monkeypatch.setattr(f"execution.approval_loop.{name}", _forbidden)
+
+    assert (
+        run_listen(
+            print_fn=_Console().print,
+            fetch_fn=_Listener(_updates("approve all")),
+            send_fn=_Sender(),
+            max_polls=1,
+        )
+        == 0
+    )
+
+
+def test_run_listen_ignores_a_stranger_messaging_the_bot(monkeypatch, telegram_configured):
+    """A bot username is public. Only the configured chat is ever heard."""
+    console = _Console()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    run_listen(
+        print_fn=console.print,
+        fetch_fn=_Listener(_updates("approve all", chat_id="777777")),
+        send_fn=_Sender(),
+        max_polls=1,
+    )
+
+    assert "you said" not in console.text
+    assert "Heard 0 approval(s)" in console.text
+
+
+def test_run_listen_advances_the_offset_so_a_reply_is_read_once(monkeypatch, telegram_configured):
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+    listener = _Listener(_updates("approve 5", start=100), [])
+
+    run_listen(print_fn=_Console().print, fetch_fn=listener, send_fn=_Sender(), max_polls=2)
+
+    assert listener.calls[0]["offset"] is None  # first poll takes whatever is queued
+    assert listener.calls[1]["offset"] == 101  # then acknowledges past update_id 100
+
+
+def test_run_listen_lets_a_later_reply_change_an_earlier_answer(monkeypatch, telegram_configured):
+    console = _Console()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    run_listen(
+        print_fn=console.print,
+        fetch_fn=_Listener(_updates("approve 5", "reject 5")),
+        send_fn=_Sender(),
+        max_polls=1,
+    )
+
+    assert "Heard 0 approval(s) and 1 rejection(s) across 1 pick(s)" in console.text
+
+
+def test_run_listen_acknowledges_back_to_the_phone(monkeypatch, telegram_configured):
+    sender = _Sender()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    run_listen(
+        print_fn=_Console().print,
+        fetch_fn=_Listener(_updates("approve 5")),
+        send_fn=sender,
+        max_polls=1,
+    )
+
+    assert len(sender.messages) == 1
+    assert "Heard you: approve" in sender.messages[0]["text"]
+    assert "Nothing was executed" in sender.messages[0]["text"]
+
+
+def test_run_listen_tells_the_phone_when_it_did_not_understand(monkeypatch, telegram_configured):
+    sender = _Sender()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    run_listen(
+        print_fn=_Console().print,
+        fetch_fn=_Listener(_updates("lol wat")),
+        send_fn=sender,
+        max_polls=1,
+    )
+
+    assert "Did not understand" in sender.messages[0]["text"]
+
+
+def test_run_listen_survives_a_failed_acknowledgement(monkeypatch, telegram_configured):
+    """The courtesy message must not be able to take the listener down."""
+    console = _Console()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+    sender = _Sender(error=approval_loop.telegram.TelegramError("sendMessage: blocked"))
+
+    assert (
+        run_listen(
+            print_fn=console.print,
+            fetch_fn=_Listener(_updates("approve 5")),
+            send_fn=sender,
+            max_polls=1,
+        )
+        == 0
+    )
+    assert "could not send the acknowledgement" in console.text
+    assert "Heard 1 approval(s)" in console.text  # the reply still counted
+
+
+def test_run_listen_exits_cleanly_with_no_credentials(monkeypatch):
+    console = _Console()
+    monkeypatch.setattr(approval_loop.telegram.settings, "telegram_bot_token", "")
+
+    def _no_calls(*args, **kwargs):
+        raise AssertionError("must not poll without a token")
+
+    assert run_listen(print_fn=console.print, fetch_fn=_no_calls, send_fn=_no_calls) == 0
+    assert "TELEGRAM_BOT_TOKEN is not set" in console.text
+
+
+def test_run_listen_says_so_when_there_is_nothing_pending(monkeypatch, telegram_configured):
+    console = _Console()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: [])
+
+    def _no_calls(*args, **kwargs):
+        raise AssertionError("nothing to listen about")
+
+    assert run_listen(print_fn=console.print, fetch_fn=_no_calls, send_fn=_no_calls) == 0
+    assert "nothing to reply about" in console.text
+
+
+def test_run_listen_reports_a_telegram_outage(monkeypatch, telegram_configured):
+    console = _Console()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    def _down(token, offset=None, poll_timeout=0):
+        raise approval_loop.telegram.TelegramError("getUpdates: could not reach api.telegram.org")
+
+    assert run_listen(print_fn=console.print, fetch_fn=_down, send_fn=_Sender()) == 1
+    assert "Telegram stopped answering" in console.text
+
+
+def test_run_listen_stops_on_ctrl_c_without_a_traceback(monkeypatch, telegram_configured):
+    console = _Console()
+    monkeypatch.setattr("execution.approval_loop.load_pending_decisions", lambda engine=None: BATCH)
+
+    def _interrupt(token, offset=None, poll_timeout=0):
+        raise KeyboardInterrupt
+
+    assert run_listen(print_fn=console.print, fetch_fn=_interrupt, send_fn=_Sender()) == 0
+    assert "Stopped listening" in console.text
+
+
+def test_main_dispatches_listen(monkeypatch):
+    monkeypatch.setattr("execution.approval_loop.run_listen", lambda: 0)
+    monkeypatch.setattr("execution.approval_loop.run_dry_run", _unreachable)
+
+    assert main(["--listen"]) == 0
 
 
 def test_the_phone_still_gets_the_real_characters(monkeypatch, telegram_configured):

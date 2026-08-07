@@ -229,19 +229,95 @@ def _update(chat_id, text="hi", first_name="Neeraj", kind="private", key="messag
     return {key: {"chat": {"id": chat_id, "first_name": first_name, "type": kind}, "text": text}}
 
 
-def test_fetch_updates_does_not_consume_or_long_poll():
+def _recording_call(captured, result=None):
+    def fake_call(method, token, payload=None, timeout=None):
+        captured.update(method=method, payload=payload, http_timeout=timeout)
+        return result if result is not None else [_update(42)]
+
+    return fake_call
+
+
+def test_fetch_updates_does_not_consume_or_long_poll_by_default():
     captured = {}
 
-    def fake_call(method, token, payload=None):
-        captured.update(method=method, payload=payload)
-        return [_update(42)]
-
-    telegram.fetch_updates(token=FAKE_TOKEN, call_fn=fake_call)
+    telegram.fetch_updates(token=FAKE_TOKEN, call_fn=_recording_call(captured))
 
     assert captured["method"] == "getUpdates"
     # no offset -> nothing is marked delivered; timeout 0 -> returns immediately
     assert "offset" not in captured["payload"]
     assert captured["payload"]["timeout"] == 0
+
+
+def test_fetch_updates_passes_an_offset_when_asked_to_consume():
+    captured = {}
+
+    telegram.fetch_updates(token=FAKE_TOKEN, offset=101, call_fn=_recording_call(captured))
+
+    assert captured["payload"]["offset"] == 101
+
+
+def test_fetch_updates_stretches_the_http_timeout_past_the_long_poll():
+    """Otherwise the client hangs up mid-poll and every wait looks like an outage."""
+    captured = {}
+
+    telegram.fetch_updates(token=FAKE_TOKEN, poll_timeout=20, call_fn=_recording_call(captured))
+
+    assert captured["payload"]["timeout"] == 20
+    assert captured["http_timeout"] > 20
+
+
+# --- offset arithmetic ----------------------------------------------------
+
+
+def test_next_offset_is_one_past_the_highest_update_id():
+    updates = [{"update_id": 100}, {"update_id": 102}, {"update_id": 101}]
+
+    assert telegram.next_offset(updates) == 103
+
+
+def test_next_offset_of_nothing_is_none():
+    """No updates means no acknowledgement — never reset the cursor to 0."""
+    assert telegram.next_offset([]) is None
+
+
+def test_next_offset_ignores_malformed_entries():
+    assert telegram.next_offset([{"no_id": 1}, {"update_id": 7}]) == 8
+
+
+# --- reply filtering ------------------------------------------------------
+
+
+def _reply_update(chat_id, text="approve 3", update_id=1):
+    return {
+        "update_id": update_id,
+        "message": {"chat": {"id": chat_id, "first_name": "Neeraj", "type": "private"}, "text": text},
+    }
+
+
+def test_replies_from_returns_messages_from_the_configured_chat():
+    replies = telegram.replies_from([_reply_update(424242, "approve 3", 9)], "424242")
+
+    assert replies == [{"update_id": 9, "text": "approve 3", "name": "Neeraj"}]
+
+
+def test_replies_from_drops_every_other_chat():
+    """A bot username is public; "someone replied" is not "the owner replied"."""
+    updates = [_reply_update(424242, "reject 3"), _reply_update(999999, "approve all")]
+
+    replies = telegram.replies_from(updates, "424242")
+
+    assert [r["text"] for r in replies] == ["reject 3"]
+
+
+def test_replies_from_ignores_messages_with_no_text():
+    """A sticker is not an approval."""
+    updates = [{"update_id": 1, "message": {"chat": {"id": 424242, "type": "private"}, "sticker": {}}}]
+
+    assert telegram.replies_from(updates, "424242") == []
+
+
+def test_replies_from_matches_a_chat_id_given_as_int_or_string():
+    assert len(telegram.replies_from([_reply_update(-100123)], " -100123 ")) == 1
 
 
 def test_fetch_updates_refuses_without_a_token(monkeypatch):
