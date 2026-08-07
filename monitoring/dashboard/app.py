@@ -18,6 +18,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import bindparam, text
 
+from config.settings import settings
 from data.ingest.db import get_engine
 from models.regime.trend_chop_classifier import CHOP, TREND
 from monitoring.breaker_state import load_latest_breaker_state
@@ -36,6 +37,26 @@ from monitoring.dashboard.picks import (
     latest_picks_table,
     regime_counts,
 )
+from monitoring.dashboard.report_card import (
+    FOLD_LABEL,
+    LEVEL_HIGH,
+    SERIES_ALL,
+    SERIES_CONFIDENT,
+    accuracy_chart_frame,
+    agreement_edge_note,
+    confidence_callout,
+    confidence_level,
+    fetch_fold_runs,
+    fold_metrics_frame,
+    headline_metrics,
+)
+from monitoring.dashboard.whatif import (
+    COL_AGREEMENT,
+    DEFAULT_MIN_AGREEMENT,
+    filter_by_thresholds,
+    shortlist_summary,
+    whatif_table,
+)
 from monitoring.equity import load_equity_curve
 from monitoring.forecast_accuracy import compute_forecast_accuracy
 
@@ -45,9 +66,13 @@ engine = get_engine()
 
 # --- Chart palette -----------------------------------------------------------
 # Both modes are chosen for their own surface rather than flipped automatically.
-# Charts here are single-series, so identity never rests on colour alone.
+# Most charts here are single-series, so identity never rests on colour alone;
+# the one two-series chart (the report card's accuracy bars) also carries a
+# legend. `series_2` is the next categorical slot after `series` — the blue and
+# orange pair clears the colour-blind separation floor in both modes.
 _LIGHT = {
     "series": "#2a78d6",
+    "series_2": "#eb6834",
     "surface": "#fcfcfb",
     "grid": "#e1e0d9",
     "axis": "#c3c2b7",
@@ -56,6 +81,7 @@ _LIGHT = {
 }
 _DARK = {
     "series": "#3987e5",
+    "series_2": "#d95926",
     "surface": "#1a1a19",
     "grid": "#2c2c2a",
     "axis": "#383835",
@@ -121,6 +147,22 @@ def load_price_symbols() -> list[str]:
 def load_universe_size() -> int:
     df = pd.read_sql(text("SELECT count(*) AS n FROM universe WHERE is_active"), engine)
     return int(df["n"].iloc[0]) if not df.empty else 0
+
+
+@st.cache_data(ttl=300)
+def load_fold_runs() -> tuple[list[dict], bool]:
+    """
+    Per-fold training metrics from MLflow, plus whether the server answered.
+
+    The tracking server is a separate container from the database, so it can be
+    down while the rest of this page is perfectly healthy. Any failure is turned
+    into `reachable=False` rather than an exception — a monitoring page that
+    dies because a *monitoring* dependency is off is worse than useless.
+    """
+    try:
+        return fetch_fold_runs(settings.mlflow_tracking_uri), True
+    except Exception:  # unreachable server, auth failure, schema change — all the same to the reader
+        return [], False
 
 
 @st.cache_data(ttl=60)
@@ -219,9 +261,96 @@ def _timeseries_chart(
     )
 
 
-def _show(chart: alt.LayerChart) -> None:
+def _grouped_bar_chart(
+    df: pd.DataFrame,
+    category_col: str,
+    series_col: str,
+    value_col: str,
+    y_title: str,
+    value_format: str,
+    value_label: str,
+    series_order: list[str],
+    baseline: float | None = None,
+) -> alt.LayerChart:
+    """
+    Two series side by side per category: capped-width bars with a 4px rounded
+    cap and a square foot on the baseline, grouped with air between categories
+    and a hairline gap between the pair.
+
+    Two series means a legend is not optional — colour alone can't carry
+    identity — so one sits above the plot with the series' own names in it.
+    The y-scale starts at zero: these are shares, and a bar that doesn't start
+    at zero misstates its own length.
+
+    Sized per category rather than stretched to the container, so a chart of
+    three folds doesn't render the same data as three slabs. Show it with
+    `_show(chart, width="content")`.
+    """
+    # `series_order` is pinned rather than left to Vega's alphabetical default:
+    # colour has to follow the series itself, so a fold that drops one of them
+    # can't hand the survivor the other's colour.
+    color = alt.Color(
+        f"{series_col}:N",
+        title=None,
+        scale=alt.Scale(domain=series_order, range=[COLORS["series"], COLORS["series_2"]]),
+        legend=alt.Legend(orient="top", direction="horizontal", labelColor=COLORS["text"], symbolType="square"),
+    )
+    bars = (
+        alt.Chart(df)
+        .mark_bar(cornerRadiusEnd=4)
+        .encode(
+            x=alt.X(f"{category_col}:N", title=None, axis=alt.Axis(labelAngle=0, grid=False)),
+            xOffset=alt.XOffset(f"{series_col}:N", scale=alt.Scale(paddingInner=0.08)),
+            y=alt.Y(
+                f"{value_col}:Q",
+                title=y_title,
+                scale=alt.Scale(zero=True),
+                axis=alt.Axis(format=value_format),
+            ),
+            color=color,
+            tooltip=[
+                alt.Tooltip(f"{category_col}:N", title="Fold"),
+                alt.Tooltip(f"{series_col}:N", title="Measured over"),
+                alt.Tooltip(f"{value_col}:Q", title=value_label, format=value_format),
+            ],
+        )
+    )
+
+    layers = []
+    if baseline is not None:
+        # As with the line charts: a rule spanning the full width has nowhere to
+        # put an inline label that isn't on top of the data, so the caption below
+        # the panel names what the line is instead.
+        layers.append(
+            alt.Chart(pd.DataFrame({"baseline": [baseline]}))
+            .mark_rule(color=COLORS["axis"], strokeWidth=1)
+            .encode(y=alt.Y("baseline:Q"))
+        )
+    layers.append(bars)
+
+    return (
+        alt.layer(*layers)
+        .properties(height=280, width=alt.Step(56))
+        .configure_view(strokeWidth=0)
+        .configure_axis(
+            gridColor=COLORS["grid"],
+            domainColor=COLORS["axis"],
+            tickColor=COLORS["axis"],
+            labelColor=COLORS["muted"],
+            titleColor=COLORS["text"],
+            labelFontSize=11,
+            titleFontSize=11,
+            titleFontWeight="normal",
+        )
+    )
+
+
+def _show(chart: alt.LayerChart, width: str = "stretch") -> None:
     # theme=None so the palette configured above wins over Streamlit's own.
-    st.altair_chart(chart, width="stretch", theme=None)
+    # width="content" hands sizing back to the chart — the bar chart sets its own
+    # width per category so the bars stay thin however many folds there are;
+    # stretching it to the container would inflate them into slabs.
+    st.altair_chart(chart, width=width, theme=None)
 
 
 # --- Page --------------------------------------------------------------------
@@ -334,6 +463,77 @@ else:
 
 st.divider()
 
+# --- What-if thresholds ------------------------------------------------------
+st.subheader("What-if thresholds")
+st.caption(
+    "A playground for the two bars a pick has to clear. Drag them and the "
+    "shortlist above re-sorts itself in front of you. This changes nothing — it "
+    "doesn't retrain anything, doesn't rewrite the screener's settings, and "
+    "doesn't place a trade. It only asks: of the picks already made, which "
+    "would still have made the cut?"
+)
+
+if batch.empty:
+    st.info("Needs a logged screener run before there is anything to re-filter.")
+else:
+    agreement_col, move_col = st.columns(2)
+    with agreement_col:
+        min_agreement = (
+            st.slider(
+                "Minimum model agreement",
+                min_value=50,
+                max_value=100,
+                value=int(DEFAULT_MIN_AGREEMENT * 100),
+                step=5,
+                format="%d%%",
+            )
+            / 100
+        )
+        st.caption(
+            "The system trains several copies of the model and asks each which way "
+            "the price will go. This is the share of them that has to say the same "
+            "thing. 50% is a dead split (no filter at all); 100% means they were "
+            "unanimous."
+        )
+    with move_col:
+        min_abs_move = (
+            st.slider("Minimum predicted move", min_value=0.0, max_value=2.0, value=0.0, step=0.1, format="%.1f%%")
+            / 100
+        )
+        st.caption(
+            "How big a price change the model has to be predicting before the pick "
+            "counts as worth the trouble. Size only — a predicted 1% fall clears a "
+            "1% bar exactly as a predicted 1% rise does."
+        )
+
+    survivors = filter_by_thresholds(batch, min_agreement, min_abs_move)
+    shortlist = whatif_table(survivors)
+
+    st.markdown(f"**{shortlist_summary(len(batch), len(shortlist))}**")
+
+    if shortlist.empty:
+        st.warning(
+            "Nothing clears both bars. That is a real answer, not an error — at these "
+            "settings the screener would have proposed no trades at all."
+        )
+    else:
+        whatif_styled = (
+            shortlist.style.format(
+                {COL_FORECAST: "{:+.2%}", COL_SIZE: "{:.2%}", COL_AGREEMENT: "{:.0%}"}, na_rep="—"
+            ).map(lambda v: _REGIME_BADGE.get(v, ""), subset=[COL_REGIME])
+        )
+        st.dataframe(whatif_styled, width="stretch", hide_index=True)
+        st.caption(
+            "Strongest predicted move first, so the top row is the pick these settings "
+            "argue hardest for. **Target size** is the size the screener originally "
+            "worked out for that pick — it is shown as logged, not recalculated for a "
+            "shorter list, so the sizes here need not add up the way the live shortlist "
+            "does. A pick with no recorded agreement figure drops out as soon as the "
+            "agreement slider leaves 50%, because there is no way to show it clears the bar."
+        )
+
+st.divider()
+
 # --- Price history -----------------------------------------------------------
 st.subheader("Price history")
 st.caption("The daily closing price of one stock, to sanity-check what the screener saw.")
@@ -418,6 +618,95 @@ else:
                     baseline=0.5,
                 )
             )
+
+st.divider()
+
+# --- Model report card -------------------------------------------------------
+st.subheader("Model report card")
+st.caption(
+    "How the model scored during training, before it was ever used to pick "
+    "anything. It was trained on a stretch of history, tested on the stretch "
+    "that came immediately after, and then the whole window was rolled forward "
+    "and the exercise repeated. Each of those re-runs is a **fold**. Several "
+    "consistent folds are evidence; one good fold is luck."
+)
+
+fold_runs, mlflow_reachable = load_fold_runs()
+folds = fold_metrics_frame(fold_runs)
+
+if not mlflow_reachable:
+    st.info(
+        f"Couldn't reach the training-metrics server at {settings.mlflow_tracking_uri}. "
+        "Nothing is wrong with the rest of this page — that server is a separate "
+        "service (`docker compose up -d mlflow`). This panel will fill in once it answers."
+    )
+elif folds.empty:
+    st.info(
+        "The training-metrics server is up but has no finished training runs recorded yet — "
+        "run `python -m models.train --feature-set-id v3 --universe` and this panel fills in."
+    )
+else:
+    headline = headline_metrics(folds)
+    mean_accuracy = headline["directional_accuracy"]
+    mean_accuracy_confident = headline["directional_accuracy_when_confident"]
+    pct_confident = headline["pct_rows_confident"]
+
+    card1, card2, card3 = st.columns(3)
+    with card1:
+        st.metric("Folds tested", headline["n_folds"])
+        st.caption("Separate train-then-test re-runs behind every number here.")
+    with card2:
+        if mean_accuracy is None:
+            st.metric("Direction called right", "—")
+            st.caption("Not recorded for these folds.")
+        else:
+            st.metric(
+                "Direction called right",
+                f"{mean_accuracy:.1%}",
+                delta=f"{(mean_accuracy - 0.5) * 100:+.1f} pts vs a coin flip",
+            )
+            st.caption("Averaged over every fold. 50% is what guessing would get you.")
+    with card3:
+        if pct_confident is None:
+            st.metric("Predictions where the models agreed", "—")
+            st.caption("Not recorded for these folds.")
+        else:
+            st.metric("Predictions where the models agreed", f"{pct_confident:.0%}")
+            st.caption("How often the ensemble cleared its own agreement bar.")
+
+    accuracy_frame = accuracy_chart_frame(folds)
+    if accuracy_frame.empty:
+        st.info("No per-fold accuracy was recorded, so there is nothing to chart.")
+    else:
+        _show(
+            _grouped_bar_chart(
+                accuracy_frame,
+                category_col=FOLD_LABEL,
+                series_col="series",
+                value_col="accuracy",
+                y_title="Direction called right",
+                value_format=".0%",
+                value_label="Accuracy",
+                series_order=[SERIES_ALL, SERIES_CONFIDENT],
+                baseline=0.5,
+            ),
+            width="content",
+        )
+        st.caption(
+            "One pair of bars per fold: the blue bar counts every prediction that fold "
+            "made, the orange one counts only the predictions where the models agreed "
+            "with each other. The grey line across the chart is 50% — pure chance. A bar "
+            "above the line beat a coin flip on that fold; only barely above the line, on "
+            "every fold, means only barely better than guessing."
+        )
+
+    st.markdown(f"**Does waiting for agreement help?** {agreement_edge_note(mean_accuracy, mean_accuracy_confident)}")
+
+    callout = confidence_callout(pct_confident)
+    if confidence_level(pct_confident) == LEVEL_HIGH:
+        st.warning(callout)
+    else:
+        st.info(callout)
 
 st.divider()
 
