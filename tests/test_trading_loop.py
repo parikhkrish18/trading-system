@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from execution import trading_loop
+from execution.approval_gate import ApprovalOutcome, number_proposals
 from models.screener import TradeCandidate
 from monitoring import reasoning
 from risk.circuit_breakers import BreakerResult
@@ -11,6 +12,21 @@ from risk.circuit_breakers import BreakerResult
 # Grabbed before the autouse _no_real_db_writes fixture replaces the module
 # attribute with a no-op, so tests can still exercise the real function.
 _real_log_decisions = trading_loop._log_decisions
+
+
+def _approve_all(proposals, *, context, **kwargs):
+    """The gate with the human removed — what most tests want in the way."""
+    ordered = number_proposals(list(proposals))
+    return ApprovalOutcome(
+        list(ordered), [], status="auto", statuses={p.index: "auto" for p in ordered}
+    )
+
+
+def _reject_all(proposals, *, context, **kwargs):
+    ordered = number_proposals(list(proposals))
+    return ApprovalOutcome(
+        [], list(ordered), status="replied", statuses={p.index: "rejected" for p in ordered}
+    )
 
 
 class _FakeBroker:
@@ -69,6 +85,15 @@ def _no_real_equity_writes(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     monkeypatch.setattr(trading_loop.time, "sleep", lambda s: None)
+
+
+@pytest.fixture(autouse=True)
+def _gate_wide_open(monkeypatch):
+    """
+    Pre-existing tests exercise the engine, not the gate — give them a gate
+    that approves everything. Gate-specific tests pass their own request_fn.
+    """
+    monkeypatch.setattr(trading_loop, "request_approval", _approve_all)
 
 
 def test_log_decisions_builds_full_phase_reasoning_for_candidates_and_closures(monkeypatch):
@@ -271,3 +296,209 @@ def test_run_cycle_never_passes_confirm_live(monkeypatch):
     # could pass confirm_live=True even by accident.
     assert captured["args"] == ()
     assert captured["kwargs"] == {}
+
+
+# --- the human gate at the weekly seam ------------------------------------
+
+
+def _gate_returning(approved_symbols=()):
+    """A request_fn whose verdict is fixed: approve listed symbols, reject the rest."""
+
+    def gate(proposals, *, context, **kwargs):
+        ordered = number_proposals(list(proposals))
+        approved = [p for p in ordered if p.symbol in approved_symbols]
+        rejected = [p for p in ordered if p.symbol not in approved_symbols]
+        statuses = {
+            p.index: ("approved" if p.symbol in approved_symbols else "rejected") for p in ordered
+        }
+        return ApprovalOutcome(approved, rejected, status="replied", statuses=statuses)
+
+    return gate
+
+
+def _timeout_gate(proposals, *, context, **kwargs):
+    ordered = number_proposals(list(proposals))
+    return ApprovalOutcome(
+        [], list(ordered), status="timeout", statuses={p.index: "timeout" for p in ordered}
+    )
+
+
+def test_run_cycle_trades_only_the_approved_subset(monkeypatch):
+    broker = _FakeBroker()
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(
+        trading_loop, "run_screen",
+        lambda *a, **k: [_candidate("YES", "long", 0.1), _candidate("NOPE", "long", 0.1)],
+    )
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"YES": 100.0, "NOPE": 100.0})
+
+    result = trading_loop.run_cycle("v3", ["YES", "NOPE"], request_fn=_gate_returning({"YES"}))
+
+    assert result.status == "traded"
+    assert [s for s, _ in broker.submitted] == ["YES"]
+
+
+def test_run_cycle_gates_closes_too(monkeypatch):
+    """A rejected close means the position STAYS OPEN — nothing is submitted for it."""
+    broker = _FakeBroker(positions={"KEEP": 10.0, "TSLA": 3.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("TSLA", "long", 0.5)])
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"TSLA": 100.0})
+
+    # Approve the TSLA open; reject closing KEEP.
+    trading_loop.run_cycle("v3", ["TSLA", "KEEP"], request_fn=_gate_returning({"TSLA"}))
+
+    submitted_symbols = [s for s, _ in broker.submitted]
+    assert "KEEP" not in submitted_symbols  # the human said keep it
+    assert "TSLA" in submitted_symbols
+    assert broker.get_positions().get("KEEP") == 10.0
+
+
+def test_run_cycle_timeout_rejects_everything_and_places_no_orders(monkeypatch):
+    broker = _FakeBroker(positions={"OLD": 5.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"AAPL": 100.0})
+
+    result = trading_loop.run_cycle("v3", ["AAPL", "OLD"], request_fn=_timeout_gate)
+
+    assert result.status == "traded"  # the cycle completed; it just did nothing
+    assert result.orders_placed == 0
+    assert broker.submitted == []
+
+
+def test_run_cycle_logs_rejected_proposals_with_their_status(monkeypatch):
+    captured = {}
+    broker = _FakeBroker(positions={"OLD": 5.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"AAPL": 100.0})
+    monkeypatch.setattr(trading_loop, "_log_decisions", lambda *a, **k: captured.update(kwargs=k, args=a))
+
+    trading_loop.run_cycle("v3", ["AAPL", "OLD"], request_fn=_timeout_gate)
+
+    assert [c.symbol for c in captured["kwargs"]["rejected_candidates"]] == ["AAPL"]
+    assert captured["kwargs"]["rejected_close_symbols"] == ["OLD"]
+    statuses = captured["kwargs"]["approval_status_by_symbol"]
+    assert statuses == {"AAPL": "timeout", "OLD": "timeout"}
+    assert captured["args"][0] == []  # no approved candidates
+    assert captured["args"][1] == []  # no approved closes
+
+
+def test_log_decisions_writes_rejected_rows_with_zero_executed_position(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+
+    rejected = _candidate("NOPE", "long", 0.2, agreement=0.85)
+    phase1 = reasoning.phase_pretrade_risk([])
+
+    _real_log_decisions(
+        candidates=[],
+        closing_symbols=[],
+        executed={},
+        intended_shares={},
+        feature_set_id="v3",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        rejected_candidates=[rejected],
+        rejected_close_symbols=["KEEP"],
+        approval_status_by_symbol={"NOPE": "rejected", "KEEP": "timeout"},
+    )
+
+    rows = {r["symbol"]: r for r in captured["rows"]}
+    assert rows["NOPE"]["executed_position"] == 0.0
+    assert rows["NOPE"]["approval_status"] == "rejected"
+    assert rows["NOPE"]["direction_agreement"] == 0.85
+    assert rows["KEEP"]["executed_position"] == 0.0
+    assert rows["KEEP"]["approval_status"] == "timeout"
+    nope_phase5 = next(p for p in json.loads(rows["NOPE"]["reasoning"]) if p["phase"] == 5)
+    assert "no order" in nope_phase5["summary"].lower() or "rejected" in nope_phase5["summary"].lower()
+
+
+def test_log_decisions_writes_direction_agreement_and_status_for_approved_rows(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+
+    approved = _candidate("AAPL", "long", 0.1, agreement=0.9)
+    phase1 = reasoning.phase_pretrade_risk([])
+
+    _real_log_decisions(
+        candidates=[approved],
+        closing_symbols=[],
+        executed={"AAPL": 10.0},
+        intended_shares={"AAPL": 10.0},
+        feature_set_id="v3",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        approval_status_by_symbol={"AAPL": "approved"},
+    )
+
+    row = captured["rows"][0]
+    assert row["direction_agreement"] == 0.9
+    assert row["approval_status"] == "approved"
+
+
+def test_run_cycle_dry_run_never_asks_anyone(monkeypatch):
+    """--dry-run returns before the gate — no Telegram message, no approval poll."""
+    broker = _FakeBroker()
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+
+    def _never(*a, **k):
+        raise AssertionError("dry run must never reach the approval gate")
+
+    result = trading_loop.run_cycle("v3", ["AAPL"], dry_run=True, request_fn=_never)
+
+    assert result.status == "dry_run"
+    assert broker.submitted == []
+
+
+def test_run_cycle_fetches_prices_after_the_gate_not_before(monkeypatch):
+    """Sizing must use quotes from after the (possibly long) human wait."""
+    order = []
+    broker = _FakeBroker()
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+
+    def fake_prices(symbols):
+        order.append("prices")
+        return {"AAPL": 100.0}
+
+    def gate(proposals, *, context, **kwargs):
+        order.append("gate")
+        return _approve_all(proposals, context=context)
+
+    monkeypatch.setattr(trading_loop, "_latest_prices", fake_prices)
+    trading_loop.run_cycle("v3", ["AAPL"], request_fn=gate)
+
+    assert order.index("gate") < order.index("prices")

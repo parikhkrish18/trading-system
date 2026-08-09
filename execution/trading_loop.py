@@ -28,6 +28,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from config.settings import settings
 from data.ingest.db import get_engine
 from data.ingest.universe import resolve_symbols
+from execution.approval_gate import ProposedTrade, request_approval
 from execution.broker import get_broker
 from execution.reconciliation import reconcile_positions, summarize
 from features.quant.momentum import adx
@@ -142,16 +143,39 @@ def _log_decisions(
     phase1: dict,
     phase6_by_symbol: dict[str, dict],
     order_type: str,
+    rejected_candidates=(),
+    rejected_close_symbols=(),
+    approval_status_by_symbol: dict[str, str] | None = None,
 ) -> None:
     """
-    Logs one decisions row per symbol touched this cycle — both new/adjusted
-    candidates and anything closed for falling out of the shortlist (which
-    previously went completely unlogged). Every row carries the full 7-phase
-    reasoning: phases 1/5/6/7 are cycle-level facts merged in here, phases
-    2/3/4 come from run_screen for real candidates (see monitoring/reasoning.py).
+    Logs one decisions row per symbol touched this cycle — new/adjusted
+    candidates, anything closed for falling out of the shortlist, AND
+    anything the human approval gate turned down (executed_position 0.0,
+    approval_status rejected/timeout), so the record shows what the system
+    wanted and didn't get, not just what happened. Every row carries the
+    full 7-phase reasoning: phases 1/5/6/7 are cycle-level facts merged in
+    here, phases 2/3/4 come from run_screen for real candidates (see
+    monitoring/reasoning.py).
     """
     now = dt.datetime.now(tz=dt.UTC)
+    statuses = approval_status_by_symbol or {}
     rows = []
+
+    def _row(symbol, forecast, target_position, executed_position, agreement, full_reasoning):
+        return {
+            "ts": now,
+            "symbol": symbol,
+            "feature_set_id": feature_set_id,
+            "model_version": _MODEL_VERSION,
+            "forecast": forecast,
+            "regime": regime,
+            "target_position": target_position,
+            "executed_position": executed_position,
+            "mode": mode,
+            "reasoning": json.dumps(full_reasoning),
+            "direction_agreement": agreement,
+            "approval_status": statuses.get(symbol),
+        }
 
     for c in candidates:
         shares = intended_shares.get(c.symbol, 0.0)
@@ -159,20 +183,7 @@ def _log_decisions(
         phase6 = phase6_by_symbol.get(c.symbol) or reasoning.phase_reconciliation(c.symbol, shares, executed.get(c.symbol, 0.0), False)
         phase7 = reasoning.phase_ongoing_monitoring(closed=False)
         full_reasoning = reasoning.combine_phases(phase1, *(c.reasoning or []), phase5, phase6, phase7)
-        rows.append(
-            {
-                "ts": now,
-                "symbol": c.symbol,
-                "feature_set_id": feature_set_id,
-                "model_version": _MODEL_VERSION,
-                "forecast": c.predicted_return,
-                "regime": regime,
-                "target_position": c.target_position_pct,
-                "executed_position": executed.get(c.symbol),
-                "mode": mode,
-                "reasoning": json.dumps(full_reasoning),
-            }
-        )
+        rows.append(_row(c.symbol, c.predicted_return, c.target_position_pct, executed.get(c.symbol), c.direction_agreement, full_reasoning))
 
     for symbol in closing_symbols:
         phase4 = reasoning.phase_selection_closed(symbol)
@@ -180,20 +191,24 @@ def _log_decisions(
         phase6 = phase6_by_symbol.get(symbol) or reasoning.phase_reconciliation(symbol, 0.0, executed.get(symbol, 0.0), False)
         phase7 = reasoning.phase_ongoing_monitoring(closed=True)
         full_reasoning = reasoning.combine_phases(phase1, phase4, phase5, phase6, phase7)
-        rows.append(
-            {
-                "ts": now,
-                "symbol": symbol,
-                "feature_set_id": feature_set_id,
-                "model_version": _MODEL_VERSION,
-                "forecast": None,
-                "regime": regime,
-                "target_position": 0.0,
-                "executed_position": executed.get(symbol),
-                "mode": mode,
-                "reasoning": json.dumps(full_reasoning),
-            }
-        )
+        rows.append(_row(symbol, None, 0.0, executed.get(symbol), None, full_reasoning))
+
+    for c in rejected_candidates:
+        status = statuses.get(c.symbol, "rejected")
+        phase5 = reasoning.phase_execution_rejected(c.symbol, status)
+        phase7 = reasoning.phase_ongoing_monitoring(closed=True)
+        full_reasoning = reasoning.combine_phases(phase1, *(c.reasoning or []), phase5, phase7)
+        rows.append(_row(c.symbol, c.predicted_return, c.target_position_pct, 0.0, c.direction_agreement, full_reasoning))
+
+    for symbol in rejected_close_symbols:
+        status = statuses.get(symbol, "rejected")
+        phase4 = reasoning.phase_selection_closed(symbol)
+        phase5 = reasoning.phase_execution_rejected(symbol, status)
+        # closed=False: the close was refused, so the position is still open
+        # and still under hourly contradiction watch.
+        phase7 = reasoning.phase_ongoing_monitoring(closed=False)
+        full_reasoning = reasoning.combine_phases(phase1, phase4, phase5, phase7)
+        rows.append(_row(symbol, None, 0.0, 0.0, None, full_reasoning))
 
     if not rows:
         return
@@ -204,6 +219,7 @@ def run_cycle(
     feature_set_id: str,
     symbols: list[str],
     dry_run: bool = False,
+    request_fn=None,
 ) -> CycleResult:
     broker = get_broker()  # never passes confirm_live=True — paper-only by construction
     engine = get_engine()
@@ -257,12 +273,50 @@ def run_cycle(
         send_slack_alert("No confident candidates this cycle — nothing traded.", severity="info")
         return CycleResult("no_candidates", 0, 0, None, portfolio_value)
 
-    prices = _latest_prices([c.symbol for c in candidates] + closing_symbols)
+    # --- The human gate. Everything below this point only acts on what a
+    # human approved: one numbered Telegram message (closes first, then
+    # opens), replies polled until answered or timeout, silence = rejected.
+    # request_fn is injectable for tests; the default asks a real phone.
+    proposals = [
+        ProposedTrade(
+            index=0, symbol=s, action="close",
+            side="long" if current_positions.get(s, 0) >= 0 else "short",
+            target_position_pct=0.0, reason="out_of_book",
+        )
+        for s in closing_symbols
+    ] + [
+        ProposedTrade(
+            index=0, symbol=c.symbol, action="open", side=c.side,
+            target_position_pct=c.target_position_pct,
+            predicted_return=c.predicted_return, reason="screen",
+        )
+        for c in candidates
+    ]
+    gate = request_fn if request_fn is not None else request_approval
+    outcome = gate(proposals, context="weekly cycle")
+
+    approved_close_symbols = [p.symbol for p in outcome.approved_closes()]
+    approved_open_symbols = {p.symbol for p in outcome.approved_opens()}
+    approved_candidates = [c for c in candidates if c.symbol in approved_open_symbols]
+    rejected_candidates = [c for c in candidates if c.symbol not in approved_open_symbols]
+    rejected_close_symbols = [s for s in closing_symbols if s not in set(approved_close_symbols)]
+    approval_status_by_symbol = {p.symbol: outcome.statuses.get(p.index) for p in proposals}
+
+    if outcome.rejected:
+        logger.info(
+            "Approval gate rejected %d of %d proposal(s) (status=%s) — acting only on the approved subset.",
+            len(outcome.rejected), len(proposals), outcome.status,
+        )
+
+    # Prices fetched AFTER the gate, not before: a human reply can take up
+    # to the full approval timeout, and shares must be sized off quotes
+    # from after that wait, not before it.
+    prices = _latest_prices([c.symbol for c in approved_candidates] + approved_close_symbols)
 
     intended_shares: dict[str, float] = {}
     orders_placed = 0
 
-    for symbol in closing_symbols:
+    for symbol in approved_close_symbols:
         intended_shares[symbol] = 0.0
         try:
             order = broker.submit_target_position(symbol, 0.0)
@@ -271,7 +325,13 @@ def run_cycle(
         except Exception:
             logger.exception("Failed to close out-of-book position %s — continuing with the rest of the cycle.", symbol)
 
-    for c in candidates:
+    # A close the human refused keeps its current share count on purpose —
+    # recording that as the intent keeps reconciliation honest (the position
+    # is *supposed* to still be there now).
+    for symbol in rejected_close_symbols:
+        intended_shares[symbol] = current_positions.get(symbol, 0.0)
+
+    for c in approved_candidates:
         price = prices.get(c.symbol)
         if not price:
             logger.warning("No price for %s — skipping this candidate.", c.symbol)
@@ -286,8 +346,12 @@ def run_cycle(
             logger.exception("Order failed for %s — continuing with the rest of the cycle.", c.symbol)
 
     order_type = _order_type(broker)
-    execution_summaries = [f"{s}: closed" for s in closing_symbols]
-    execution_summaries += [f"{c.symbol}: {intended_shares.get(c.symbol, 0.0):+.4g} sh via {order_type}" for c in candidates]
+    execution_summaries = [f"{s}: closed" for s in approved_close_symbols]
+    execution_summaries += [f"{c.symbol}: {intended_shares.get(c.symbol, 0.0):+.4g} sh via {order_type}" for c in approved_candidates]
+    execution_summaries += [
+        f"{p.symbol}: {p.action} NOT executed ({approval_status_by_symbol.get(p.symbol) or 'rejected'})"
+        for p in outcome.rejected
+    ]
     send_slack_alert("Phase 5 — Execution: " + " | ".join(execution_summaries), severity="info")
 
     time.sleep(5)  # let paper fills settle before reading positions back
@@ -305,12 +369,15 @@ def run_cycle(
     )
 
     _log_decisions(
-        candidates, closing_symbols, actual_positions, intended_shares, feature_set_id, broker.mode, regime,
+        approved_candidates, approved_close_symbols, actual_positions, intended_shares, feature_set_id, broker.mode, regime,
         phase1, phase6_by_symbol, order_type,
+        rejected_candidates=rejected_candidates,
+        rejected_close_symbols=rejected_close_symbols,
+        approval_status_by_symbol=approval_status_by_symbol,
     )
 
-    phase7_open = len(candidates)
-    phase7_closed = len(closing_symbols)
+    phase7_open = len(approved_candidates)
+    phase7_closed = len(approved_close_symbols)
     send_slack_alert(
         f"Phase 7 — Ongoing Monitoring: {phase7_open} position(s) now under hourly contradiction watch, "
         f"{phase7_closed} closed position(s) need no further monitoring.",
@@ -320,7 +387,7 @@ def run_cycle(
     new_portfolio_value = broker.get_portfolio_value()
     record_equity_snapshot(new_portfolio_value, mode=broker.mode)
 
-    total_attempted = len(candidates) + len(closing_symbols)
+    total_attempted = len(approved_candidates) + len(approved_close_symbols)
 
     post_trade_triggers = _run_breaker_check(broker, engine)
     if post_trade_triggers:
@@ -330,7 +397,8 @@ def run_cycle(
 
     send_slack_alert(
         f"Trading cycle complete: {orders_placed}/{total_attempted} order(s) placed "
-        f"({len(candidates)} candidate(s), {len(closing_symbols)} position(s) closed). "
+        f"({len(approved_candidates)} approved candidate(s), {len(approved_close_symbols)} position(s) closed, "
+        f"{len(outcome.rejected)} proposal(s) rejected at the gate). "
         f"Portfolio value ${new_portfolio_value:,.2f}. {reconciliation_summary}",
         severity="info",
     )

@@ -426,6 +426,27 @@ def phase_execution(
     return {"phase": 5, "title": "Execution", "summary": summary, "lines": lines}
 
 
+def phase_execution_rejected(symbol: str, status: str) -> dict:
+    """
+    Phase 5, for a proposal that never became an order because the human
+    said no — or said nothing. `status`: "rejected" (explicit no) or
+    "timeout" (silence, which the gate treats as no).
+    """
+    if status == "timeout":
+        summary = f"{symbol}: no approval reply before the timeout — no order sent."
+        lines = [
+            "This proposal was sent to the approval chat, but nobody answered before the timeout.",
+            "Silence is never consent — the proposal was treated as rejected and no order went to the broker.",
+        ]
+    else:
+        summary = f"{symbol}: rejected by the human reviewer — no order sent."
+        lines = [
+            "A human explicitly rejected this proposal in the approval chat.",
+            "No order was sent to the broker.",
+        ]
+    return {"phase": 5, "title": "Execution", "summary": summary, "lines": lines}
+
+
 def phase_reconciliation(symbol: str, intended_shares: float, actual_shares: float, flagged: bool) -> dict:
     """Phase 6. Did the actual fill match what was intended."""
     diff = actual_shares - intended_shares
