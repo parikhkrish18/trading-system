@@ -32,6 +32,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from data.ingest.db import get_engine
 from data.ingest.news import ingest_news
 from data.ingest.universe import load_active_universe
+from execution.approval_gate import ProposedTrade, request_approval
 from execution.broker import get_broker
 from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
@@ -122,7 +123,9 @@ def _check_position(engine, symbol: str, qty: float) -> ContradictionResult:
     return ContradictionResult(symbol=symbol, side=side, closed=bool(reasons), reasons=reasons)
 
 
-def _log_closure(result: ContradictionResult, mode: str, executed_position: float | None) -> None:
+def _log_closure(
+    result: ContradictionResult, mode: str, executed_position: float | None, approval_status: str | None = "approved"
+) -> None:
     # Phases 1/3/6 don't apply here (this isn't the weekly screen — no fresh
     # risk gate, forecast, or fill reconciliation to report); phases 2/4/5/7
     # cover what actually happened: what contradicted, why it wasn't part of
@@ -152,6 +155,44 @@ def _log_closure(result: ContradictionResult, mode: str, executed_position: floa
         "executed_position": executed_position,
         "mode": mode,
         "reasoning": json.dumps(full_reasoning),
+        "approval_status": approval_status,
+    }
+    pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
+
+
+def _log_rejected_closure(result: ContradictionResult, mode: str, approval_status: str) -> None:
+    """
+    The variant row for a contradiction the human declined (or ignored) —
+    the record must show the system FLAGGED this position even though the
+    position is still open.
+    """
+    phase2 = reasoning.phase_contradiction(result.reasons)
+    phase4 = {
+        "phase": 4,
+        "title": "Candidate Selection & Sizing",
+        "summary": f"{result.symbol} flagged mid-week, but the close was not approved — position kept.",
+        "lines": [
+            "The hourly contradiction check proposed closing this position mid-week.",
+            "The close was not approved, so the position stays open on the human's call.",
+        ],
+    }
+    phase5 = reasoning.phase_execution_rejected(result.symbol, approval_status)
+    # closed=False: the position is still open and still under hourly watch.
+    phase7 = reasoning.phase_ongoing_monitoring(closed=False)
+    full_reasoning = reasoning.combine_phases(phase2, phase4, phase5, phase7)
+
+    row = {
+        "ts": dt.datetime.now(tz=dt.UTC),
+        "symbol": result.symbol,
+        "feature_set_id": _FEATURE_SET_ID,
+        "model_version": _MODEL_VERSION,
+        "forecast": None,
+        "regime": None,
+        "target_position": 0.0,
+        "executed_position": 0.0,
+        "mode": mode,
+        "reasoning": json.dumps(full_reasoning),
+        "approval_status": approval_status,
     }
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
@@ -181,7 +222,33 @@ def _freed_capital_fraction(broker, engine) -> float:
     return max(0.0, 1.0 - held_value / portfolio_value)
 
 
-def _log_reactivation(candidate, executed_position: float | None, mode: str, target_shares: float) -> None:
+def _log_rejected_reactivation(candidate, mode: str, approval_status: str) -> None:
+    """A reactivation pick the human turned down — recorded, not opened."""
+    phases = list(candidate.reasoning or [])
+    phase5 = reasoning.phase_execution_rejected(candidate.symbol, approval_status)
+    phase7 = reasoning.phase_ongoing_monitoring(closed=True)
+    full_reasoning = reasoning.combine_phases(*phases, phase5, phase7)
+
+    row = {
+        "ts": dt.datetime.now(tz=dt.UTC),
+        "symbol": candidate.symbol,
+        "feature_set_id": _FEATURE_SET_ID,
+        "model_version": _REACTIVATION_MODEL_VERSION,
+        "forecast": candidate.predicted_return,
+        "regime": None,
+        "target_position": candidate.target_position_pct,
+        "executed_position": 0.0,
+        "mode": mode,
+        "reasoning": json.dumps(full_reasoning),
+        "direction_agreement": candidate.direction_agreement,
+        "approval_status": approval_status,
+    }
+    pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
+
+
+def _log_reactivation(
+    candidate, executed_position: float | None, mode: str, target_shares: float, approval_status: str | None = "approved"
+) -> None:
     # Phases 2/3/4 already come fully built from run_screen (same selection
     # logic as the weekly cycle) -- just note on phase 4 that this fired
     # mid-week rather than at the normal weekly screen, then add phases 5/7.
@@ -207,11 +274,13 @@ def _log_reactivation(candidate, executed_position: float | None, mode: str, tar
         "executed_position": executed_position,
         "mode": mode,
         "reasoning": json.dumps(full_reasoning),
+        "direction_agreement": candidate.direction_agreement,
+        "approval_status": approval_status,
     }
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
 
-def _attempt_reactivation(broker, engine) -> None:
+def _attempt_reactivation(broker, engine, request_fn=None) -> None:
     """
     After a contradiction close, checks whether meaningful capital is now
     sitting idle and, if so, immediately re-screens for a new candidate to
@@ -241,6 +310,36 @@ def _attempt_reactivation(broker, engine) -> None:
         logger.info("No confident candidate to redeploy %.1f%% freed capital — staying in cash for now.", freed_fraction * 100)
         return
 
+    # Reactivation opens go through the same human gate as everything else —
+    # a separate message from the closes, since it is a separate question
+    # ("re-deploy the freed capital into X?").
+    gate = request_fn if request_fn is not None else request_approval
+    proposals = [
+        ProposedTrade(
+            index=0, symbol=c.symbol, action="open", side=c.side,
+            target_position_pct=c.target_position_pct,
+            predicted_return=c.predicted_return, reason="reactivation",
+        )
+        for c in candidates
+    ]
+    outcome = gate(proposals, context="contradiction monitor — reactivation")
+    status_by_symbol = {p.symbol: outcome.statuses.get(p.index) for p in proposals}
+    approved_symbols = {p.symbol for p in outcome.approved}
+
+    for c in candidates:
+        if c.symbol not in approved_symbols:
+            status = status_by_symbol.get(c.symbol) or "rejected"
+            logger.warning("Reactivation of %s not approved (%s) — freed capital stays in cash.", c.symbol, status)
+            _log_rejected_reactivation(c, broker.mode, status)
+            send_slack_alert(
+                f"Reactivation proposal for {c.symbol} was not approved ({status}) — capital stays in cash.",
+                severity="info",
+            )
+    candidates = [c for c in candidates if c.symbol in approved_symbols]
+    if not candidates:
+        return
+
+    # Prices read after the gate, so shares are sized off post-wait quotes.
     portfolio_value = broker.get_portfolio_value()
     prices = _latest_prices(engine, [c.symbol for c in candidates])
 
@@ -263,18 +362,20 @@ def _attempt_reactivation(broker, engine) -> None:
             continue
 
         executed = broker.get_positions().get(c.symbol, 0.0)
-        _log_reactivation(c, executed, broker.mode, target_shares)
+        _log_reactivation(c, executed, broker.mode, target_shares, approval_status=status_by_symbol.get(c.symbol) or "approved")
         send_slack_alert(f"Phase 5 — Execution: {c.symbol} opened mid-week (reactivation) — {target_shares:+.4g} shares.", severity="info")
 
 
-def run_contradiction_check() -> list[ContradictionResult]:
+def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     """
     Checks every currently held position for news/momentum contradicting the
-    side it's held on, closes any that trip either threshold, logs a
-    decisions row for each closure, and alerts Slack. If anything closed,
-    immediately attempts to redeploy the freed capital (_attempt_reactivation)
-    rather than leaving it idle until next week. No-ops cleanly if nothing is
-    held or nothing contradicts.
+    side it's held on, then asks a human (one batched proposal message)
+    before closing anything that tripped a threshold. Approved closes are
+    submitted and logged; rejected ones are logged as flagged-but-kept and
+    alerted. If anything actually closed, immediately attempts to redeploy
+    the freed capital (_attempt_reactivation, itself gated the same way)
+    rather than leaving it idle until next week. No-ops cleanly if nothing
+    is held or nothing contradicts.
     """
     broker = get_broker()  # never passes confirm_live=True — paper-only by construction
     engine = get_engine()
@@ -295,30 +396,62 @@ def run_contradiction_check() -> list[ContradictionResult]:
     except Exception:
         logger.exception("News refresh failed — checking against whatever sentiment is already in the DB.")
 
+    # Detect first, act later: every position is checked, and everything
+    # that tripped goes to the human as ONE batch instead of a message per
+    # position.
     results: list[ContradictionResult] = []
+    flagged: list[ContradictionResult] = []
     for symbol, qty in positions.items():
         result = _check_position(engine, symbol, qty)
         results.append(result)
+        if result.closed:
+            flagged.append(result)
+            detail = "; ".join(r["detail"] for r in result.reasons)
+            logger.warning("Contradiction detected for %s (%s). %s", symbol, result.side, detail)
+            send_slack_alert(f"Phase 2 — Market Regime & Signals: {symbol} ({result.side}) — {detail}", severity="warning")
 
-        if not result.closed:
+    if not flagged:
+        return results
+
+    gate = request_fn if request_fn is not None else request_approval
+    proposals = [
+        ProposedTrade(
+            index=0, symbol=r.symbol, action="close", side=r.side,
+            target_position_pct=0.0, reason="contradiction",
+        )
+        for r in flagged
+    ]
+    outcome = gate(proposals, context="contradiction monitor")
+    status_by_symbol = {p.symbol: outcome.statuses.get(p.index) for p in proposals}
+    approved_symbols = {p.symbol for p in outcome.approved}
+
+    closed_any = False
+    for result in flagged:
+        status = status_by_symbol.get(result.symbol)
+        if result.symbol not in approved_symbols:
+            result.closed = False  # the record must not claim a close that didn't happen
+            logger.warning("Close of %s not approved (%s) — position stays open.", result.symbol, status or "rejected")
+            _log_rejected_closure(result, broker.mode, status or "rejected")
+            send_slack_alert(
+                f"{result.symbol} was flagged as contradicted but NOT closed ({status or 'rejected'}) — "
+                "position stays open on the human's call.",
+                severity="warning",
+            )
             continue
-
-        detail = "; ".join(r["detail"] for r in result.reasons)
-        logger.warning("Contradiction detected for %s (%s) — closing position. %s", symbol, result.side, detail)
-        send_slack_alert(f"Phase 2 — Market Regime & Signals: {symbol} ({result.side}) — {detail}", severity="warning")
 
         try:
-            broker.submit_target_position(symbol, 0.0)
+            broker.submit_target_position(result.symbol, 0.0)
         except Exception:
-            logger.exception("Failed to close contradicted position %s.", symbol)
+            logger.exception("Failed to close contradicted position %s.", result.symbol)
             continue
 
-        executed = broker.get_positions().get(symbol, 0.0)
-        _log_closure(result, broker.mode, executed)
-        send_slack_alert(f"Phase 5 — Execution: {symbol} closed mid-week (contradiction).", severity="warning")
+        closed_any = True
+        executed = broker.get_positions().get(result.symbol, 0.0)
+        _log_closure(result, broker.mode, executed, approval_status=status or "approved")
+        send_slack_alert(f"Phase 5 — Execution: {result.symbol} closed mid-week (contradiction).", severity="warning")
 
-    if any(r.closed for r in results):
-        _attempt_reactivation(broker, engine)
+    if closed_any:
+        _attempt_reactivation(broker, engine, request_fn=request_fn)
 
     return results
 

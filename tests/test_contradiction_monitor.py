@@ -2,6 +2,21 @@ import pandas as pd
 import pytest
 
 from execution import contradiction_monitor as cm
+from execution.approval_gate import ApprovalOutcome, number_proposals
+
+
+def _approve_all(proposals, *, context, **kwargs):
+    ordered = number_proposals(list(proposals))
+    return ApprovalOutcome(
+        list(ordered), [], status="auto", statuses={p.index: "auto" for p in ordered}
+    )
+
+
+def _reject_all(proposals, *, context, **kwargs):
+    ordered = number_proposals(list(proposals))
+    return ApprovalOutcome(
+        [], list(ordered), status="replied", statuses={p.index: "rejected" for p in ordered}
+    )
 
 
 class _FakeClock:
@@ -45,6 +60,15 @@ def _prices_df(symbol: str, closes: list[float]) -> pd.DataFrame:
 @pytest.fixture(autouse=True)
 def _no_slack(monkeypatch):
     monkeypatch.setattr(cm, "send_slack_alert", lambda *a, **k: True)
+
+
+@pytest.fixture(autouse=True)
+def _gate_wide_open(monkeypatch):
+    """
+    Pre-existing tests exercise detection and execution, not the gate — give
+    them a gate that approves everything. Gate tests pass their own request_fn.
+    """
+    monkeypatch.setattr(cm, "request_approval", _approve_all)
 
 
 def test_market_closed_is_a_clean_noop(monkeypatch):
@@ -278,6 +302,131 @@ def test_log_closure_builds_valid_phase_reasoning(monkeypatch):
     phases = json.loads(row["reasoning"])
     assert [p["phase"] for p in phases] == [2, 4, 5, 7]
     assert "sentiment turned negative" in phases[0]["lines"]
+
+
+# --- the human gate on mid-week closes and reactivations ------------------
+
+
+def test_contradiction_closes_are_batched_into_one_gate_call(monkeypatch):
+    broker = _FakeBroker({"AAPL": 10, "TSLA": -20})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5) if symbol == "AAPL" else (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.06 if symbol == "TSLA" else None)
+    monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+
+    gate_calls = []
+
+    def gate(proposals, *, context, **kwargs):
+        gate_calls.append({"context": context, "symbols": [p.symbol for p in proposals], "reasons": [p.reason for p in proposals]})
+        return _approve_all(proposals, context=context)
+
+    cm.run_contradiction_check(request_fn=gate)
+
+    assert len(gate_calls) == 1  # ONE message for the whole batch, not one per position
+    assert set(gate_calls[0]["symbols"]) == {"AAPL", "TSLA"}
+    assert gate_calls[0]["reasons"] == ["contradiction", "contradiction"]
+    assert set(broker.closed) == {"AAPL", "TSLA"}
+
+
+def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    logged = []
+    monkeypatch.setattr(cm, "_log_rejected_closure", lambda result, mode, status: logged.append((result.symbol, status)))
+    monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: pytest.fail("a rejected close must not log as a closure"))
+
+    alerts = []
+    monkeypatch.setattr(cm, "send_slack_alert", lambda msg, severity="warning": alerts.append(msg))
+
+    reactivations = []
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: reactivations.append(1))
+
+    results = cm.run_contradiction_check(request_fn=_reject_all)
+
+    assert broker.closed == []  # nothing submitted
+    assert logged == [("AAPL", "rejected")]
+    assert any("flagged" in m and "NOT closed" in m for m in alerts)
+    assert not results[0].closed  # the record reflects what actually happened
+    assert reactivations == []  # nothing closed -> no capital freed -> no re-screen
+
+
+def test_reactivation_opens_are_gated_with_their_own_proposal(monkeypatch):
+    from models.screener import TradeCandidate
+
+    broker = _FakeBroker({}, portfolio_value=100_000.0)
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["AAPL"], "close": [50.0]}))
+
+    candidate = TradeCandidate(
+        symbol="AAPL", side="long", predicted_return=0.03, direction_agreement=0.9,
+        conviction_score=0.027, target_position_pct=0.6,
+    )
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: [candidate])
+    monkeypatch.setattr(cm, "_log_reactivation", lambda *a, **k: None)
+
+    gate_calls = []
+
+    def gate(proposals, *, context, **kwargs):
+        gate_calls.append({"context": context, "reasons": [p.reason for p in proposals]})
+        return _approve_all(proposals, context=context)
+
+    cm._attempt_reactivation(broker, engine=object(), request_fn=gate)
+
+    assert gate_calls[0]["reasons"] == ["reactivation"]
+    assert "reactivation" in gate_calls[0]["context"]
+    assert broker.closed == ["AAPL"]  # the open went through
+
+
+def test_rejected_reactivation_stays_in_cash_and_is_logged(monkeypatch):
+    from models.screener import TradeCandidate
+
+    broker = _FakeBroker({}, portfolio_value=100_000.0)
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["AAPL"], "close": [50.0]}))
+
+    candidate = TradeCandidate(
+        symbol="AAPL", side="long", predicted_return=0.03, direction_agreement=0.9,
+        conviction_score=0.027, target_position_pct=0.6,
+    )
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: [candidate])
+
+    logged = []
+    monkeypatch.setattr(cm, "_log_rejected_reactivation", lambda c, mode, status: logged.append((c.symbol, status)))
+    monkeypatch.setattr(cm, "_log_reactivation", lambda *a, **k: pytest.fail("a rejected reactivation must not log as opened"))
+
+    cm._attempt_reactivation(broker, engine=object(), request_fn=_reject_all)
+
+    assert broker.closed == []  # no order submitted
+    assert logged == [("AAPL", "rejected")]
+
+
+def test_reactivation_still_scopes_the_screen_to_freed_capital_only(monkeypatch):
+    """Gating must not break the freed-capital-only redeployment contract."""
+    broker = _FakeBroker({"MSFT": 100}, portfolio_value=100_000.0)  # $20k held -> 80% freed
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL", "MSFT"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["MSFT"], "close": [200.0]}))
+
+    captured = {}
+
+    def fake_run_screen(feature_set_id, symbols, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cm, "run_screen", fake_run_screen)
+
+    cm._attempt_reactivation(broker, engine=object(), request_fn=_approve_all)
+
+    assert captured["total_deploy_pct"] == pytest.approx(0.80)
 
 
 def test_news_refresh_failure_does_not_abort_the_check(monkeypatch):
