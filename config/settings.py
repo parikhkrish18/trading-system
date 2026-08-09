@@ -31,8 +31,10 @@ class Settings(BaseSettings):
     # RTH; when off, orders submitted outside RTH just queue as normal DAY
     # market orders until the next open (the old, pre-extended-hours
     # behavior). IBKR support for this isn't implemented yet — see
-    # execution/broker_ibkr.py.
-    allow_extended_hours_trading: bool = Field(default=True, alias="ALLOW_EXTENDED_HOURS_TRADING")
+    # execution/broker_ibkr.py. Default off: human approval adds latency,
+    # and extended-hours limit orders against thin quotes interact badly
+    # with a gate that can take minutes — re-enable deliberately via env.
+    allow_extended_hours_trading: bool = Field(default=False, alias="ALLOW_EXTENDED_HOURS_TRADING")
 
     # --- IBKR (TWS / IB Gateway socket — no REST keys) ---
     ibkr_host: str = Field(default="127.0.0.1", alias="IBKR_HOST")
@@ -62,27 +64,63 @@ class Settings(BaseSettings):
     # --- MLflow ---
     mlflow_tracking_uri: str = Field(default="http://localhost:5000", alias="MLFLOW_TRACKING_URI")
 
+    # --- Dashboard ---
+    # Bearer token protecting mutating dashboard endpoints (POST
+    # /api/tests/run). Blank is fine on localhost; required when the
+    # dashboard binds a non-loopback interface.
+    dashboard_api_token: str = Field(default="", alias="DASHBOARD_API_TOKEN")
+
     # --- Alerts ---
     slack_webhook_url: str = Field(default="", alias="SLACK_WEBHOOK_URL")
 
+    # --- Trade approval (Telegram) ---
+    # Used by execution/approval_gate.py to send trade proposals to a human
+    # and read back approve/reject replies. Blank = approval transport
+    # unconfigured; in telegram mode that fails closed (all proposals
+    # rejected) rather than trading unattended.
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+    # "telegram" = every open/close needs a human reply on the phone;
+    # "auto" = approve everything without asking (the old unattended
+    # behavior, kept as a deliberate escape hatch).
+    approval_mode: str = Field(default="telegram", alias="APPROVAL_MODE")  # "telegram" | "auto"
+    # How long to wait for replies before giving up. Must stay under 3600 —
+    # the hourly contradiction monitor shares the one Telegram bot, and a
+    # poll that outlives the hour would collide with the next cycle.
+    approval_timeout_s: int = Field(default=900, alias="APPROVAL_TIMEOUT_S")
+    # What happens to a *close* proposal nobody answered in time. Opens
+    # always fail closed (rejected). "reject" keeps closes symmetric;
+    # "approve" lets risk-reducing exits proceed unattended on timeout.
+    approval_timeout_close_action: str = Field(
+        default="reject", alias="APPROVAL_TIMEOUT_CLOSE_ACTION"
+    )  # "reject" | "approve"
+
     # --- Risk limits ---
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
-    # These two are now circuit-breaker-only thresholds — the "last line of
-    # defense" catching a genuine anomaly (e.g. a stale price feeding a bad
-    # size calculation), not the sizing-time cap. The active strategy
-    # (models.screener.run_screen) concentrates into 2 positions via
-    # max/min_concentrated_position_pct below, which legitimately deploys
-    # up to ~70% of portfolio in a single name — these breaker thresholds
-    # sit above that on purpose, so normal operation never trips them.
-    max_single_position_pct: float = Field(default=0.80, alias="MAX_SINGLE_POSITION_PCT")
+    # Conservative defaults: these cap sizing in the diversified strategy
+    # (risk.sizing.select_trades) AND act as circuit-breaker thresholds.
+    # The concentrated 2-trade strategy legitimately deploys up to ~70% in
+    # one name — when running STRATEGY_MODE=concentrated, raise these via
+    # env (MAX_SINGLE_POSITION_PCT=0.80, MAX_CORRELATED_EXPOSURE_PCT=0.95)
+    # so the breakers sit above the strategy's intended sizes instead of
+    # tripping on normal operation.
+    max_single_position_pct: float = Field(default=0.25, alias="MAX_SINGLE_POSITION_PCT")
     # Lower than max_single_position_pct deliberately: a long position can
     # only ever lose 100% of what's put in, but a short's loss is structurally
     # uncapped (the underlying can keep rising) — size shorts more
     # conservatively by default to reflect that asymmetry. Only used by the
-    # legacy diversified-book path (risk.sizing.select_trades), not the
-    # active concentrated strategy.
+    # diversified-book path (risk.sizing.select_trades), not the
+    # concentrated strategy.
     max_short_position_pct: float = Field(default=0.15, alias="MAX_SHORT_POSITION_PCT")
-    max_correlated_exposure_pct: float = Field(default=0.95, alias="MAX_CORRELATED_EXPOSURE_PCT")
+    max_correlated_exposure_pct: float = Field(default=0.50, alias="MAX_CORRELATED_EXPOSURE_PCT")
+
+    # --- Strategy selection ---
+    # "diversified" (default) = top-k book sized by risk.sizing.select_trades
+    # under the conservative caps above. "concentrated" = the 2-trade
+    # high-conviction split below (needs the env cap overrides to breathe).
+    strategy_mode: str = Field(default="diversified", alias="STRATEGY_MODE")  # "diversified" | "concentrated"
+    # How many names the diversified book holds at most.
+    screener_top_k: int = Field(default=10, alias="SCREENER_TOP_K")
 
     # --- Concentrated 2-trade strategy (models.screener.select_concentrated_trades) ---
     # Split between the two highest-conviction picks is weighted by relative
