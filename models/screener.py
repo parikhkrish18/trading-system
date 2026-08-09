@@ -21,6 +21,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import json
+import logging
 from collections.abc import Callable
 
 import pandas as pd
@@ -33,7 +34,9 @@ from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND
 from models.train import load_feature_frame, load_training_frame
 from monitoring import reasoning
-from risk.sizing import target_position_size
+from risk.sizing import scale_to_full_deployment, target_position_size
+
+logger = logging.getLogger(__name__)
 
 _MODEL_VERSION = "ensemble_v1"
 
@@ -47,9 +50,9 @@ class TradeCandidate:
     conviction_score: float
     target_position_pct: float
     # Plain-English phase 2-4 reasoning (see monitoring/reasoning.py), populated
-    # by run_screen. trading_loop.py merges in phases 1/5/6/7 once execution
-    # facts exist. None for candidates built via the legacy select_trades()
-    # path, which doesn't have an ensemble/feature frame in scope for this.
+    # by run_screen for both strategies (phase-4 wording follows the strategy).
+    # trading_loop.py merges in phases 1/5/6/7 once execution facts exist.
+    # None only for candidates built outside run_screen.
     reasoning: list[dict] | None = None
 
 
@@ -119,9 +122,9 @@ def select_trades(
     is_shortable_fn: Callable[[str], bool] | None = None,
 ) -> list[TradeCandidate]:
     """
-    LEGACY diversified-book path — not used by run_screen() anymore (see
-    select_concentrated_trades below, the active strategy). Kept as tested,
-    working infra in case a broader multi-name book is wanted again later.
+    The diversified-book path — the default strategy (STRATEGY_MODE=
+    diversified). See select_concentrated_trades below for the 2-trade
+    alternative; run_screen dispatches between them on settings.strategy_mode.
 
     Filters `scored` down to the top_k confident candidates and sizes each
     via risk.sizing.target_position_size — reused unchanged; it already
@@ -199,7 +202,7 @@ def select_concentrated_trades(
     is_shortable_fn: Callable[[str], bool] | None = None,
 ) -> list[TradeCandidate]:
     """
-    The active strategy: concentrate all deployable capital into the top 2
+    The concentrated strategy (STRATEGY_MODE=concentrated): put all deployable capital into the top 2
     highest-conviction candidates instead of spreading across many names —
     the point is to make a small number of high-confidence bets, not to
     track the market with a diversified book.
@@ -259,6 +262,8 @@ def _attach_reasoning(
     min_leg_pct: float,
     min_direction_agreement: float,
     top_n: int = 5,
+    strategy: str = "concentrated",
+    top_k: int | None = None,
 ) -> None:
     """
     Mutates each candidate in place, attaching plain-English reasoning for
@@ -267,6 +272,8 @@ def _attach_reasoning(
     once execution/reconciliation facts exist). Phase 2/3 are built from
     the top `top_n` SHAP feature contributions (LightGBM pred_contrib) —
     genuine per-prediction attribution, not just global feature importance.
+    Phase 4 wording follows the strategy: the concentrated split story for
+    the 2-trade mode, the top-k book story for the diversified default.
     """
     if not candidates:
         return
@@ -288,12 +295,17 @@ def _attach_reasoning(
             }
             for feat in top_feature_names
         ]
-        candidate.reasoning = [
-            reasoning.phase_signals(regime, top_features),
-            reasoning.phase_forecast(
-                candidate.predicted_return, candidate.direction_agreement, candidate.conviction_score, min_direction_agreement
-            ),
-            reasoning.phase_selection(
+        if strategy == "diversified":
+            phase4 = reasoning.phase_selection_diversified(
+                candidate.symbol,
+                candidate.side,
+                candidate.target_position_pct,
+                n_confident,
+                len(candidates),
+                top_k or len(candidates),
+            )
+        else:
+            phase4 = reasoning.phase_selection(
                 candidate.symbol,
                 candidate.side,
                 candidate.target_position_pct,
@@ -301,7 +313,13 @@ def _attach_reasoning(
                 len(candidates),
                 max_leg_pct,
                 min_leg_pct,
+            )
+        candidate.reasoning = [
+            reasoning.phase_signals(regime, top_features),
+            reasoning.phase_forecast(
+                candidate.predicted_return, candidate.direction_agreement, candidate.conviction_score, min_direction_agreement
             ),
+            phase4,
         ]
 
 
@@ -318,13 +336,14 @@ def run_screen(
 ) -> list[TradeCandidate]:
     """
     Trains a fresh ensemble on all available history, scores today's
-    snapshot, and concentrates `total_deploy_pct` of capital into the top 2
-    highest-conviction picks (select_concentrated_trades) rather than
-    spreading across many names.
+    snapshot, and sizes `total_deploy_pct` of capital by whichever strategy
+    STRATEGY_MODE selects: the diversified top-k book (default, sized under
+    the conservative caps in risk/sizing.py) or the concentrated top-2
+    split (select_concentrated_trades).
 
     `total_deploy_pct` defaults to 1.0 (the normal weekly-cycle behavior --
-    100% of the book, both legs). execution/contradiction_monitor.py's
-    mid-week reactivation passes a smaller value: the fraction of capital a
+    100% of the book). execution/contradiction_monitor.py's mid-week
+    reactivation passes a smaller value: the fraction of capital a
     contradiction-close just freed up, so it can redeploy only that slice
     via this exact same selection logic rather than reshuffling the whole
     book. Regime is still used to gate which candidates clear the confidence
@@ -341,13 +360,43 @@ def run_screen(
     latest = load_latest_features(feature_set_id, symbols)
     scored = score_universe(ensemble, latest, feature_cols, min_direction_agreement, min_abs_return)
 
-    candidates = select_concentrated_trades(
-        scored,
-        max_leg_pct=settings.max_concentrated_position_pct,
-        min_leg_pct=settings.min_concentrated_position_pct,
-        total_deploy_pct=total_deploy_pct,
-        is_shortable_fn=is_shortable_fn,
-    )
+    if settings.strategy_mode == "concentrated":
+        candidates = select_concentrated_trades(
+            scored,
+            max_leg_pct=settings.max_concentrated_position_pct,
+            min_leg_pct=settings.min_concentrated_position_pct,
+            total_deploy_pct=total_deploy_pct,
+            is_shortable_fn=is_shortable_fn,
+        )
+    else:
+        # Diversified default: top-k book sized through the full risk
+        # pipeline (confidence scaling, regime damping, correlation caps).
+        forecast_scale = float(train_df["fwd_return"].std())
+        correlation_matrix = build_correlation_matrix(train_df[["symbol", "ts", "close"]])
+        candidates = select_trades(
+            scored,
+            regime=regime,
+            forecast_scale=forecast_scale,
+            max_position_pct=settings.max_single_position_pct,
+            max_short_position_pct=settings.max_short_position_pct,
+            max_correlated_exposure_pct=settings.max_correlated_exposure_pct,
+            correlation_matrix=correlation_matrix,
+            top_k=settings.screener_top_k,
+            is_shortable_fn=is_shortable_fn,
+        )
+        # Reactivation semantics: when only a freed slice of the portfolio
+        # is on the table, every size shrinks proportionally to fit it.
+        if total_deploy_pct < 1.0:
+            for candidate in candidates:
+                candidate.target_position_pct *= total_deploy_pct
+        if settings.full_deployment:
+            candidates = apply_full_deployment(
+                candidates,
+                max_position_pct=settings.max_single_position_pct,
+                max_short_position_pct=settings.max_short_position_pct,
+                target_allocation=total_deploy_pct,
+            )
+
     _attach_reasoning(
         candidates,
         ensemble,
@@ -358,7 +407,47 @@ def run_screen(
         settings.max_concentrated_position_pct,
         settings.min_concentrated_position_pct,
         min_direction_agreement,
+        strategy=settings.strategy_mode,
+        top_k=settings.screener_top_k,
     )
+    return candidates
+
+
+def apply_full_deployment(
+    candidates: list[TradeCandidate],
+    max_position_pct: float,
+    max_short_position_pct: float,
+    target_allocation: float = 1.0,
+) -> list[TradeCandidate]:
+    """
+    Scale the shortlist up to a fully-allocated book (see
+    risk.sizing.scale_to_full_deployment) and report what happened.
+
+    Runs after select_trades, so every per-symbol adjustment — regime
+    damping, correlation shrinking, the short cap — has already been applied
+    and is preserved proportionally. It changes how much of the portfolio the
+    picks take up, never which symbols were picked or which way they lean.
+    """
+    if not candidates:
+        return candidates
+
+    result = scale_to_full_deployment(
+        {c.symbol: c.target_position_pct for c in candidates},
+        max_position_pct=max_position_pct,
+        max_short_position_pct=max_short_position_pct,
+        target_allocation=target_allocation,
+    )
+
+    for candidate in candidates:
+        candidate.target_position_pct = result.sizes[candidate.symbol]
+
+    if result.reached_target:
+        logger.info(
+            "Full deployment: %.1f%% of the portfolio allocated across %d pick(s).",
+            result.deployed_pct * 100, len(candidates),
+        )
+    else:
+        logger.warning("%s", result.reason)
     return candidates
 
 

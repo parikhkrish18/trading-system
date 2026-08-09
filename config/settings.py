@@ -121,6 +121,14 @@ class Settings(BaseSettings):
     strategy_mode: str = Field(default="diversified", alias="STRATEGY_MODE")  # "diversified" | "concentrated"
     # How many names the diversified book holds at most.
     screener_top_k: int = Field(default=10, alias="SCREENER_TOP_K")
+    # When true, the diversified screener scales its shortlist up
+    # proportionally until the book is ~100% allocated instead of leaving
+    # the unused remainder in cash (risk.sizing.scale_to_full_deployment).
+    # The per-position caps above still bind — if they're reached first, the
+    # cappable maximum is deployed and the shortfall is logged. Off by
+    # default: being fully invested is a decision about risk appetite, not a
+    # default anyone should inherit by accident.
+    full_deployment: bool = Field(default=False, alias="FULL_DEPLOYMENT")
 
     # --- Concentrated 2-trade strategy (models.screener.select_concentrated_trades) ---
     # Split between the two highest-conviction picks is weighted by relative

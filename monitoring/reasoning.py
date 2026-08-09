@@ -409,6 +409,36 @@ def phase_selection(
     }
 
 
+def phase_selection_diversified(
+    symbol: str,
+    side: str,
+    weight_pct: float,
+    n_confident: int,
+    n_selected: int,
+    top_k: int,
+) -> dict:
+    """
+    Phase 4 for the diversified top-k strategy — why this symbol made the
+    book and how much capital it got. Wording differs from phase_selection
+    (the concentrated 2-trade story) because the sizing story differs: here
+    each position is sized independently through the risk pipeline, not
+    split between two legs.
+    """
+    lines = [
+        f"{n_confident} symbol(s) cleared the confidence bar this cycle; the top {n_selected} by "
+        f"conviction score were picked for the diversified book (holds up to {top_k}).",
+        f"{symbol} was sized as a {side} position for {abs(weight_pct):.1%} of total portfolio capital.",
+        "Each position is sized independently: forecast strength scaled by confidence, dampened in a "
+        "choppy regime, and shrunk if it would crowd into names the portfolio already moves with.",
+    ]
+    return {
+        "phase": 4,
+        "title": "Candidate Selection & Sizing",
+        "summary": f"{symbol}: {side}, {abs(weight_pct):.1%} of capital (diversified book).",
+        "lines": lines,
+    }
+
+
 def phase_execution(
     symbol: str,
     action: str,  # "opened" | "closed" | "adjusted"

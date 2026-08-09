@@ -284,6 +284,135 @@ def test_attach_reasoning_empty_candidates_is_noop():
     )  # should not raise
 
 
+# --- strategy dispatch ----------------------------------------------------
+
+
+def _run_screen_harness(monkeypatch, mode, *, full_deployment=False, diversified_result=None):
+    """
+    Wire run_screen's heavy dependencies to fakes so the dispatch itself can
+    be exercised: which selector ran, with which settings-derived arguments.
+    """
+    import models.screener as scr
+
+    monkeypatch.setattr(scr.settings, "strategy_mode", mode)
+    monkeypatch.setattr(scr.settings, "screener_top_k", 7)
+    monkeypatch.setattr(scr.settings, "full_deployment", full_deployment)
+    monkeypatch.setattr(scr.settings, "max_single_position_pct", 0.25)
+    monkeypatch.setattr(scr.settings, "max_short_position_pct", 0.15)
+    monkeypatch.setattr(scr.settings, "max_correlated_exposure_pct", 0.50)
+
+    dates = pd.bdate_range("2026-01-01", periods=3, tz="UTC")
+    train_df = pd.DataFrame(
+        {"symbol": ["A"] * 3, "ts": dates, "close": [1.0, 1.1, 1.2], "fwd_return": [0.01, 0.02, 0.03], "f1": [1, 2, 3]}
+    )
+    monkeypatch.setattr(scr, "load_training_frame", lambda *a, **k: train_df)
+
+    class _NoopEnsemble:
+        def __init__(self, n_models=5): ...
+        def fit(self, X, y): ...
+
+    monkeypatch.setattr(scr, "EnsembleForecastModel", _NoopEnsemble)
+    monkeypatch.setattr(scr, "load_latest_features", lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3]}))
+    monkeypatch.setattr(scr, "score_universe", lambda *a, **k: _scored_df(
+        [{"symbol": "A", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    ))
+    monkeypatch.setattr(scr, "build_correlation_matrix", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+
+    calls = {}
+
+    def fake_select_trades(scored, **kwargs):
+        calls["diversified"] = kwargs
+        return list(diversified_result or [])
+
+    def fake_select_concentrated(scored, **kwargs):
+        calls["concentrated"] = kwargs
+        return []
+
+    monkeypatch.setattr(scr, "select_trades", fake_select_trades)
+    monkeypatch.setattr(scr, "select_concentrated_trades", fake_select_concentrated)
+    return scr, calls
+
+
+def test_run_screen_diversified_mode_uses_the_topk_book_with_conservative_caps(monkeypatch):
+    scr, calls = _run_screen_harness(monkeypatch, "diversified")
+
+    scr.run_screen("v3", ["A"])
+
+    assert "diversified" in calls and "concentrated" not in calls
+    assert calls["diversified"]["top_k"] == 7  # settings.screener_top_k
+    assert calls["diversified"]["max_position_pct"] == 0.25
+    assert calls["diversified"]["max_short_position_pct"] == 0.15
+    assert calls["diversified"]["max_correlated_exposure_pct"] == 0.50
+    assert calls["diversified"]["forecast_scale"] == pytest.approx(0.01)  # std of fwd_return
+
+
+def test_run_screen_concentrated_mode_uses_the_two_trade_split(monkeypatch):
+    scr, calls = _run_screen_harness(monkeypatch, "concentrated")
+
+    scr.run_screen("v3", ["A"])
+
+    assert "concentrated" in calls and "diversified" not in calls
+
+
+def test_run_screen_diversified_scales_sizes_by_the_freed_capital_fraction(monkeypatch):
+    from models.screener import TradeCandidate
+
+    candidate = TradeCandidate(
+        symbol="A", side="long", predicted_return=0.05, direction_agreement=1.0,
+        conviction_score=0.05, target_position_pct=0.20,
+    )
+    scr, _calls = _run_screen_harness(monkeypatch, "diversified", diversified_result=[candidate])
+
+    result = scr.run_screen("v3", ["A"], total_deploy_pct=0.5)
+
+    assert result[0].target_position_pct == pytest.approx(0.10)  # 0.20 * 0.5
+
+
+def test_run_screen_diversified_honors_full_deployment(monkeypatch):
+    from models.screener import TradeCandidate
+
+    candidate = TradeCandidate(
+        symbol="A", side="long", predicted_return=0.05, direction_agreement=1.0,
+        conviction_score=0.05, target_position_pct=0.10,
+    )
+    scr, _calls = _run_screen_harness(
+        monkeypatch, "diversified", full_deployment=True, diversified_result=[candidate]
+    )
+
+    result = scr.run_screen("v3", ["A"])
+
+    # One pick under a 25% cap: scaled up to the cap, shortfall logged, never past it.
+    assert result[0].target_position_pct == pytest.approx(0.25)
+
+
+def test_attach_reasoning_diversified_wording_tells_the_topk_story():
+    from models.screener import TradeCandidate
+
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
+    candidates = [
+        TradeCandidate(
+            symbol="AAPL", side="long", predicted_return=0.05, direction_agreement=1.0,
+            conviction_score=0.05, target_position_pct=0.10,
+        )
+    ]
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [1.5]})
+    contributions = pd.DataFrame({"f1": [0.03], "base_value": [0.0]}, index=pd.Index(["AAPL"], name="symbol"))
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
+
+    _attach_reasoning(
+        candidates, ensemble, latest, feature_cols=["f1"], scored=scored, regime=TREND,
+        max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8,
+        strategy="diversified", top_k=10,
+    )
+
+    phase4 = next(p for p in candidates[0].reasoning if p["phase"] == 4)
+    text = " ".join(phase4["lines"])
+    assert "diversified book" in text
+    assert "up to 10" in text
+    assert "two picks" not in text  # the concentrated split story must not leak in
+
+
 def test_build_correlation_matrix_from_prices():
     dates = pd.bdate_range("2026-01-01", periods=30, tz="UTC")
     rng = np.random.default_rng(0)
