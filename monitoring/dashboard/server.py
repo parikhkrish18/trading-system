@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import json
 import subprocess
 import sys
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import mlflow
 import pandas as pd
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
@@ -421,7 +422,36 @@ def get_last_test_run() -> dict | None:
     return json.loads(LAST_TEST_RUN_PATH.read_text())
 
 
-@app.post("/api/tests/run")
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _require_api_token(request: Request) -> None:
+    """
+    Gate for mutating endpoints. Three cases:
+
+    - Token configured: every caller must present it as a bearer header,
+      loopback or not — configuring a token means wanting it checked.
+    - No token, loopback bind: allowed. The only people who can reach a
+      127.0.0.1 dashboard are already on the machine.
+    - No token, non-loopback bind: 403 always. An open interface with an
+      endpoint that runs subprocesses must not be one blank env var away
+      from the network.
+    """
+    token = settings.dashboard_api_token
+    if token:
+        supplied = request.headers.get("authorization", "")
+        if not hmac.compare_digest(supplied, f"Bearer {token}"):
+            raise HTTPException(status_code=403, detail="Missing or invalid bearer token.")
+        return
+    if settings.dashboard_host not in _LOOPBACK_HOSTS:
+        raise HTTPException(
+            status_code=403,
+            detail="This endpoint is disabled: the dashboard is bound to a non-loopback "
+                   "interface and DASHBOARD_API_TOKEN is not set.",
+        )
+
+
+@app.post("/api/tests/run", dependencies=[Depends(_require_api_token)])
 def run_tests() -> dict:
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "--tb=short"],
@@ -451,7 +481,9 @@ app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("monitoring.dashboard.server:app", host="0.0.0.0", port=8501, reload=False)
+    # Loopback by default — exposing the dashboard to the network is an
+    # explicit DASHBOARD_HOST=0.0.0.0 decision (the Docker image makes it).
+    uvicorn.run("monitoring.dashboard.server:app", host=settings.dashboard_host, port=8501, reload=False)
 
 
 if __name__ == "__main__":

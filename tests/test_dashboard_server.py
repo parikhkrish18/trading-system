@@ -467,3 +467,61 @@ def test_whatif_endpoint_with_no_decisions_at_all(monkeypatch, client):
     body = resp.json()
     assert body["available"] is False
     assert body["rows"] == []
+
+
+# --- /api/tests/run token gate ----------------------------------------------
+
+
+class _FakePytestResult:
+    returncode = 0
+    stdout = "..\n2 passed in 0.1s\n"
+    stderr = ""
+
+
+@pytest.fixture
+def _runnable_tests(monkeypatch, tmp_path):
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _FakePytestResult())
+    monkeypatch.setattr(server, "LAST_TEST_RUN_PATH", tmp_path / "last_test_run.json")
+
+
+def test_run_tests_allowed_on_loopback_without_a_token(monkeypatch, client, _runnable_tests):
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
+
+    resp = client.post("/api/tests/run")
+
+    assert resp.status_code == 200
+
+
+def test_run_tests_forbidden_on_open_interface_without_a_token(monkeypatch, client, _runnable_tests):
+    """An open bind with no token must refuse — never run subprocesses for the whole network."""
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+
+    resp = client.post("/api/tests/run")
+
+    assert resp.status_code == 403
+    assert "DASHBOARD_API_TOKEN" in resp.json()["detail"]
+
+
+def test_run_tests_requires_the_bearer_token_when_configured(monkeypatch, client, _runnable_tests):
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+
+    no_token = client.post("/api/tests/run")
+    wrong = client.post("/api/tests/run", headers={"Authorization": "Bearer wrong"})
+    right = client.post("/api/tests/run", headers={"Authorization": "Bearer sekrit"})
+
+    assert no_token.status_code == 403
+    assert wrong.status_code == 403
+    assert right.status_code == 200
+
+
+def test_configured_token_is_checked_even_on_loopback(monkeypatch, client, _runnable_tests):
+    """Configuring a token means wanting it enforced — the loopback exemption is only for the blank case."""
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
+    monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
+
+    resp = client.post("/api/tests/run")
+
+    assert resp.status_code == 403

@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     # /api/tests/run). Blank is fine on localhost; required when the
     # dashboard binds a non-loopback interface.
     dashboard_api_token: str = Field(default="", alias="DASHBOARD_API_TOKEN")
+    # Where the dashboard listens. Loopback by default so it isn't reachable
+    # from the network by accident; the Docker image sets 0.0.0.0 explicitly
+    # (containers need it to publish the port).
+    dashboard_host: str = Field(default="127.0.0.1", alias="DASHBOARD_HOST")
 
     # --- Alerts ---
     slack_webhook_url: str = Field(default="", alias="SLACK_WEBHOOK_URL")
