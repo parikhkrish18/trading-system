@@ -354,3 +354,116 @@ def test_run_tests_executes_subprocess_and_caches(monkeypatch, client, tmp_path)
     assert body["passed"] is True
     assert "2 passed" in body["summary"]
     assert (tmp_path / "last_test_run.json").exists()
+
+
+# --- model report card ------------------------------------------------------
+
+
+def _fold_run(fold_id, accuracy, confident_accuracy, pct_confident):
+    return {
+        "run_name": f"fold_{fold_id}",
+        "fold_id": str(fold_id),
+        "metrics": {
+            "directional_accuracy": accuracy,
+            "directional_accuracy_when_confident": confident_accuracy,
+            "pct_rows_confident": pct_confident,
+            "mae": 0.01,
+            "rmse": 0.02,
+        },
+    }
+
+
+def test_report_card_endpoint_folds_metrics_into_headline_chart_and_callouts(monkeypatch, client):
+    runs = [_fold_run(2, 0.60, 0.70, 0.5), _fold_run(1, 0.50, 0.60, 0.5)]
+    monkeypatch.setattr(server.report_card, "fetch_fold_runs", lambda uri, experiment_name="forecast_lgbm": runs)
+
+    resp = client.get("/api/analysis/report_card")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["headline"]["n_folds"] == 2
+    assert body["headline"]["directional_accuracy"] == pytest.approx(0.55)
+    # two folds x two series = four bars
+    assert len(body["chart"]) == 4
+    assert len(body["callouts"]) == 2
+    assert any("models agreed" in c for c in body["callouts"])
+
+
+def test_report_card_endpoint_is_empty_not_500_when_mlflow_is_down(monkeypatch, client):
+    def _down(uri, experiment_name="forecast_lgbm"):
+        raise ConnectionError("mlflow unreachable")
+
+    monkeypatch.setattr(server.report_card, "fetch_fold_runs", _down)
+
+    resp = client.get("/api/analysis/report_card")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False, "headline": None, "chart": [], "callouts": []}
+
+
+def test_report_card_endpoint_unavailable_when_no_runs(monkeypatch, client):
+    monkeypatch.setattr(server.report_card, "fetch_fold_runs", lambda uri, experiment_name="forecast_lgbm": [])
+
+    resp = client.get("/api/analysis/report_card")
+
+    assert resp.json()["available"] is False
+
+
+# --- what-if thresholds -----------------------------------------------------
+
+
+def _whatif_batch(agreements):
+    ts = pd.Timestamp("2026-08-07T14:00:00Z")
+    return pd.DataFrame(
+        [
+            {
+                "ts": ts, "symbol": sym, "forecast": fc, "regime": "trend",
+                "target_position": tp, "executed_position": None, "mode": "paper",
+                "direction_agreement": ag,
+            }
+            for sym, fc, tp, ag in [
+                ("AAPL", 0.05, 0.10, agreements[0]),
+                ("TSLA", -0.02, -0.05, agreements[1]),
+            ]
+        ]
+    )
+
+
+def test_whatif_endpoint_filters_by_slider_thresholds(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _whatif_batch([1.0, 0.6]))
+
+    resp = client.get("/api/whatif?min_agreement=0.8&min_abs_move=0.0")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["n_before"] == 2
+    assert body["n_after"] == 1  # TSLA's 0.6 agreement fails the 0.8 bar
+    assert [r["Symbol"] for r in body["rows"]] == ["AAPL"]
+    assert body["rows"][0]["Model agreement"] == 1.0
+    assert "1 pick" in body["summary"]
+
+
+def test_whatif_endpoint_reports_no_scored_batch_for_pre_merge_rows(monkeypatch, client):
+    """Rows logged before direction_agreement existed must say so, not silently filter on nothing."""
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _whatif_batch([None, None]))
+
+    resp = client.get("/api/whatif")
+
+    body = resp.json()
+    assert body["available"] is False
+    assert "No scored batch" in body["message"]
+
+
+def test_whatif_endpoint_with_no_decisions_at_all(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
+
+    resp = client.get("/api/whatif")
+
+    body = resp.json()
+    assert body["available"] is False
+    assert body["rows"] == []

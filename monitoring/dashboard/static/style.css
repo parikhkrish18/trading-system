@@ -220,3 +220,28 @@ tbody tr:hover { background: var(--bg-elevated); }
 .feature-freq-bar-track { flex: 1; height: 14px; background: var(--bg-elevated); border-radius: 3px; overflow: hidden; }
 .feature-freq-bar { height: 100%; background: var(--accent); }
 .feature-freq-count { width: 40px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text-muted); }
+
+/* --- Model report card & what-if thresholds --- */
+.callout {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin-top: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.legend-item { margin-right: 14px; }
+.legend-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: baseline;
+}
+.whatif-sliders { display: flex; gap: 32px; flex-wrap: wrap; margin-bottom: 12px; }
+.whatif-sliders label { font-size: 13px; color: var(--text-muted); display: flex; flex-direction: column; gap: 6px; }
+.whatif-sliders label span { color: var(--text); font-variant-numeric: tabular-nums; }
+.whatif-sliders input[type="range"] { width: 220px; accent-color: var(--accent); }

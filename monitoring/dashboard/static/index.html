@@ -77,6 +77,40 @@
       </div>
     </section>
 
+    <section id="report-card-section">
+      <h2>Model Report Card <span class="muted">(walk-forward folds, plain English)</span></h2>
+      <div class="summary-row" id="report-card-summary"></div>
+      <div class="chart-box">
+        <h3>Directional accuracy per fold — all predictions vs. only when the models agreed</h3>
+        <div id="report-card-chart"></div>
+      </div>
+      <div id="report-card-callouts"></div>
+    </section>
+
+    <section id="whatif-section">
+      <h2>What-If Thresholds <span class="muted">(re-filter the latest picks, nothing is retrained)</span></h2>
+      <div class="filter-row whatif-sliders">
+        <label for="whatif-agreement">Min model agreement <span id="whatif-agreement-value">80%</span>
+          <input type="range" id="whatif-agreement" min="0.5" max="1.0" step="0.05" value="0.8" />
+        </label>
+        <label for="whatif-move">Min predicted move <span id="whatif-move-value">0.0%</span>
+          <input type="range" id="whatif-move" min="0.0" max="0.10" step="0.005" value="0.0" />
+        </label>
+      </div>
+      <div class="summary-row" id="whatif-summary"></div>
+      <div class="table-wrap">
+        <table id="whatif-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Direction</th><th>Market regime</th>
+              <th>Predicted move</th><th>Target size</th><th>Model agreement</th><th>Placed?</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="feature-importance-section">
       <h2>Feature Importance Over Time <span class="muted">(last 200 decisions)</span></h2>
       <div id="feature-importance-list" class="feature-freq-list"></div>

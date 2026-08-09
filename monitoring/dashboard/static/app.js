@@ -71,6 +71,114 @@ function renderLineChart(container, points, { color = "#5b8cff", height = 160, z
   container.innerHTML = svg;
 }
 
+// Grouped bar chart for the report card — same hand-rolled SVG approach as
+// renderLineChart. `rows`: [{fold_label, series, accuracy}], long form.
+function renderGroupedBarChart(container, rows, { height = 180, colors = { [0]: "#5b8cff", [1]: "#26a65b" } } = {}) {
+  container.innerHTML = "";
+  if (!rows || rows.length === 0) {
+    container.innerHTML = '<div class="empty-state">No fold metrics recorded yet.</div>';
+    return;
+  }
+  const width = 600;
+  const pad = 8;
+  const labelBand = 16;
+  const folds = [...new Set(rows.map((r) => r.fold_label))];
+  const seriesNames = [...new Set(rows.map((r) => r.series))];
+  const groupWidth = (width - pad * 2) / folds.length;
+  const barWidth = Math.min(24, (groupWidth - 6) / seriesNames.length);
+  const plotHeight = height - pad * 2 - labelBand;
+
+  const bars = rows
+    .map((r) => {
+      const gi = folds.indexOf(r.fold_label);
+      const si = seriesNames.indexOf(r.series);
+      const h = Math.max(1, plotHeight * Math.min(Math.max(r.accuracy, 0), 1));
+      const x = pad + gi * groupWidth + (groupWidth - barWidth * seriesNames.length) / 2 + si * barWidth;
+      const y = pad + plotHeight - h;
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(barWidth - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="${colors[si] || "#5b8cff"}"><title>${r.fold_label} — ${r.series}: ${(r.accuracy * 100).toFixed(1)}%</title></rect>`;
+    })
+    .join("");
+
+  const fiftyY = pad + plotHeight * 0.5;
+  const labels = folds
+    .map((f, gi) => {
+      const x = pad + gi * groupWidth + groupWidth / 2;
+      return `<text x="${x.toFixed(1)}" y="${height - 4}" text-anchor="middle" font-size="10" fill="#8b92a6">${f}</text>`;
+    })
+    .join("");
+
+  const legend = seriesNames
+    .map((name, si) => `<span class="legend-item"><span class="legend-swatch" style="background:${colors[si] || "#5b8cff"}"></span>${name}</span>`)
+    .join(" ");
+
+  container.innerHTML = `
+    <svg viewBox="0 0 ${width} ${height}">
+      <line x1="${pad}" y1="${fiftyY}" x2="${width - pad}" y2="${fiftyY}" stroke="#8b92a6" stroke-dasharray="3,3" stroke-width="1" />
+      <text x="${width - pad}" y="${fiftyY - 3}" text-anchor="end" font-size="9" fill="#8b92a6">coin flip (50%)</text>
+      ${bars}
+      ${labels}
+    </svg>
+    <div class="muted" style="font-size:11px;margin-top:4px;">${legend}</div>`;
+}
+
+// ---------- Model report card ----------
+async function loadReportCard() {
+  const result = await fetchJSON("/api/analysis/report_card");
+  const summary = document.getElementById("report-card-summary");
+  const callouts = document.getElementById("report-card-callouts");
+  if (!result.available) {
+    summary.innerHTML = '<div class="empty-state">No training runs found in MLflow yet — run models/train.py to grade the model.</div>';
+    renderGroupedBarChart(document.getElementById("report-card-chart"), []);
+    callouts.innerHTML = "";
+    return;
+  }
+  const h = result.headline;
+  summary.innerHTML = `
+    <div class="stat-card"><div class="value">${h.n_folds}</div><div class="label">Folds graded</div></div>
+    <div class="stat-card"><div class="value">${fmt.pct(h.directional_accuracy, 1)}</div><div class="label">Direction right (all predictions)</div></div>
+    <div class="stat-card"><div class="value">${fmt.pct(h.directional_accuracy_when_confident, 1)}</div><div class="label">Direction right (models agreed)</div></div>
+    <div class="stat-card"><div class="value">${fmt.pct(h.pct_rows_confident, 1)}</div><div class="label">Share clearing the agreement bar</div></div>
+  `;
+  renderGroupedBarChart(document.getElementById("report-card-chart"), result.chart);
+  callouts.innerHTML = result.callouts.map((c) => `<div class="callout">${c}</div>`).join("");
+}
+
+// ---------- What-if thresholds ----------
+async function loadWhatif() {
+  const minAgreement = document.getElementById("whatif-agreement").value;
+  const minMove = document.getElementById("whatif-move").value;
+  document.getElementById("whatif-agreement-value").textContent = `${Math.round(minAgreement * 100)}%`;
+  document.getElementById("whatif-move-value").textContent = `${(minMove * 100).toFixed(1)}%`;
+
+  const result = await fetchJSON(`/api/whatif?min_agreement=${minAgreement}&min_abs_move=${minMove}`);
+  const summary = document.getElementById("whatif-summary");
+  const tbody = document.querySelector("#whatif-table tbody");
+  if (!result.available) {
+    summary.innerHTML = `<div class="empty-state">${result.message}</div>`;
+    tbody.innerHTML = "";
+    return;
+  }
+  summary.innerHTML = `<div class="stat-card"><div class="value">${result.n_after}/${result.n_before}</div><div class="label">${result.summary}</div></div>`;
+  if (result.rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Nothing clears these thresholds.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = result.rows
+    .map(
+      (r) => `
+      <tr>
+        <td><strong>${r["Symbol"]}</strong></td>
+        <td>${r["Direction"]}</td>
+        <td>${r["Market regime"]}</td>
+        <td>${fmt.pct(r["Predicted move"], 2)}</td>
+        <td>${fmt.pct(r["Target size"], 1)}</td>
+        <td>${fmt.pct(r["Model agreement"], 0)}</td>
+        <td>${r["Placed?"]}</td>
+      </tr>`
+    )
+    .join("");
+}
+
 // ---------- Positions ----------
 
 // Legacy fallback for decisions logged before the 7-phase reasoning model —
@@ -484,6 +592,8 @@ async function loadAll() {
     loadEquity(),
     loadBreakers(),
     loadAnalysis(),
+    loadReportCard(),
+    loadWhatif(),
     loadFeatureImportance(),
     loadLiveAccuracy(),
     loadDecisions(),
@@ -499,5 +609,9 @@ document.getElementById("decision-filter-btn").addEventListener("click", () => {
 document.getElementById("decision-symbol-filter").addEventListener("keydown", (e) => {
   if (e.key === "Enter") document.getElementById("decision-filter-btn").click();
 });
+// The sliders re-hit the endpoint on every input tick — the endpoint is a
+// read-only re-filter of one already-logged batch, so that's cheap.
+document.getElementById("whatif-agreement").addEventListener("input", loadWhatif);
+document.getElementById("whatif-move").addEventListener("input", loadWhatif);
 
 loadAll();

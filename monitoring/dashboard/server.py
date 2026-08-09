@@ -31,6 +31,7 @@ from execution.broker import get_broker
 from features.quant.momentum import adx as compute_adx
 from models.regime.trend_chop_classifier import RuleBasedRegime
 from monitoring.breaker_state import load_latest_breaker_state
+from monitoring.dashboard import report_card, whatif
 from monitoring.equity import load_equity_curve
 from monitoring.forecast_accuracy import compute_forecast_accuracy
 
@@ -179,6 +180,84 @@ def get_live_accuracy(limit: int = 500) -> dict:
         "hit_rate": float(result["hit"].mean()),
         "n_matured": len(result),
         "rows": _clean_records(result.sort_values("ts", ascending=False).head(50)),
+    }
+
+
+@app.get("/api/analysis/report_card")
+def get_report_card() -> dict:
+    """
+    The model's report card: fold-by-fold walk-forward metrics folded down to
+    a headline, a grouped-bar chart, and two plain-English callouts about
+    whether "the models agreed" is actually buying accuracy. Same
+    fail-empty pattern as /api/analysis/runs — an unreachable MLflow means
+    an unavailable panel, not a 500.
+    """
+    try:
+        runs = report_card.fetch_fold_runs(settings.mlflow_tracking_uri)
+    except Exception:
+        return {"available": False, "headline": None, "chart": [], "callouts": []}
+
+    folds = report_card.fold_metrics_frame(runs)
+    if folds.empty:
+        return {"available": False, "headline": None, "chart": [], "callouts": []}
+
+    headline = report_card.headline_metrics(folds)
+    return {
+        "available": True,
+        "headline": headline,
+        "chart": _clean_records(report_card.accuracy_chart_frame(folds)),
+        "callouts": [
+            report_card.confidence_callout(headline["pct_rows_confident"]),
+            report_card.agreement_edge_note(
+                headline["directional_accuracy"], headline["directional_accuracy_when_confident"]
+            ),
+        ],
+    }
+
+
+@app.get("/api/whatif")
+def get_whatif(min_agreement: float = 0.8, min_abs_move: float = 0.0) -> dict:
+    """
+    The what-if threshold playground: re-filter the latest logged screener
+    batch at whatever bar the sliders ask for. Read-only — nothing is
+    retrained or rescored; the question is only "which of these picks would
+    still have made the cut".
+    """
+    engine = get_engine()
+    batch = pd.read_sql(
+        text(
+            """SELECT ts, symbol, forecast, regime, target_position, executed_position,
+                      mode, direction_agreement
+               FROM decisions
+               WHERE mode = 'paper' AND forecast IS NOT NULL
+                 AND ts = (
+                     SELECT MAX(ts) FROM decisions WHERE mode = 'paper' AND forecast IS NOT NULL
+                 )"""
+        ),
+        engine,
+    )
+    if batch.empty:
+        return {"available": False, "message": "No scored screener batch logged yet.", "rows": [], "summary": ""}
+    if batch["direction_agreement"].isna().all():
+        # Rows logged before the unified loop recorded agreement — the
+        # sliders would filter on a number that was never written.
+        return {
+            "available": False,
+            "message": "No scored batch yet — the latest picks were logged before model agreement was recorded. "
+                       "The playground activates after the next screener run.",
+            "rows": [],
+            "summary": "",
+        }
+
+    filtered = whatif.filter_by_thresholds(batch, min_agreement=min_agreement, min_abs_move=min_abs_move)
+    return {
+        "available": True,
+        "min_agreement": min_agreement,
+        "min_abs_move": min_abs_move,
+        "n_before": len(batch),
+        "n_after": len(filtered),
+        "summary": whatif.shortlist_summary(len(batch), len(filtered)),
+        "rows": _clean_records(whatif.whatif_table(filtered)),
     }
 
 
