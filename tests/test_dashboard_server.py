@@ -159,17 +159,19 @@ def test_last_test_run_returns_cached_result(monkeypatch, client, tmp_path):
 
 def test_live_accuracy_no_decisions_returns_null_hit_rate(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "forecast"]))
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "forecast", "mode"]))
 
     resp = client.get("/api/analysis/live_accuracy")
     body = resp.json()
     assert body["hit_rate"] is None
     assert body["n_matured"] == 0
+    assert body["backfill"]["hit_rate"] is None
+    assert body["backfill"]["n_matured"] == 0
 
 
 def test_live_accuracy_computes_hit_rate_from_matured_decisions(monkeypatch, client):
     decisions = pd.DataFrame(
-        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5]}
+        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "mode": ["paper"]}
     )
     prices = pd.DataFrame(
         {"symbol": ["AAPL", "AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z", "2026-07-28T00:00:00Z"]), "close": [100.0, 105.0]}
@@ -182,6 +184,62 @@ def test_live_accuracy_computes_hit_rate_from_matured_decisions(monkeypatch, cli
     body = resp.json()
     assert body["hit_rate"] == pytest.approx(1.0)  # positive forecast, price went up
     assert body["n_matured"] == 1
+    assert body["backfill"]["n_matured"] == 0
+
+
+def test_live_accuracy_excludes_backfilled_history_from_the_live_number(monkeypatch, client):
+    """
+    The honesty split: 3 replayed rows (mode='backfill', all hits) + 1 real
+    paper decision (a miss). Blended, that would read as a 75% hit rate; the
+    live number must be the honest 0% and the replay reported separately.
+    """
+    decisions = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL", "AAPL", "AAPL"],
+            "ts": pd.to_datetime(
+                ["2026-07-20T12:00:00Z", "2026-07-21T12:00:00Z", "2026-07-22T12:00:00Z", "2026-07-27T12:00:00Z"]
+            ),
+            # Backfill rows predict up while price rises (hits); the one real
+            # paper row predicts up right before the price falls (a miss).
+            "forecast": [0.5, 0.5, 0.5, 0.5],
+            "mode": ["backfill", "backfill", "backfill", "paper"],
+        }
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 6,
+            "ts": pd.to_datetime(
+                ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23", "2026-07-27", "2026-07-28"]
+            ).tz_localize("UTC"),
+            "close": [100.0, 101.0, 102.0, 103.0, 104.0, 95.0],
+        }
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    body = client.get("/api/analysis/live_accuracy").json()
+    assert body["n_matured"] == 1
+    assert body["hit_rate"] == pytest.approx(0.0)  # the real decision missed
+    assert body["backfill"]["n_matured"] == 3
+    assert body["backfill"]["hit_rate"] == pytest.approx(1.0)
+
+
+def test_live_accuracy_with_only_backfill_rows_reports_no_live_number(monkeypatch, client):
+    decisions = pd.DataFrame(
+        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "mode": ["backfill"]}
+    )
+    prices = pd.DataFrame(
+        {"symbol": ["AAPL", "AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z", "2026-07-28T00:00:00Z"]), "close": [100.0, 105.0]}
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    body = client.get("/api/analysis/live_accuracy").json()
+    assert body["hit_rate"] is None  # nothing real has matured — say so, don't borrow history
+    assert body["n_matured"] == 0
+    assert body["backfill"]["n_matured"] == 1
 
 
 def test_closed_trades_reconstructs_a_round_trip(monkeypatch, client):

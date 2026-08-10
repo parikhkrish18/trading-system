@@ -155,33 +155,51 @@ def get_analysis_runs(experiment: str = "forecast_lgbm") -> list[dict]:
     return _clean_records(result)
 
 
+# Decision modes that count as the system actually running. Anything else
+# (mode='backfill' — replayed history loaded after the fact) is reported
+# separately and must never be blended into what's presented as live results.
+_LIVE_DECISION_MODES = ("paper", "live")
+
+
 @app.get("/api/analysis/live_accuracy")
 def get_live_accuracy(limit: int = 500) -> dict:
     """
     How often real logged decisions' predicted direction matched what
     actually happened next — complements /api/analysis/runs (the
     walk-forward backtest) with a live, after-the-fact check.
+
+    The top-level hit_rate counts ONLY real decision modes (paper/live).
+    Replayed history (mode='backfill') is scored the same way but returned
+    under "backfill", clearly separated: blending 130 replayed rows into 23
+    real ones would let history masquerade as live performance.
     """
     engine = get_engine()
     decisions = pd.read_sql(
-        text("SELECT symbol, ts, forecast FROM decisions WHERE forecast IS NOT NULL ORDER BY ts DESC LIMIT :limit"),
+        text("SELECT symbol, ts, forecast, mode FROM decisions WHERE forecast IS NOT NULL ORDER BY ts DESC LIMIT :limit"),
         engine,
         params={"limit": limit},
     )
+    empty_bucket = {"hit_rate": None, "n_matured": 0, "rows": []}
     if decisions.empty:
-        return {"hit_rate": None, "n_matured": 0, "rows": []}
+        return {**empty_bucket, "backfill": dict(empty_bucket)}
 
     symbol_list = symbol_in_clause(decisions["symbol"].unique())
     prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
 
-    result = compute_forecast_accuracy(decisions, prices)
-    if result.empty:
-        return {"hit_rate": None, "n_matured": 0, "rows": []}
-    return {
-        "hit_rate": float(result["hit"].mean()),
-        "n_matured": len(result),
-        "rows": _clean_records(result.sort_values("ts", ascending=False).head(50)),
-    }
+    def _scored(subset: pd.DataFrame) -> dict:
+        if subset.empty:
+            return dict(empty_bucket)
+        result = compute_forecast_accuracy(subset, prices)
+        if result.empty:
+            return dict(empty_bucket)
+        return {
+            "hit_rate": float(result["hit"].mean()),
+            "n_matured": len(result),
+            "rows": _clean_records(result.sort_values("ts", ascending=False).head(50)),
+        }
+
+    is_live = decisions["mode"].isin(_LIVE_DECISION_MODES)
+    return {**_scored(decisions[is_live]), "backfill": _scored(decisions[~is_live])}
 
 
 @app.get("/api/analysis/report_card")

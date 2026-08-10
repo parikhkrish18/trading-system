@@ -487,15 +487,22 @@ async function loadAnalysis() {
 async function loadLiveAccuracy() {
   const result = await fetchJSON("/api/analysis/live_accuracy");
   const box = document.getElementById("live-accuracy-summary");
+  const backfill = result.backfill || { hit_rate: null, n_matured: 0 };
+  let html = "";
   if (result.hit_rate === null) {
-    box.innerHTML = '<div class="empty-state">No matured decisions yet to score (needs a price bar after the decision).</div>';
-    return;
+    html += '<div class="empty-state">No matured live decisions yet to score (needs a price bar after the decision).</div>';
+  } else {
+    const cls = result.hit_rate >= 0.5 ? "good" : "bad";
+    html += `
+    <div class="stat-card ${cls}"><div class="value">${fmt.pct(result.hit_rate, 1)}</div><div class="label">Live directional hit rate — real decisions only</div></div>
+    <div class="stat-card"><div class="value">${result.n_matured}</div><div class="label">Matured live decisions scored</div></div>`;
   }
-  const cls = result.hit_rate >= 0.5 ? "good" : "bad";
-  box.innerHTML = `
-    <div class="stat-card ${cls}"><div class="value">${fmt.pct(result.hit_rate, 1)}</div><div class="label">Live directional hit rate</div></div>
-    <div class="stat-card"><div class="value">${result.n_matured}</div><div class="label">Matured decisions scored</div></div>
-  `;
+  if (backfill.hit_rate !== null) {
+    html += `
+    <div class="stat-card"><div class="value">${fmt.pct(backfill.hit_rate, 1)}</div><div class="label">Backfilled replay hit rate — historical simulation, NOT live results</div></div>
+    <div class="stat-card"><div class="value">${backfill.n_matured}</div><div class="label">Backfilled rows (excluded from the live number)</div></div>`;
+  }
+  box.innerHTML = html;
 }
 
 // ---------- Decision history ----------
