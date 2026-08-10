@@ -99,6 +99,13 @@ class Settings(BaseSettings):
         default="reject", alias="APPROVAL_TIMEOUT_CLOSE_ACTION"
     )  # "reject" | "approve"
 
+    # --- Data freshness ---
+    # The weekly cycle refuses to trade if the newest price or feature row
+    # is older than this many days (scripts/run_weekly_cycle.py). Guards
+    # against every ingest job failing silently — or vendors returning
+    # empty responses — and the cycle then trading on last week's data.
+    max_data_staleness_days: int = Field(default=3, alias="MAX_DATA_STALENESS_DAYS")
+
     # --- Risk limits ---
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
     # Conservative defaults: these cap sizing in the diversified strategy
