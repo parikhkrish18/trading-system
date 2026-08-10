@@ -35,7 +35,7 @@ from features.quant.momentum import adx
 from models.regime.trend_chop_classifier import CHOP, RuleBasedRegime
 from models.screener import build_correlation_matrix, run_screen
 from monitoring import reasoning
-from monitoring.alerts import alert_circuit_breaker, send_slack_alert
+from monitoring.alerts import alert_circuit_breaker, configure_file_logging, send_slack_alert
 from monitoring.breaker_state import check_and_record_breakers
 from monitoring.equity import load_equity_curve, record_equity_snapshot
 
@@ -407,6 +407,7 @@ def run_cycle(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    configure_file_logging()  # logs survive the console closing
     parser = argparse.ArgumentParser(description="Run one screen-and-trade cycle (paper only).")
     parser.add_argument("--feature-set-id", required=True)
     parser.add_argument("--symbols", default=None)

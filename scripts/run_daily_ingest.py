@@ -13,7 +13,7 @@ import datetime as dt
 import logging
 
 from data.ingest.prices import ingest_prices
-from monitoring.alerts import alert_pipeline_failure
+from monitoring.alerts import alert_pipeline_failure, configure_file_logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,6 +34,7 @@ def main() -> None:
     parser.add_argument("--symbols", required=True)
     parser.add_argument("--source", default="alpaca", choices=["alpaca", "yfinance"])
     args = parser.parse_args()
+    configure_file_logging()  # logs survive the console closing
     symbols = [s.strip().upper() for s in args.symbols.split(",")]
 
     today = dt.datetime.now(tz=dt.UTC).date()

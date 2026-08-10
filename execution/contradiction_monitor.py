@@ -38,7 +38,7 @@ from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
 from models.screener import run_screen
 from monitoring import reasoning
-from monitoring.alerts import send_slack_alert
+from monitoring.alerts import configure_file_logging, send_slack_alert
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +458,7 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    configure_file_logging()  # logs survive the console closing
     results = run_contradiction_check()
     closed = [r for r in results if r.closed]
     print(f"Checked {len(results)} position(s), closed {len(closed)}.")

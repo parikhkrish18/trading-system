@@ -36,7 +36,7 @@ from data.validators.checks import check_staleness
 from execution.trading_loop import run_cycle
 from features.build_features import build_and_store
 from features.qualitative.sentiment import backfill_unscored_news
-from monitoring.alerts import alert_pipeline_failure
+from monitoring.alerts import alert_pipeline_failure, configure_file_logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -137,6 +137,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Screen only, never place orders.")
     args = parser.parse_args()
 
+    configure_file_logging()  # logs survive the console closing
     run_job("universe_refresh", refresh_universe)
     symbols = load_active_universe()
     if not symbols:
