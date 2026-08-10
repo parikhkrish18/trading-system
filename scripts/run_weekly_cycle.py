@@ -80,7 +80,7 @@ def check_data_freshness(engine=None, max_age_days: int | None = None) -> list[s
     engine = engine or get_engine()
     max_age_days = settings.max_data_staleness_days if max_age_days is None else max_age_days
     latest = {
-        table: pd.read_sql(f"SELECT MAX(ts) AS ts FROM {table}", engine)["ts"].iloc[0]
+        table: pd.read_sql(f"SELECT MAX(ts) AS ts FROM {table}", engine)["ts"].iloc[0]  # noqa: S608 — table names are a fixed tuple
         for table in ("prices", "features")
     }
     return freshness_issues(latest, max_age_days)

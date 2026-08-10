@@ -17,7 +17,7 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from data.ingest.db import get_engine, upsert_dataframe
+from data.ingest.db import get_engine, symbol_in_clause, upsert_dataframe
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
 from features.quant.momentum import adx, rolling_return
 from features.quant.volatility import atr, realized_vol, vol_of_vol
@@ -201,11 +201,11 @@ FEATURE_LOOKBACK_YEARS = 3
 
 def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int = FEATURE_LOOKBACK_YEARS) -> int:
     engine = get_engine()
-    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    symbol_list = symbol_in_clause(symbols)
     prices = pd.read_sql(
-        f"""SELECT symbol, ts, open, high, low, close, volume FROM prices
-            WHERE symbol IN ({symbol_list}) AND ts >= now() - interval '{lookback_years} years'
-            ORDER BY ts""",
+        "SELECT symbol, ts, open, high, low, close, volume FROM prices "  # noqa: S608 — symbols validated via symbol_in_clause; lookback cast to int
+        f"WHERE symbol IN ({symbol_list}) AND ts >= now() - interval '{int(lookback_years)} years' "
+        "ORDER BY ts",
         engine,
     )
     if prices.empty:
@@ -213,11 +213,11 @@ def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int
         return 0
 
     news = pd.read_sql(
-        f"SELECT symbol, ts, sentiment FROM news_events WHERE symbol IN ({symbol_list})", engine
+        f"SELECT symbol, ts, sentiment FROM news_events WHERE symbol IN ({symbol_list})", engine  # noqa: S608 — symbols validated via symbol_in_clause
     )
     macro_calendar = pd.read_sql("SELECT ts, category FROM macro_calendar", engine)
     fundamentals = pd.read_sql(
-        f"SELECT symbol, ts, metric, value FROM fundamentals WHERE symbol IN ({symbol_list})", engine
+        f"SELECT symbol, ts, metric, value FROM fundamentals WHERE symbol IN ({symbol_list})", engine  # noqa: S608 — symbols validated via symbol_in_clause
     )
 
     feature_frames = [

@@ -26,7 +26,7 @@ import pandas as pd
 from sqlalchemy.dialects.postgresql import JSONB
 
 from config.settings import settings
-from data.ingest.db import get_engine
+from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
 from execution.approval_gate import ProposedTrade, request_approval
 from execution.broker import get_broker
@@ -56,11 +56,11 @@ class CycleResult:
 def _latest_prices(symbols: list[str]) -> dict[str, float]:
     if not symbols:
         return {}
-    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    symbol_list = symbol_in_clause(symbols)
     engine = get_engine()
     df = pd.read_sql(
-        f"""SELECT DISTINCT ON (symbol) symbol, close FROM prices
-            WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC""",
+        "SELECT DISTINCT ON (symbol) symbol, close FROM prices "  # noqa: S608 — symbols validated via symbol_in_clause
+        f"WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC",
         engine,
     )
     return dict(zip(df["symbol"], df["close"], strict=False))
@@ -77,8 +77,9 @@ def _market_regime(engine, market_proxy: str = "SPY") -> str:
     single `regime` argument) — ADX on a broad market proxy, not per-symbol.
     """
     df = pd.read_sql(
-        f"SELECT ts, high, low, close FROM prices WHERE symbol = '{market_proxy}' ORDER BY ts",
+        "SELECT ts, high, low, close FROM prices WHERE symbol = %(symbol)s ORDER BY ts",
         engine,
+        params={"symbol": market_proxy},
     )
     if len(df) < 20:
         logger.warning("Not enough %s price history for a regime read — defaulting to CHOP (conservative).", market_proxy)
@@ -96,9 +97,8 @@ def _run_breaker_check(broker, engine) -> list:
     portfolio_value = broker.get_portfolio_value()
 
     price_history = pd.read_sql(
-        f"""SELECT symbol, ts, close FROM prices
-            WHERE symbol IN ({", ".join(f"'{s}'" for s in positions_by_value) or "''"})
-            ORDER BY ts""",
+        "SELECT symbol, ts, close FROM prices "  # noqa: S608 — symbols validated via symbol_in_clause
+        f"WHERE symbol IN ({symbol_in_clause(positions_by_value)}) ORDER BY ts",
         engine,
     )
     correlation_matrix = build_correlation_matrix(price_history) if not price_history.empty else pd.DataFrame()

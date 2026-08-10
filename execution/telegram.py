@@ -51,7 +51,7 @@ MAX_MESSAGE_CHARS = 4096
 TRUNCATION_NOTE = "\n\n[...trimmed — too long for one Telegram message]"
 
 MISSING_TOKEN_MESSAGE = (
-    "TELEGRAM_BOT_TOKEN is not set — nothing was sent.\n"
+    "TELEGRAM_BOT_TOKEN is not set — nothing was sent.\n"  # noqa: S105 — help text about a missing token, not a credential
     "Get one by messaging @BotFather on Telegram (/newbot), then put the token "
     "in .env as TELEGRAM_BOT_TOKEN=..."
 )

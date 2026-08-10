@@ -31,7 +31,7 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from config.settings import settings
-from data.ingest.db import get_engine
+from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
 from models.forecast.ensemble import EnsembleForecastModel
 
@@ -85,15 +85,16 @@ def load_feature_frame(feature_set_id: str, symbols: list[str]) -> pd.DataFrame:
     that would require future data).
     """
     engine = get_engine()
-    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    symbol_list = symbol_in_clause(symbols)
 
     features = pd.read_sql(
-        f"""SELECT symbol, ts, feature_name, value FROM features
-            WHERE feature_set_id = '{feature_set_id}' AND symbol IN ({symbol_list})""",
+        "SELECT symbol, ts, feature_name, value FROM features "  # noqa: S608 — symbols validated via symbol_in_clause; feature_set_id is a bind param
+        f"WHERE feature_set_id = %(feature_set_id)s AND symbol IN ({symbol_list})",
         engine,
+        params={"feature_set_id": feature_set_id},
     )
     prices = pd.read_sql(
-        f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts",
+        f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts",  # noqa: S608 — symbols validated via symbol_in_clause
         engine,
     )
     if features.empty or prices.empty:

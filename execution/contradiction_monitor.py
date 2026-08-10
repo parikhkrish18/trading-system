@@ -29,7 +29,7 @@ import logging
 import pandas as pd
 from sqlalchemy.dialects.postgresql import JSONB
 
-from data.ingest.db import get_engine
+from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.news import ingest_news
 from data.ingest.universe import load_active_universe
 from execution.approval_gate import ProposedTrade, request_approval
@@ -200,10 +200,10 @@ def _log_rejected_closure(result: ContradictionResult, mode: str, approval_statu
 def _latest_prices(engine, symbols: list[str]) -> dict[str, float]:
     if not symbols:
         return {}
-    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    symbol_list = symbol_in_clause(symbols)
     df = pd.read_sql(
-        f"""SELECT DISTINCT ON (symbol) symbol, close FROM prices
-            WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC""",
+        "SELECT DISTINCT ON (symbol) symbol, close FROM prices "  # noqa: S608 — symbols validated via symbol_in_clause
+        f"WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC",
         engine,
     )
     return dict(zip(df["symbol"], df["close"], strict=False))

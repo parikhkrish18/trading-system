@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from config.settings import settings
-from data.ingest.db import get_engine
+from data.ingest.db import get_engine, symbol_in_clause
 from execution.broker import get_broker
 from features.quant.momentum import adx as compute_adx
 from models.regime.trend_chop_classifier import RuleBasedRegime
@@ -57,11 +57,11 @@ def get_positions() -> list[dict]:
 
     symbols = [p["symbol"] for p in positions]
     engine = get_engine()
-    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    symbol_list = symbol_in_clause(symbols)
     decisions = pd.read_sql(
-        f"""SELECT DISTINCT ON (symbol) symbol, ts, feature_set_id, model_version,
-                   forecast, regime, target_position, executed_position, mode, reasoning
-            FROM decisions WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC""",
+        "SELECT DISTINCT ON (symbol) symbol, ts, feature_set_id, model_version, "  # noqa: S608 — symbols validated via symbol_in_clause
+        "forecast, regime, target_position, executed_position, mode, reasoning "
+        f"FROM decisions WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC",
         engine,
     )
     decisions_by_symbol = {row["symbol"]: row.to_dict() for _, row in decisions.iterrows()}
@@ -98,9 +98,9 @@ def get_decisions(symbol: str | None = None, limit: int = Query(default=200, le=
         params["symbol"] = symbol
     df = pd.read_sql(
         text(
-            f"""SELECT ts, symbol, feature_set_id, model_version, forecast, regime,
-                       target_position, executed_position, mode, reasoning
-                FROM decisions {where} ORDER BY ts DESC LIMIT :limit OFFSET :offset"""
+            "SELECT ts, symbol, feature_set_id, model_version, forecast, regime, "  # noqa: S608 — WHERE fragment is a fixed literal; values are bind params
+            "target_position, executed_position, mode, reasoning "
+            f"FROM decisions {where} ORDER BY ts DESC LIMIT :limit OFFSET :offset"
         ),
         engine,
         params=params,
@@ -171,8 +171,8 @@ def get_live_accuracy(limit: int = 500) -> dict:
     if decisions.empty:
         return {"hit_rate": None, "n_matured": 0, "rows": []}
 
-    symbol_list = ", ".join(f"'{s}'" for s in decisions["symbol"].unique())
-    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts", engine)
+    symbol_list = symbol_in_clause(decisions["symbol"].unique())
+    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
 
     result = compute_forecast_accuracy(decisions, prices)
     if result.empty:
@@ -293,8 +293,8 @@ def get_closed_trades(limit: int = 100) -> list[dict]:
         return []
 
     symbols = decisions["symbol"].unique().tolist()
-    symbol_list = ", ".join(f"'{s}'" for s in symbols)
-    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts", engine)
+    symbol_list = symbol_in_clause(symbols)
+    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
 
     trades: list[dict] = []
     for symbol, group in decisions.groupby("symbol"):
@@ -344,10 +344,10 @@ def get_positions_news(limit_per_symbol: int = 8) -> dict[str, list[dict]]:
         return {}
 
     engine = get_engine()
-    symbol_list = ", ".join(f"'{s}'" for s in symbols)
+    symbol_list = symbol_in_clause(symbols)
     df = pd.read_sql(
-        f"""SELECT symbol, ts, headline, sentiment, source FROM news_events
-            WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC""",
+        "SELECT symbol, ts, headline, sentiment, source FROM news_events "  # noqa: S608 — symbols validated via symbol_in_clause
+        f"WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC",
         engine,
     )
     result: dict[str, list[dict]] = {s: [] for s in symbols}

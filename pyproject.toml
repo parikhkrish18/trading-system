@@ -5,13 +5,19 @@ target-version = "py311"
 [tool.ruff.lint]
 # Pinned explicitly so CI behavior doesn't shift as ruff adds new default
 # rule categories over time. Covers correctness (E/F), import hygiene (I),
-# a few high-value modernization/perf/bugbear checks. Add more deliberately,
-# don't let `ruff check .` silently get stricter on its own.
-select = ["E", "F", "I", "UP", "B", "C4", "PERF", "RUF"]
+# a few high-value modernization/perf/bugbear checks, and the bandit
+# security rules (S). Add more deliberately, don't let `ruff check .`
+# silently get stricter on its own.
+select = ["E", "F", "I", "UP", "B", "C4", "PERF", "RUF", "S"]
 ignore = [
     "E501",   # line length handled by line-length above, not worth hard-failing on
     "RUF001", "RUF002", "RUF003",  # ambiguous-unicode checks flag intentional emoji in alert text/docs
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# assert is how pytest works; hardcoded "secrets" in tests are fakes;
+# 0.0.0.0 binds in tests simulate the misconfiguration under test.
+"tests/**" = ["S101", "S104", "S105", "S106"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

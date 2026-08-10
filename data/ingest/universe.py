@@ -19,12 +19,20 @@ import datetime as dt
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
-from data.ingest.db import get_engine, upsert_dataframe
+from data.ingest.db import get_engine, upsert_dataframe, validate_symbols
 
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 _USER_AGENT = "trading-system-universe-ingest/1.0 (personal research bot)"
+
+# The S&P 500 has ~503 tickers (multiple share classes). A scrape returning
+# meaningfully fewer means Wikipedia changed its page layout or served an
+# error page — NOT that hundreds of companies left the index overnight.
+# Refusing matters because refresh_universe deactivates everything absent
+# from the scrape: accepting a bad scrape would deactivate most of the
+# universe, and the next trading cycle would propose closing every position.
+MIN_EXPECTED_CONSTITUENTS = 450
 
 
 def fetch_sp500_constituents() -> pd.DataFrame:
@@ -57,10 +65,24 @@ def refresh_universe() -> int:
     previously-tracked symbol NOT in this scrape as is_active=False — so
     ingestion driven by --universe stops chasing names that have been
     removed from the index (acquired, delisted, demoted, etc).
+
+    Fails loudly (ValueError) instead of touching the table when the scrape
+    looks wrong: fewer than MIN_EXPECTED_CONSTITUENTS rows, or any scraped
+    string that doesn't look like a ticker. Both mean a broken/changed page,
+    and deactivating on that basis would tell the next cycle to close every
+    position. The weekly cycle's run_job catches the error, alerts, and
+    keeps the previous universe.
     """
     constituents = fetch_sp500_constituents()
-    if constituents.empty:
-        return 0
+    if len(constituents) < MIN_EXPECTED_CONSTITUENTS:
+        raise ValueError(
+            f"S&P 500 scrape returned only {len(constituents)} row(s) "
+            f"(expected at least {MIN_EXPECTED_CONSTITUENTS}) — refusing to refresh: "
+            "accepting it would deactivate most of the universe."
+        )
+    # Scraped strings from a public wiki page: nothing that doesn't look
+    # like a ticker gets anywhere near the database.
+    symbols = validate_symbols(constituents["symbol"])
 
     now = dt.datetime.now(tz=dt.UTC)
     constituents = constituents.copy()
@@ -69,12 +91,12 @@ def refresh_universe() -> int:
 
     n = upsert_dataframe(constituents, table="universe", conflict_cols=["symbol"])
 
-    symbol_list = ", ".join(f"'{s}'" for s in constituents["symbol"])
     engine = get_engine()
+    deactivate = text("UPDATE universe SET is_active = FALSE WHERE symbol NOT IN :symbols").bindparams(
+        bindparam("symbols", expanding=True)
+    )
     with engine.begin() as conn:
-        conn.execute(
-            text(f"UPDATE universe SET is_active = FALSE WHERE symbol NOT IN ({symbol_list})")
-        )
+        conn.execute(deactivate, {"symbols": symbols})
     return n
 
 

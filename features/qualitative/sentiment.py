@@ -79,13 +79,13 @@ def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
 def backfill_unscored_news(batch_size: int = 500) -> int:
     """Pull rows from news_events where sentiment IS NULL, score them, write back."""
     engine = get_engine()
-    query = f"""
+    query = """
         SELECT id, ts, symbol, headline FROM news_events
         WHERE sentiment IS NULL
         ORDER BY ts
-        LIMIT {batch_size}
+        LIMIT %(limit)s
     """
-    df = pd.read_sql(query, engine)
+    df = pd.read_sql(query, engine, params={"limit": int(batch_size)})
     if df.empty:
         return 0
 
