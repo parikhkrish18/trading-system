@@ -34,6 +34,7 @@ from data.ingest.news import ingest_news
 from data.ingest.universe import load_active_universe
 from execution.approval_gate import ProposedTrade, request_approval
 from execution.broker import get_broker
+from execution.trading_loop import current_pnl_by_symbol
 from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
 from models.screener import run_screen
@@ -319,6 +320,7 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
             index=0, symbol=c.symbol, action="open", side=c.side,
             target_position_pct=c.target_position_pct,
             predicted_return=c.predicted_return, reason="reactivation",
+            reasoning=c.reasoning,
         )
         for c in candidates
     ]
@@ -414,10 +416,17 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         return results
 
     gate = request_fn if request_fn is not None else request_approval
+    # Each close proposal carries the contradiction evidence and the
+    # position's current P&L, so the phone message says WHY the system
+    # wants out and what the position stands at — not just "close X".
+    pnl_by_symbol = current_pnl_by_symbol(broker)
     proposals = [
         ProposedTrade(
             index=0, symbol=r.symbol, action="close", side=r.side,
             target_position_pct=0.0, reason="contradiction",
+            reasoning=[reasoning.phase_contradiction(r.reasons)],
+            current_pnl_pct=pnl_by_symbol.get(r.symbol, (None, None))[0],
+            current_pnl_usd=pnl_by_symbol.get(r.symbol, (None, None))[1],
         )
         for r in flagged
     ]

@@ -213,6 +213,69 @@ def test_run_cycle_closes_positions_not_in_new_candidate_set(monkeypatch):
     assert result.orders_placed == 3
 
 
+def test_run_cycle_proposals_carry_reasoning_and_close_pnl(monkeypatch):
+    """
+    The human on the phone must see WHY: open proposals carry the
+    screener's reasoning phases, close proposals carry a phase-4 story and
+    the position's current P&L when the broker can report it.
+    """
+    broker = _FakeBroker(positions={"OLD1": 10.0})
+    broker.get_positions_detailed = lambda: [
+        {"symbol": "OLD1", "qty": 10.0, "unrealized_plpc": 0.042, "unrealized_pl": 421.5}
+    ]
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+
+    candidate = _candidate("TSLA", "long", 0.5)
+    candidate.reasoning = [
+        reasoning.phase_signals("trend", [{"feature_name": "mom_ret_5d", "value": 0.05, "contribution": 0.02}]),
+        reasoning.phase_forecast(0.02, 0.9, 0.018),
+    ]
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [candidate])
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"TSLA": 100.0})
+
+    seen = {}
+
+    def capturing_gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["TSLA", "OLD1"], request_fn=capturing_gate)
+
+    by_symbol = {p.symbol: p for p in seen["proposals"]}
+    open_p = by_symbol["TSLA"]
+    assert open_p.reasoning is candidate.reasoning
+    close_p = by_symbol["OLD1"]
+    assert close_p.current_pnl_pct == pytest.approx(0.042)
+    assert close_p.current_pnl_usd == pytest.approx(421.5)
+    assert close_p.reasoning and close_p.reasoning[0]["phase"] == 4
+
+
+def test_run_cycle_proposals_survive_a_broker_without_pnl_support(monkeypatch):
+    """No get_positions_detailed on the broker — proposals go out without P&L, the gate is not blocked."""
+    broker = _FakeBroker(positions={"OLD1": 10.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [])
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {})
+
+    seen = {}
+
+    def capturing_gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["OLD1"], request_fn=capturing_gate)
+
+    (close_p,) = seen["proposals"]
+    assert close_p.current_pnl_pct is None
+    assert close_p.current_pnl_usd is None
+
+
 def test_run_cycle_no_candidates_still_closes_stale_positions(monkeypatch):
     """Zero confidence this cycle should mean fully in cash, not 'leave whatever was open.'"""
     broker = _FakeBroker(positions={"OLD1": 10.0})

@@ -115,6 +115,25 @@ def _run_breaker_check(broker, engine) -> list:
     )
 
 
+def current_pnl_by_symbol(broker) -> dict[str, tuple[float | None, float | None]]:
+    """
+    {symbol: (unrealized P&L %, unrealized P&L $)} for every open position,
+    for the approval message's close proposals. Best-effort: a broker
+    without get_positions_detailed (or a failing call) yields {} and the
+    proposals simply omit the P&L rather than blocking the gate.
+    """
+    if not hasattr(broker, "get_positions_detailed"):
+        return {}
+    try:
+        return {
+            p["symbol"]: (p.get("unrealized_plpc"), p.get("unrealized_pl"))
+            for p in broker.get_positions_detailed()
+        }
+    except Exception:
+        logger.warning("Could not fetch position P&L for the approval message — proposing without it.")
+        return {}
+
+
 def _flatten_and_alert(broker, reason: str) -> None:
     logger.critical("Circuit breaker triggered: %s — flattening all positions.", reason)
     broker.flatten_all()
@@ -242,13 +261,17 @@ def run_cycle(
     # inside run_screen — surface a one-line summary per phase here so Slack
     # gets the same 7-phase breakdown the dashboard shows per position.
     for phase_num in (2, 3, 4):
-        summaries = [
-            f"{c.symbol}: {next(p['summary'] for p in c.reasoning if p['phase'] == phase_num)}"
+        # next(..., None): a candidate missing a phase must cost a summary
+        # line, not crash the whole trading cycle with StopIteration.
+        with_phase = [
+            (c.symbol, next((p for p in c.reasoning if p["phase"] == phase_num), None))
             for c in candidates
             if c.reasoning
         ]
-        if summaries:
-            title = next(p["title"] for c in candidates for p in (c.reasoning or []) if p["phase"] == phase_num)
+        with_phase = [(symbol, p) for symbol, p in with_phase if p is not None]
+        if with_phase:
+            title = with_phase[0][1]["title"]
+            summaries = [f"{symbol}: {p['summary']}" for symbol, p in with_phase]
             send_slack_alert(f"Phase {phase_num} — {title}: " + " | ".join(summaries), severity="info")
 
     if dry_run:
@@ -277,11 +300,19 @@ def run_cycle(
     # human approved: one numbered Telegram message (closes first, then
     # opens), replies polled until answered or timeout, silence = rejected.
     # request_fn is injectable for tests; the default asks a real phone.
+    # Every proposal carries its "why" (the screener's reasoning phases for
+    # opens, the selection story for closes) plus current P&L for closes —
+    # the human on the phone gets the same explanation Slack and the
+    # dashboard do, not just a ticker and a size.
+    pnl_by_symbol = current_pnl_by_symbol(broker)
     proposals = [
         ProposedTrade(
             index=0, symbol=s, action="close",
             side="long" if current_positions.get(s, 0) >= 0 else "short",
             target_position_pct=0.0, reason="out_of_book",
+            reasoning=[reasoning.phase_selection_closed(s)],
+            current_pnl_pct=pnl_by_symbol.get(s, (None, None))[0],
+            current_pnl_usd=pnl_by_symbol.get(s, (None, None))[1],
         )
         for s in closing_symbols
     ] + [
@@ -289,6 +320,7 @@ def run_cycle(
             index=0, symbol=c.symbol, action="open", side=c.side,
             target_position_pct=c.target_position_pct,
             predicted_return=c.predicted_return, reason="screen",
+            reasoning=c.reasoning,
         )
         for c in candidates
     ]

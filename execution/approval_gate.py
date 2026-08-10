@@ -81,6 +81,15 @@ class ProposedTrade:
     target_position_pct: float  # 0.0 for closes
     predicted_return: float | None = None
     reason: str = "screen"  # screen | out_of_book | contradiction | reactivation
+    # The screener/monitor's plain-English reasoning phases (see
+    # monitoring/reasoning.py) — the same explanations Slack and the
+    # dashboard already get. A human asked to approve a trade on a phone
+    # deserves the "why", not just the ticker and the size.
+    reasoning: list[dict] | None = None
+    # For closes: how the position is doing right now, so "close this" is a
+    # decision about a known P&L, not a mystery. None when unavailable.
+    current_pnl_pct: float | None = None
+    current_pnl_usd: float | None = None
 
 
 @dataclasses.dataclass
@@ -179,15 +188,55 @@ def number_proposals(proposals: list[ProposedTrade]) -> list[ProposedTrade]:
     return ordered
 
 
+# A why-line longer than this stops being phone-readable — trimmed, because
+# the reasoning phases were written for a dashboard, not a lock screen.
+MAX_WHY_CHARS = 200
+
+
+def short_why(p: ProposedTrade) -> str | None:
+    """
+    One phone-sized line of "why", built from the proposal's reasoning
+    phases: the signals/forecast summaries (phases 2-3) when present,
+    falling back to the selection story (phase 4). None if there is no
+    reasoning at all — the line is simply omitted, never invented.
+    """
+    if not p.reasoning:
+        return None
+    summaries = [ph.get("summary", "") for ph in p.reasoning if ph.get("phase") in (2, 3) and ph.get("summary")]
+    if not summaries:
+        summaries = [ph.get("summary", "") for ph in p.reasoning if ph.get("summary")][:1]
+    if not summaries:
+        return None
+    why = " ".join(summaries)
+    if len(why) > MAX_WHY_CHARS:
+        why = why[: MAX_WHY_CHARS - 1].rstrip() + "…"
+    return why
+
+
 def format_proposal_line(p: ProposedTrade) -> str:
-    """One proposal, one line, numbered so a reply can say "approve 2"."""
+    """
+    One proposal, numbered so a reply can say "approve 2". First line is
+    the decision (action, symbol, size, and for closes the current P&L);
+    an indented second line says why, when the engine attached a reason.
+    """
     label = _REASON_LABELS.get(p.reason, p.reason)
     if p.action == "close":
-        return f"{p.index}. CLOSE {p.side.upper()} {p.symbol} — {label}"
-    line = f"{p.index}. OPEN {p.side.upper()} {p.symbol} — {abs(p.target_position_pct):.1%} of portfolio"
-    if p.predicted_return is not None:
-        line += f" | expected {p.predicted_return:+.1%}"
-    return f"{line} ({label})"
+        line = f"{p.index}. CLOSE {p.side.upper()} {p.symbol} — {label}"
+        if p.current_pnl_pct is not None:
+            pnl = f" | P&L {p.current_pnl_pct:+.1%}"
+            if p.current_pnl_usd is not None:
+                pnl += f" (${p.current_pnl_usd:+,.0f})"
+            line += pnl
+    else:
+        line = f"{p.index}. OPEN {p.side.upper()} {p.symbol} — {abs(p.target_position_pct):.1%} of portfolio"
+        if p.predicted_return is not None:
+            line += f" | expected {p.predicted_return:+.1%}"
+        line += f" ({label})"
+
+    why = short_why(p)
+    if why:
+        line += f"\n   {why}"
+    return line
 
 
 def format_proposal_message(proposals: list[ProposedTrade], context: str, timeout_s: int) -> str:

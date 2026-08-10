@@ -137,6 +137,76 @@ def test_proposal_message_is_plain_text_with_no_markdown():
     assert "*" not in message and "`" not in message and "_" not in message
 
 
+def _phases(*summaries_by_phase):
+    return [
+        {"phase": phase, "title": f"Phase {phase}", "summary": summary, "lines": []}
+        for phase, summary in summaries_by_phase
+    ]
+
+
+def test_proposal_line_includes_the_why_when_reasoning_is_attached():
+    p = _open("NVDA", index=1)
+    p.reasoning = _phases(
+        (2, "Regime: trend. Strongest driver: 5-day price momentum."),
+        (3, "+3.1% forecast, 100% model agreement."),
+    )
+    line = approval_gate.format_proposal_line(p)
+    first, why = line.splitlines()
+    assert first.startswith("1. OPEN LONG NVDA — 12.0% of portfolio")
+    assert "Regime: trend" in why
+    assert "100% model agreement" in why
+
+
+def test_proposal_line_without_reasoning_keeps_the_old_single_line_shape():
+    line = approval_gate.format_proposal_line(_open("NVDA", index=1))
+    assert "\n" not in line
+
+
+def test_close_proposal_shows_current_pnl():
+    p = _close("TSLA", index=1)
+    p.current_pnl_pct = 0.042
+    p.current_pnl_usd = 421.5
+    line = approval_gate.format_proposal_line(p)
+    assert "P&L +4.2%" in line
+    assert "$+422" in line or "$+421" in line
+
+
+def test_close_proposal_with_no_pnl_omits_the_field_rather_than_guessing():
+    line = approval_gate.format_proposal_line(_close("TSLA", index=1))
+    assert "P&L" not in line
+
+
+def test_why_falls_back_to_the_selection_story_for_closes():
+    p = _close("AAPL", index=1)
+    p.reasoning = _phases((4, "AAPL was not one of this cycle's top picks."))
+    line = approval_gate.format_proposal_line(p)
+    assert "not one of this cycle's top picks" in line
+
+
+def test_why_is_trimmed_to_stay_phone_readable():
+    p = _open("NVDA", index=1)
+    p.reasoning = _phases((2, "x" * 500))
+    why_line = approval_gate.format_proposal_line(p).splitlines()[1]
+    assert len(why_line) <= approval_gate.MAX_WHY_CHARS + 4  # indent + ellipsis
+    assert why_line.endswith("…")
+
+
+def test_message_with_reasoning_still_numbers_every_proposal_and_keeps_the_footer():
+    """The reply grammar contract: numbered proposals, same instructions."""
+    close = _close("TSLA")
+    close.reasoning = _phases((2, "Contradiction detected via: news_sentiment."))
+    close.current_pnl_pct = -0.021
+    open_ = _open("NVDA")
+    open_.reasoning = _phases((2, "Regime: trend."), (3, "+3.1% forecast, 100% model agreement."))
+    proposals = number_proposals([close, open_])
+
+    message = format_proposal_message(proposals, "weekly cycle", timeout_s=900)
+    assert "1. CLOSE LONG TSLA" in message
+    assert "2. OPEN LONG NVDA" in message
+    assert 'Reply "approve 1", "reject 2 3", or "approve all"' in message
+    assert "Numbers refer to THIS message only." in message
+
+
 def test_ack_message_says_what_happened_to_each_number():
     proposals = number_proposals([_close("TSLA"), _open("NVDA")])
     outcome = ApprovalOutcome(
