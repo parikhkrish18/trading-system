@@ -1,21 +1,23 @@
 """
-Telegram Bot API transport — the SEND half of the approval loop's human step.
+Telegram Bot API transport — the wire under execution/approval_gate.py.
 
-execution/approval_loop.py has always been able to *format* a proposal a human
-could read on a phone; it had no way to actually put it on one. This module is
-that wire, and nothing more: it can push text into a chat and it can read back
-enough of getUpdates to discover a chat id during setup.
+approval_gate.py formats the numbered trade proposals, decides what a reply
+means, and enforces the fail-closed rules; this module is only the transport
+underneath it: push text into a chat, read raw getUpdates back (for reply
+polling and for chat-id discovery during setup), and nothing else.
 
-DELIBERATELY SEND-ONLY. There is no reply parsing, no approve/reject grammar,
-no polling loop here. approval_loop.request_approvals — the function that would
-turn a chat reply into an order — is still a stub, and this module gives it
-nothing it could be built out of by accident. Approval remains a local,
-console-side act. That boundary is the point: a message arriving on a phone is
-a notification, and a notification cannot trade.
+TRANSPORT ONLY. There is no reply parsing, no approve/reject grammar, and no
+polling loop here — all of that lives in approval_gate.py, where it is tested
+against the fail-closed rules. This module hands back raw updates and filtered
+plain-text replies (replies_from); deciding that a reply approves a trade is
+the gate's business alone.
 
 Also deliberately dependency-free of the rest of execution/: this module
 imports settings and requests, and nothing that knows what a broker is. It is
 structurally incapable of placing an order.
+
+Setup (one-time chat-id discovery):
+    python -m execution.telegram --setup
 
 No new libraries. data/ingest/http.py's polygon_get is the repo's other HTTP
 retry helper, but it is a GET with Polygon's quota baked into its pacing and
@@ -57,7 +59,7 @@ MISSING_TOKEN_MESSAGE = (
 MISSING_CHAT_ID_MESSAGE = (
     "TELEGRAM_CHAT_ID is not set — nothing was sent.\n"
     "Send your bot any message on Telegram, then run:\n"
-    "  python -m execution.approval_loop --telegram-setup\n"
+    "  python -m execution.telegram --setup\n"
     "and copy the chat id it prints into .env as TELEGRAM_CHAT_ID=..."
 )
 
@@ -177,7 +179,7 @@ def send_message(
     parse_mode is deliberately not set. The proposal strings carry %, +, -, |
     and _ characters that Markdown and HTML modes would either mangle or reject
     outright, and escaping rules have no business leaking back into the
-    formatting code in approval_loop.py.
+    formatting code in approval_gate.py.
 
     Raises TelegramError if credentials are missing — callers that want the
     friendly "not configured, carrying on" behaviour check configured() first.
@@ -209,7 +211,7 @@ def fetch_updates(
 
     Two modes, both driven by the caller:
 
-    offset=None (the default, used by --telegram-setup) consumes nothing.
+    offset=None (the default, used by `--setup` chat-id discovery) consumes nothing.
     Telegram keeps an unacknowledged update for about 24 hours and will keep
     handing it back, which is what setup wants: look, don't disturb.
 
@@ -333,3 +335,53 @@ def chat_candidates(updates: list[dict]) -> list[dict]:
             "text": str(message.get("text", "")),
         }
     return list(seen.values())
+
+
+def run_setup() -> None:
+    """
+    One-time chat-id discovery: list every chat the bot has seen recently so
+    the right id can be copied into .env as TELEGRAM_CHAT_ID. Read-only —
+    fetches updates without acknowledging them (offset=None), so nothing the
+    approval gate might later need to read is consumed.
+    """
+    token, _ = credentials()
+    if not token:
+        print(MISSING_TOKEN_MESSAGE)
+        return
+
+    try:
+        chats = chat_candidates(fetch_updates(token))
+    except TelegramError as exc:
+        print(f"Could not fetch updates: {exc}")
+        return
+
+    if not chats:
+        print(
+            "No chats found. Send your bot any message on Telegram first "
+            "(find it by the username you gave @BotFather), then re-run this."
+        )
+        return
+
+    print("Chats the bot has seen (newest first):\n")
+    for chat in chats:
+        print(f"  chat_id={chat['chat_id']}  [{chat['kind']}]  {chat['name']}  — last message: {chat['text']!r}")
+    print("\nCopy the right chat_id into .env as TELEGRAM_CHAT_ID=...")
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Telegram transport utilities for the approval gate.")
+    parser.add_argument(
+        "--setup", action="store_true",
+        help="List chats the bot has seen, to discover the TELEGRAM_CHAT_ID value.",
+    )
+    args = parser.parse_args()
+    if args.setup:
+        run_setup()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

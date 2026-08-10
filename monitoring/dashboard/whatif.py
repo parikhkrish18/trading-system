@@ -9,9 +9,9 @@ sitting in the `decisions` row the screener wrote; the panel only asks "which of
 these would still have made the cut". That is what makes it safe to recompute on
 every slider tick.
 
-Split from monitoring/dashboard/app.py for the same reason as picks.py and
-evidence.py: the filtering rule is the part worth testing, and it shouldn't need
-Streamlit or a database to run.
+Kept apart from monitoring/dashboard/server.py for the same reason as picks.py:
+the filtering rule is the part worth testing, and it shouldn't need an HTTP
+server or a database to run.
 """
 from __future__ import annotations
 

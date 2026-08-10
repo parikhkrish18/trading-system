@@ -16,7 +16,7 @@ ingest:
 	python -m data.ingest.prices --universe --backfill-years 5
 
 screen:
-	python -m models.screener --feature-set-id v3 --universe --top-k 10
+	python -m models.screener --feature-set-id v3 --universe
 
 test:
 	pytest -v

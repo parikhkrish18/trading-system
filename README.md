@@ -81,9 +81,10 @@ Stubbed with a clear interface, needs a vendor/API key + your judgment calls:
   model once you have walk-forward infra validated and labeled regime history;
   no vendor needed, this one's a training-data problem, not an API problem)
 
-Explicitly **not built yet**: nothing wires the screener's output to
-`execution/broker.py` — it produces and logs candidates, it doesn't place
-orders. That's the next step before paper trading can actually run.
+The screener-to-broker wiring above (`execution/trading_loop.py`, driven by
+`scripts/run_weekly_cycle.py`) is paper-only by construction: it never passes
+`confirm_live=True` to `get_broker()`, so going live requires deliberately
+editing code, not flipping an environment variable.
 
 ## Quickstart
 
@@ -98,7 +99,7 @@ python -m data.ingest.fundamentals --universe   # slow on a rate-limited Polygon
 python -m data.ingest.news --universe
 python -m features.build_features --universe --feature-set-id v3
 python -m models.train --universe --feature-set-id v3 --n-folds 6
-python -m models.screener --universe --feature-set-id v3 --top-k 10
+python -m models.screener --universe --feature-set-id v3   # book size comes from SCREENER_TOP_K in .env, default 10
 pytest                                    # run unit tests
 ```
 
