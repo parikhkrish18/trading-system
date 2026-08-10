@@ -27,6 +27,7 @@ from collections.abc import Callable
 import pandas as pd
 from sqlalchemy.dialects.postgresql import JSONB
 
+from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine
 from data.ingest.universe import resolve_symbols
@@ -39,6 +40,13 @@ from risk.sizing import scale_to_full_deployment, target_position_size
 logger = logging.getLogger(__name__)
 
 _MODEL_VERSION = "ensemble_v1"
+
+# A trade whose predicted move doesn't even cover getting in and out is a
+# guaranteed loser even when the prediction is right. min_abs_return
+# therefore floors at the estimated round-trip transaction cost (see
+# backtest/cost_model.py — the spread-only minimum without ADV data)
+# instead of the old 0.0, which passed literally any nonzero forecast.
+DEFAULT_MIN_ABS_RETURN = round_trip_cost_fraction()
 
 
 @dataclasses.dataclass
@@ -78,13 +86,16 @@ def score_universe(
     latest_features: pd.DataFrame,
     feature_cols: list[str],
     min_direction_agreement: float = 0.8,
-    min_abs_return: float = 0.0,
+    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
 ) -> pd.DataFrame:
     """
     latest_features: one row per symbol (see load_latest_features), with a
     'symbol' column plus all of `feature_cols` (missing ones are fine —
     LightGBM handles NaN features natively).
     Returns: symbol, predicted_return, direction_agreement, conviction_score, confident.
+
+    min_abs_return defaults to the estimated round-trip transaction cost:
+    a prediction smaller than the cost of trading it is not "confident".
     """
     empty = pd.DataFrame(
         columns=["symbol", "predicted_return", "direction_agreement", "conviction_score", "confident"]
@@ -329,7 +340,7 @@ def run_screen(
     target_horizon_days: int = 5,
     n_ensemble_models: int = 5,
     min_direction_agreement: float = 0.8,
-    min_abs_return: float = 0.0,
+    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
     total_deploy_pct: float = 1.0,
@@ -485,7 +496,11 @@ def main() -> None:
     parser.add_argument("--target-horizon-days", type=int, default=5)
     parser.add_argument("--n-ensemble-models", type=int, default=5)
     parser.add_argument("--min-direction-agreement", type=float, default=0.8)
-    parser.add_argument("--min-abs-return", type=float, default=0.0)
+    parser.add_argument(
+        "--min-abs-return", type=float, default=DEFAULT_MIN_ABS_RETURN,
+        help="Minimum |predicted return| to shortlist. Defaults to the estimated round-trip "
+             "transaction cost — a prediction below the cost of trading it is a guaranteed loser.",
+    )
     parser.add_argument("--log", action="store_true", help="Write the shortlist to the decisions table.")
     args = parser.parse_args()
 

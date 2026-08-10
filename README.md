@@ -142,3 +142,15 @@ tests/       unit tests
 - MLflow (self-hosted) for model/run tracking.
 - S&P 500 as the tradeable universe — not a broader index, to keep vendor
   rate limits and data quality manageable on a free-tier API key.
+
+## Known evaluation caveat: survivorship bias
+
+The universe is scraped from **today's** Wikipedia S&P 500 list. Any
+backtest or walk-forward run over history therefore only ever sees
+companies that survived long enough to still be in the index now — the
+losers that were removed (bankrupt, acquired at a discount, demoted) are
+exactly the names the evaluation can't see, which biases every historical
+metric upward. Every universe refresh now appends a dated membership
+snapshot to the `universe_snapshot` table (`data/schema/006_universe_snapshot.sql`),
+so runs from here on can use point-in-time membership; history from before
+the first snapshot stays biased and should be read accordingly.

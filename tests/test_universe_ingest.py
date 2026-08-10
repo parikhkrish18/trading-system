@@ -83,9 +83,7 @@ def test_refresh_universe_deactivates_removed_symbols(monkeypatch):
     upsert_calls = {}
 
     def fake_upsert(df, table, conflict_cols):
-        upsert_calls["df"] = df
-        upsert_calls["table"] = table
-        upsert_calls["conflict_cols"] = conflict_cols
+        upsert_calls[table] = {"df": df, "conflict_cols": conflict_cols}
         return len(df)
 
     executed = {}
@@ -95,9 +93,14 @@ def test_refresh_universe_deactivates_removed_symbols(monkeypatch):
     n = universe.refresh_universe()
 
     assert n == 2
-    assert upsert_calls["table"] == "universe"
-    assert upsert_calls["conflict_cols"] == ["symbol"]
-    assert (upsert_calls["df"]["is_active"]).all()
+    assert upsert_calls["universe"]["conflict_cols"] == ["symbol"]
+    assert (upsert_calls["universe"]["df"]["is_active"]).all()
+    # Every refresh also appends a dated membership snapshot, so future
+    # backtests can use point-in-time membership instead of today's winners.
+    snapshot = upsert_calls["universe_snapshot"]
+    assert snapshot["conflict_cols"] == ["snapshot_date", "symbol"]
+    assert set(snapshot["df"]["symbol"]) == {"MMM", "TSLA"}
+    assert "snapshot_date" in snapshot["df"].columns
     # Deactivation is parameterized now — symbols travel as bind params, not
     # spliced into the SQL string.
     assert "is_active = FALSE" in executed["stmt"]

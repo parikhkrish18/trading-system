@@ -30,6 +30,31 @@ def slippage_bps(
     return base_spread_bps + impact_coefficient * participation
 
 
+def round_trip_cost_fraction(
+    trade_shares: float = 0.0,
+    price: float = 100.0,
+    avg_daily_volume: float = 0.0,
+    commission_per_share: float = 0.0,
+    base_spread_bps: float = 1.0,
+    impact_coefficient: float = 10.0,
+) -> float:
+    """
+    Estimated round-trip (entry + exit) cost as a FRACTION of trade value —
+    the hurdle a predicted return has to clear before a trade is worth
+    making at all. With the defaults (no volume data, so participation ~ 0)
+    this is the spread-only floor: 2 x base_spread_bps = 0.0002. That is
+    deliberately the *minimum* honest estimate; pass real ADV/shares to get
+    the impact-inclusive number.
+
+    Used by models/train.py (cost-adjusted fold metrics) and
+    models/screener.py (min_abs_return default) so the evaluation harness
+    and the live screener agree on what a trade costs.
+    """
+    per_side_fraction = slippage_bps(trade_shares, avg_daily_volume, base_spread_bps, impact_coefficient) / 10_000
+    commission_fraction = commission_per_share / price if price > 0 else 0.0
+    return 2 * (per_side_fraction + commission_fraction)
+
+
 def total_transaction_cost(
     trade_shares: float,
     price: float,
