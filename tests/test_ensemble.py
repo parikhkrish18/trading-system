@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from models.forecast.ensemble import EnsembleForecastModel
+from models.forecast.ensemble import EnsembleForecastModel, recent_window_mask
 
 
 def _synthetic_data(n=200, seed=0):
@@ -61,6 +61,64 @@ def test_ensemble_members_actually_differ_across_seeds():
 
     result = ensemble.predict(X)
     assert result["std_prediction"].mean() > 0
+
+
+def test_ensemble_predict_members_matches_predict_mean():
+    X, y = _synthetic_data()
+    ensemble = EnsembleForecastModel(n_models=3, num_boost_round=20, base_seed=1)
+    ensemble.fit(X, y)
+
+    members = ensemble.predict_members(X)
+    summary = ensemble.predict(X)
+
+    assert list(members.columns) == ["member_0", "member_1", "member_2"]
+    np.testing.assert_allclose(members.mean(axis=1), summary["mean_prediction"])
+
+
+def test_structural_diversity_varies_member_params():
+    X, y = _synthetic_data()
+    ensemble = EnsembleForecastModel(n_models=5, num_boost_round=20, base_seed=1, diversity="structural")
+    ensemble.fit(X, y)
+
+    num_leaves = {m.params["num_leaves"] for m in ensemble.models}
+    feature_fractions = {m.params["feature_fraction"] for m in ensemble.models}
+    assert len(num_leaves) > 1
+    assert len(feature_fractions) > 1
+
+
+def test_structural_diversity_disagrees_more_than_seed_only():
+    """
+    The entire reason "structural" exists: seed-only members are near
+    clones, so their spread understates real model uncertainty.
+    """
+    X, y = _synthetic_data(n=400)
+    ts = pd.Series(pd.date_range("2025-01-01", periods=len(X)))
+
+    seed_only = EnsembleForecastModel(n_models=5, num_boost_round=50, base_seed=1)
+    seed_only.fit(X, y)
+    structural = EnsembleForecastModel(n_models=5, num_boost_round=50, base_seed=1, diversity="structural")
+    structural.fit(X, y, ts=ts)
+
+    assert structural.predict(X)["std_prediction"].mean() > seed_only.predict(X)["std_prediction"].mean()
+
+
+def test_recent_window_mask_keeps_recent_dates_across_symbols():
+    # Two symbols interleaved: date-based masking must keep the recent 40%
+    # of *dates* for both symbols, not the tail 40% of rows (which would be
+    # entirely the second symbol).
+    dates = pd.date_range("2025-01-01", periods=10)
+    ts = pd.Series(list(dates) + list(dates))  # symbol A rows then symbol B rows
+    mask = recent_window_mask(ts, window_frac=0.4)
+
+    assert mask.sum() == 8  # 4 recent dates x 2 symbols
+    kept = ts[mask]
+    assert kept.min() == dates[6]
+    assert set(kept) == set(dates[6:])
+
+
+def test_invalid_diversity_raises():
+    with pytest.raises(ValueError, match="diversity"):
+        EnsembleForecastModel(diversity="chaos")
 
 
 def test_ensemble_predict_before_fit_raises():
