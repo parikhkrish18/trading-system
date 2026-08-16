@@ -1,6 +1,9 @@
+import sys
+
 import pandas as pd
 import pytest
 
+from data.ingest import universe
 from features import build_features
 from features.build_features import (
     build_and_store,
@@ -126,3 +129,44 @@ def test_build_and_store_lookback_years_is_configurable(monkeypatch):
     build_and_store(["AAPL"], "v3", lookback_years=1)
 
     assert "interval '1 years'" in captured["queries"][0]
+
+
+def test_main_universe_flag_builds_the_active_universe(monkeypatch):
+    """
+    --universe was documented in the README and in data/ingest/universe.py's
+    docstring but never implemented here, so a full-universe rebuild meant
+    hand-pasting ~500 tickers. It must resolve to the active universe list
+    the ingest CLIs use, not to a --symbols string.
+    """
+    captured = {}
+    # resolve_symbols looks load_active_universe up in its own module globals.
+    monkeypatch.setattr(universe, "load_active_universe", lambda: ["AAPL", "MSFT"])
+    monkeypatch.setattr(
+        build_features, "build_and_store",
+        lambda symbols, feature_set_id: captured.update(symbols=symbols, fsid=feature_set_id) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["build_features", "--universe", "--feature-set-id", "v4"])
+
+    build_features.main()
+
+    assert captured["symbols"] == ["AAPL", "MSFT"]
+    assert captured["fsid"] == "v4"
+
+
+def test_main_still_accepts_an_explicit_symbol_list(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        build_features, "build_and_store",
+        lambda symbols, feature_set_id: captured.update(symbols=symbols) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["build_features", "--symbols", "aapl,msft", "--feature-set-id", "v4"])
+
+    build_features.main()
+
+    assert captured["symbols"] == ["AAPL", "MSFT"]
+
+
+def test_main_requires_one_of_symbols_or_universe(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["build_features", "--feature-set-id", "v4"])
+    with pytest.raises(SystemExit):
+        build_features.main()

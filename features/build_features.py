@@ -9,6 +9,7 @@ reuse an old id with new logic.
 
 Usage:
     python -m features.build_features --symbols SPY,QQQ,TQQQ,SQQQ --feature-set-id v1
+    python -m features.build_features --universe --feature-set-id v1
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from data.ingest.db import get_engine, symbol_in_clause, upsert_dataframe
+from data.ingest.universe import resolve_symbols
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
 from features.quant.momentum import adx, rolling_return
 from features.quant.volatility import atr, realized_vol, vol_of_vol
@@ -243,10 +245,16 @@ def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build and store versioned feature set.")
-    parser.add_argument("--symbols", required=True, help="Comma-separated tickers")
+    parser.add_argument("--symbols", default=None, help="Comma-separated tickers")
+    parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
     parser.add_argument("--feature-set-id", required=True, help="e.g. 'v1' — bump when feature logic changes")
     args = parser.parse_args()
-    symbols = [s.strip().upper() for s in args.symbols.split(",")]
+    # Was --symbols-only, while the README and data/ingest/universe.py's
+    # docstring both already documented --universe here: a full-universe
+    # rebuild meant hand-pasting ~500 tickers onto the command line. Uses the
+    # same resolve_symbols helper as the ingest scripts so all four CLIs agree
+    # on what --universe/--symbols mean.
+    symbols = resolve_symbols(args.symbols, args.universe)
     n = build_and_store(symbols, args.feature_set_id)
     print(f"Stored {n} feature rows under feature_set_id={args.feature_set_id!r}.")
 
