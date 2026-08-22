@@ -16,13 +16,21 @@ from __future__ import annotations
 
 import logging
 
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# How far through the latest quote to price an extended-hours limit order,
+# as a fraction (0.005 = 0.5%). Extended-hours liquidity is thin, so pricing
+# exactly at the last quote often just sits unfilled; this buys a modest
+# amount of fill probability without accepting an unbounded price.
+_EXTENDED_HOURS_LIMIT_BUFFER_PCT = 0.005
 
 
 class AlpacaBroker:
@@ -48,6 +56,8 @@ class AlpacaBroker:
             raise RuntimeError(f"Alpaca {mode} API credentials are not set in the environment.")
 
         self.client = TradingClient(api_key, secret_key, paper=(mode == "paper"))
+        # Market data is the same feed regardless of paper/live trading mode.
+        self.data_client = StockHistoricalDataClient(api_key, secret_key)
 
     def get_account(self) -> dict:
         account = self.client.get_account()
@@ -56,6 +66,29 @@ class AlpacaBroker:
     def get_positions(self) -> dict[str, float]:
         positions = self.client.get_all_positions()
         return {p.symbol: float(p.qty) for p in positions}
+
+    def get_positions_detailed(self) -> list[dict]:
+        """
+        Richer than get_positions() (which stays {symbol: qty} exactly as-is
+        since execution/reconciliation.py and trading_loop.py depend on that
+        contract) — for display purposes, e.g. the dashboard's position
+        overview: entry price, live price, P&L, market value.
+        """
+        positions = self.client.get_all_positions()
+        return [
+            {
+                "symbol": p.symbol,
+                "qty": float(p.qty),
+                "side": str(p.side.value) if hasattr(p.side, "value") else str(p.side),
+                "avg_entry_price": float(p.avg_entry_price),
+                "current_price": float(p.current_price),
+                "market_value": float(p.market_value),
+                "cost_basis": float(p.cost_basis),
+                "unrealized_pl": float(p.unrealized_pl),
+                "unrealized_plpc": float(p.unrealized_plpc),
+            }
+            for p in positions
+        ]
 
     def get_portfolio_value(self) -> float:
         return float(self.client.get_account().equity)
@@ -72,12 +105,39 @@ class AlpacaBroker:
         asset = self.client.get_asset(symbol)
         return bool(getattr(asset, "shortable", False) and getattr(asset, "easy_to_borrow", False))
 
+    def _extended_hours_limit_price(self, symbol: str, side: OrderSide) -> float:
+        """
+        Extended-hours orders must be limit orders (no market orders
+        accepted outside RTH at all) — price it through the latest quote by
+        _EXTENDED_HOURS_LIMIT_BUFFER_PCT to have a realistic chance of
+        filling against thin extended-hours liquidity, without leaving the
+        price fully open-ended.
+        """
+        quote = self.data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))[symbol]
+        reference_price = (quote.ask_price if side == OrderSide.BUY else quote.bid_price) or quote.ask_price or quote.bid_price
+        if not reference_price:
+            raise RuntimeError(f"No quote available for {symbol} — can't price an extended-hours order.")
+
+        multiplier = 1 + _EXTENDED_HOURS_LIMIT_BUFFER_PCT if side == OrderSide.BUY else 1 - _EXTENDED_HOURS_LIMIT_BUFFER_PCT
+        return round(reference_price * multiplier, 2)
+
     def submit_target_position(self, symbol: str, target_shares: float) -> dict | None:
         """
-        Submits a single market order to move from the current position in
+        Submits a single order to move from the current position in
         `symbol` to `target_shares`. Returns the order dict, or None if no
-        trade was needed. Uses whole shares — extend to fractional if your
-        universe needs it, Alpaca supports fractional for many symbols.
+        trade was needed.
+
+        Fractional shares by default (Alpaca supports it for most symbols)
+        — except: (a) orders that open or increase a short position, which
+        Alpaca rejects outright if fractional ("fractional orders cannot be
+        sold short"), and (b) extended-hours orders, which Alpaca also
+        requires as whole shares. Both get rounded.
+
+        Outside regular trading hours, market orders aren't accepted at
+        all — switches to a limit order priced via _extended_hours_limit_price,
+        unless settings.allow_extended_hours_trading is off, in which case
+        this falls back to the old behavior: submit a normal DAY market
+        order and let it queue until the next open.
         """
         current_positions = self.get_positions()
         current_shares = current_positions.get(symbol, 0.0)
@@ -89,17 +149,51 @@ class AlpacaBroker:
         side = OrderSide.BUY if delta > 0 else OrderSide.SELL
         qty = abs(round(delta, 4))
 
-        logger.info(
-            "Submitting %s order: %s %s shares (mode=%s, current=%s, target=%s)",
-            side, qty, symbol, self.mode, current_shares, target_shares,
-        )
+        if side == OrderSide.SELL and target_shares < 0:
+            qty = float(round(qty))
+            if qty < 1:
+                logger.info("Skipping %s: rounds to 0 whole shares for a short order.", symbol)
+                return None
 
-        order_request = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=side,
-            time_in_force=TimeInForce.DAY,
-        )
+        is_rth = self.client.get_clock().is_open
+        use_extended_hours = not is_rth and settings.allow_extended_hours_trading
+
+        if use_extended_hours:
+            # Truncate, never round up: an order that reduces an existing
+            # position (a sell trimming/closing a long, a buy covering a
+            # short) can't request more shares than are actually held —
+            # rounding 30.8892 up to 31 gets rejected outright ("insufficient
+            # qty available"). Flooring is always safe since it never asks
+            # for more than the fractional amount already covers.
+            qty = float(int(qty))
+            if qty < 1:
+                logger.info("Skipping %s: rounds to 0 whole shares for an extended-hours order.", symbol)
+                return None
+            limit_price = self._extended_hours_limit_price(symbol, side)
+            logger.info(
+                "Submitting extended-hours %s LIMIT order: %s %s shares @ %.2f (mode=%s, current=%s, target=%s)",
+                side, qty, symbol, limit_price, self.mode, current_shares, target_shares,
+            )
+            order_request = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+                extended_hours=True,
+            )
+        else:
+            logger.info(
+                "Submitting %s order: %s %s shares (mode=%s, current=%s, target=%s)",
+                side, qty, symbol, self.mode, current_shares, target_shares,
+            )
+            order_request = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+            )
+
         order = self.client.submit_order(order_request)
         return order.model_dump()
 

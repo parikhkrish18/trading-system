@@ -2,13 +2,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from models.regime.trend_chop_classifier import CHOP, TREND
+from models.regime.trend_chop_classifier import TREND
 from models.screener import (
-    TradeCandidate,
+    _attach_reasoning,
     build_correlation_matrix,
-    log_candidates,
-    per_symbol_regimes,
     score_universe,
+    select_concentrated_trades,
     select_trades,
 )
 
@@ -16,10 +15,11 @@ from models.screener import (
 class _FakeEnsemble:
     """Fakes EnsembleForecastModel.predict with a preset mapping of row index -> stats."""
 
-    def __init__(self, mean_prediction, direction_agreement, std_prediction=None):
+    def __init__(self, mean_prediction, direction_agreement, std_prediction=None, contributions=None):
         self.mean_prediction = mean_prediction
         self.direction_agreement = direction_agreement
         self.std_prediction = std_prediction if std_prediction is not None else [0.0] * len(mean_prediction)
+        self._contributions = contributions
 
     def predict(self, X):
         return pd.DataFrame(
@@ -30,6 +30,9 @@ class _FakeEnsemble:
             },
             index=X.index,
         )
+
+    def predict_contributions(self, X):
+        return self._contributions.loc[X.index]
 
 
 def test_score_universe_computes_conviction_and_confident_flag():
@@ -157,81 +160,267 @@ def test_select_trades_shortable_check_does_not_affect_longs():
     assert len(candidates) == 1
 
 
-def test_per_symbol_regimes_splits_on_adx_threshold():
-    latest = pd.DataFrame({"symbol": ["AAPL", "TSLA", "MMM"], "adx_14": [30.0, 10.0, np.nan]})
-
-    regimes = per_symbol_regimes(latest, adx_threshold=25.0)
-
-    assert regimes == {"AAPL": TREND, "TSLA": CHOP}  # NaN ADX omitted -> caller falls back to TREND
-
-
-def test_per_symbol_regimes_without_adx_column_returns_empty():
-    assert per_symbol_regimes(pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})) == {}
-
-
-def test_select_trades_damps_chop_symbols_and_tags_regime():
+def test_select_concentrated_trades_splits_by_relative_conviction():
     scored = _scored_df(
         [
-            {"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True},
-            {"symbol": "MMM", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
         ]
     )
-    corr = pd.DataFrame(
-        {"AAPL": [1.0, 0.0], "MMM": [0.0, 1.0]}, index=["AAPL", "MMM"]
-    )
+    # conviction_score: AAPL=0.04, TSLA=0.02 -> raw split 2:1 -> 0.667/0.333, within [0.30, 0.70] bounds.
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
 
-    candidates = select_trades(
-        scored,
-        regime=TREND,
-        forecast_scale=0.05,
-        max_position_pct=0.25,
-        max_short_position_pct=0.15,
-        max_correlated_exposure_pct=0.50,
-        correlation_matrix=corr,
-        regime_by_symbol={"AAPL": TREND, "MMM": CHOP},
+    assert len(candidates) == 2
+    by_symbol = {c.symbol: c for c in candidates}
+    assert by_symbol["AAPL"].target_position_pct == pytest.approx(2 / 3, rel=1e-6)
+    assert by_symbol["TSLA"].target_position_pct == pytest.approx(1 / 3, rel=1e-6)
+    # fully deployed
+    assert sum(abs(c.target_position_pct) for c in candidates) == pytest.approx(1.0)
+
+
+def test_select_concentrated_trades_clamps_dominant_leg_at_bound():
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.50, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": 0.01, "direction_agreement": 1.0, "confident": True},
+        ]
     )
+    # Raw split would be ~98/2 — clamped to 70/30 so one pick can't swallow the whole deployment.
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
 
     by_symbol = {c.symbol: c for c in candidates}
-    assert by_symbol["AAPL"].regime == TREND
-    assert by_symbol["MMM"].regime == CHOP
-    # identical forecasts, but the chop symbol must be sized strictly smaller
-    assert abs(by_symbol["MMM"].target_position_pct) < abs(by_symbol["AAPL"].target_position_pct)
+    assert by_symbol["AAPL"].target_position_pct == pytest.approx(0.70)
+    assert by_symbol["TSLA"].target_position_pct == pytest.approx(0.30)
 
 
-def test_select_trades_falls_back_to_global_regime_for_unmapped_symbols():
+def test_select_concentrated_trades_signs_match_forecast_direction():
     scored = _scored_df(
-        [{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+        [
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": -0.02, "direction_agreement": 1.0, "confident": True},
+        ]
     )
-    corr = pd.DataFrame({"AAPL": [1.0]}, index=["AAPL"])
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+    by_symbol = {c.symbol: c for c in candidates}
+    assert by_symbol["AAPL"].side == "long"
+    assert by_symbol["AAPL"].target_position_pct > 0
+    assert by_symbol["TSLA"].side == "short"
+    assert by_symbol["TSLA"].target_position_pct < 0
 
-    candidates = select_trades(
-        scored, regime=TREND, forecast_scale=0.05, max_position_pct=0.25,
-        max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr,
-        regime_by_symbol={"TSLA": CHOP},  # AAPL not in the map
+
+def test_select_concentrated_trades_single_confident_candidate_goes_all_in():
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True}]
+    )
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+
+    assert len(candidates) == 1
+    assert candidates[0].target_position_pct == pytest.approx(1.0)
+
+
+def test_select_concentrated_trades_no_confident_candidates_returns_empty():
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.20, "direction_agreement": 0.55, "confident": False}]
+    )
+    assert select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30) == []
+
+
+def test_select_concentrated_trades_respects_total_deploy_pct():
+    """Regime-based damping (see run_screen) scales both legs down together."""
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30, total_deploy_pct=0.35)
+    assert sum(abs(c.target_position_pct) for c in candidates) == pytest.approx(0.35)
+
+
+def test_select_concentrated_trades_skips_unshortable_and_falls_through_ranking():
+    scored = _scored_df(
+        [
+            {"symbol": "TSLA", "predicted_return": -0.06, "direction_agreement": 1.0, "confident": True},  # unshortable
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "MSFT", "predicted_return": 0.03, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    candidates = select_concentrated_trades(
+        scored, max_leg_pct=0.70, min_leg_pct=0.30,
+        is_shortable_fn=lambda symbol: symbol != "TSLA",
     )
 
-    assert candidates[0].regime == TREND
+    symbols = {c.symbol for c in candidates}
+    assert symbols == {"AAPL", "MSFT"}  # TSLA skipped, next two ranked candidates picked instead
 
 
-def test_log_candidates_writes_regime(monkeypatch):
-    captured = {}
+def test_attach_reasoning_picks_top_features_by_absolute_contribution():
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [1.5], "f2": [-0.5], "f3": [0.1]})
+    # Indexed by symbol, matching what _attach_reasoning's X (latest.set_index("symbol")) actually looks like.
+    contributions = pd.DataFrame(
+        {"f1": [0.03], "f2": [-0.08], "f3": [0.001], "base_value": [0.0]}, index=pd.Index(["AAPL"], name="symbol")
+    )
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
 
-    def fake_to_sql(self, name, engine, **kwargs):
-        captured["table"] = name
-        captured["df"] = self
+    _attach_reasoning(
+        candidates, ensemble, latest, feature_cols=["f1", "f2", "f3"], scored=scored, regime=TREND,
+        max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8, top_n=2,
+    )
 
-    monkeypatch.setattr("models.screener.get_engine", lambda: object())
-    monkeypatch.setattr(pd.DataFrame, "to_sql", fake_to_sql)
+    phases = {p["phase"]: p for p in candidates[0].reasoning}
+    assert set(phases) == {2, 3, 4}
+    lines = " ".join(phases[2]["lines"]).lower()
+    assert lines.index("f2") < lines.index("f1")  # ranked by |contribution|, f3 excluded (top_n=2)
+    assert "f3" not in lines
+
+
+def test_attach_reasoning_empty_candidates_is_noop():
+    ensemble = _FakeEnsemble(mean_prediction=[], direction_agreement=[])
+    _attach_reasoning(
+        [], ensemble, pd.DataFrame(), feature_cols=[], scored=pd.DataFrame({"confident": []}),
+        regime=TREND, max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8,
+    )  # should not raise
+
+
+# --- strategy dispatch ----------------------------------------------------
+
+
+def _run_screen_harness(monkeypatch, mode, *, full_deployment=False, diversified_result=None):
+    """
+    Wire run_screen's heavy dependencies to fakes so the dispatch itself can
+    be exercised: which selector ran, with which settings-derived arguments.
+    """
+    import models.screener as scr
+
+    monkeypatch.setattr(scr.settings, "strategy_mode", mode)
+    monkeypatch.setattr(scr.settings, "screener_top_k", 7)
+    monkeypatch.setattr(scr.settings, "full_deployment", full_deployment)
+    monkeypatch.setattr(scr.settings, "max_single_position_pct", 0.25)
+    monkeypatch.setattr(scr.settings, "max_short_position_pct", 0.15)
+    monkeypatch.setattr(scr.settings, "max_correlated_exposure_pct", 0.50)
+
+    dates = pd.bdate_range("2026-01-01", periods=3, tz="UTC")
+    # `target` is what the model is fitted on (absolute forward return here,
+    # cross-sectional excess under TARGET_MODE=relative); `fwd_return` stays
+    # absolute so money is always measured in money.
+    train_df = pd.DataFrame(
+        {
+            "symbol": ["A"] * 3,
+            "ts": dates,
+            "close": [1.0, 1.1, 1.2],
+            "fwd_return": [0.01, 0.02, 0.03],
+            "target": [0.01, 0.02, 0.03],
+            "f1": [1, 2, 3],
+        }
+    )
+    monkeypatch.setattr(scr, "load_training_frame", lambda *a, **k: train_df)
+
+    class _NoopEnsemble:
+        def __init__(self, n_models=5): ...
+        def fit(self, X, y): ...
+
+    monkeypatch.setattr(scr, "EnsembleForecastModel", _NoopEnsemble)
+    monkeypatch.setattr(scr, "load_latest_features", lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3]}))
+    monkeypatch.setattr(scr, "score_universe", lambda *a, **k: _scored_df(
+        [{"symbol": "A", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    ))
+    monkeypatch.setattr(scr, "build_correlation_matrix", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+
+    calls = {}
+
+    def fake_select_trades(scored, **kwargs):
+        calls["diversified"] = kwargs
+        return list(diversified_result or [])
+
+    def fake_select_concentrated(scored, **kwargs):
+        calls["concentrated"] = kwargs
+        return []
+
+    monkeypatch.setattr(scr, "select_trades", fake_select_trades)
+    monkeypatch.setattr(scr, "select_concentrated_trades", fake_select_concentrated)
+    return scr, calls
+
+
+def test_run_screen_diversified_mode_uses_the_topk_book_with_conservative_caps(monkeypatch):
+    scr, calls = _run_screen_harness(monkeypatch, "diversified")
+
+    scr.run_screen("v3", ["A"])
+
+    assert "diversified" in calls and "concentrated" not in calls
+    assert calls["diversified"]["top_k"] == 7  # settings.screener_top_k
+    assert calls["diversified"]["max_position_pct"] == 0.25
+    assert calls["diversified"]["max_short_position_pct"] == 0.15
+    assert calls["diversified"]["max_correlated_exposure_pct"] == 0.50
+    assert calls["diversified"]["forecast_scale"] == pytest.approx(0.01)  # std of fwd_return
+
+
+def test_run_screen_concentrated_mode_uses_the_two_trade_split(monkeypatch):
+    scr, calls = _run_screen_harness(monkeypatch, "concentrated")
+
+    scr.run_screen("v3", ["A"])
+
+    assert "concentrated" in calls and "diversified" not in calls
+
+
+def test_run_screen_diversified_scales_sizes_by_the_freed_capital_fraction(monkeypatch):
+    from models.screener import TradeCandidate
 
     candidate = TradeCandidate(
-        symbol="MMM", side="long", predicted_return=0.03, direction_agreement=0.9,
-        conviction_score=0.027, target_position_pct=0.05, regime=CHOP,
+        symbol="A", side="long", predicted_return=0.05, direction_agreement=1.0,
+        conviction_score=0.05, target_position_pct=0.20,
     )
-    n = log_candidates([candidate], feature_set_id="v3")
+    scr, _calls = _run_screen_harness(monkeypatch, "diversified", diversified_result=[candidate])
 
-    assert n == 1
-    assert captured["table"] == "decisions"
-    assert list(captured["df"]["regime"]) == [CHOP]
+    result = scr.run_screen("v3", ["A"], total_deploy_pct=0.5)
+
+    assert result[0].target_position_pct == pytest.approx(0.10)  # 0.20 * 0.5
+
+
+def test_run_screen_diversified_honors_full_deployment(monkeypatch):
+    from models.screener import TradeCandidate
+
+    candidate = TradeCandidate(
+        symbol="A", side="long", predicted_return=0.05, direction_agreement=1.0,
+        conviction_score=0.05, target_position_pct=0.10,
+    )
+    scr, _calls = _run_screen_harness(
+        monkeypatch, "diversified", full_deployment=True, diversified_result=[candidate]
+    )
+
+    result = scr.run_screen("v3", ["A"])
+
+    # One pick under a 25% cap: scaled up to the cap, shortfall logged, never past it.
+    assert result[0].target_position_pct == pytest.approx(0.25)
+
+
+def test_attach_reasoning_diversified_wording_tells_the_topk_story():
+    from models.screener import TradeCandidate
+
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
+    candidates = [
+        TradeCandidate(
+            symbol="AAPL", side="long", predicted_return=0.05, direction_agreement=1.0,
+            conviction_score=0.05, target_position_pct=0.10,
+        )
+    ]
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [1.5]})
+    contributions = pd.DataFrame({"f1": [0.03], "base_value": [0.0]}, index=pd.Index(["AAPL"], name="symbol"))
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
+
+    _attach_reasoning(
+        candidates, ensemble, latest, feature_cols=["f1"], scored=scored, regime=TREND,
+        max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8,
+        strategy="diversified", top_k=10,
+    )
+
+    phase4 = next(p for p in candidates[0].reasoning if p["phase"] == 4)
+    text = " ".join(phase4["lines"])
+    assert "diversified book" in text
+    assert "up to 10" in text
+    assert "two picks" not in text  # the concentrated split story must not leak in
 
 
 def test_build_correlation_matrix_from_prices():

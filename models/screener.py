@@ -1,48 +1,54 @@
 """
 Confidence-ranked equity screener. Scores every symbol in a universe with
-the ensemble forecast model and produces a small, sized shortlist of
-trades — long or short, whichever the data actually supports for that
-symbol — rather than only ever looking at a fixed handful of names. If
-nothing in the mega-caps clears the confidence bar but some other S&P 500
-name does, that's what gets picked; nothing here special-cases which
-symbols are "important."
+the ensemble forecast model, then concentrates all deployable capital into
+the top 2 highest-conviction picks — long only by default; see
+settings.allow_shorts, off because shorts lost -1.069% per trade at a
+41.6% win rate in the walk-forward — rather than spreading thinly. The
+point is to make a small number of high-confidence bets instead of
+tracking the market with a diversified book. If nothing in the mega-caps
+clears the confidence bar but some other S&P 500 name does, that's what
+gets picked; nothing here special-cases which symbols are "important."
 
 This module does NOT place orders — it produces candidates and logs them
 to the `decisions` table (mode="paper", executed_position left null).
 Wiring the output to execution/broker.py is a separate step.
 
-Alongside each logged candidate it records *why* the model picked it —
-the per-feature contributions behind that symbol's forecast, into the
-`decision_evidence` table (see models/evidence.py). That evidence is
-captured at screening time on purpose: the ensemble is retrained on every
-run, so a contribution recomputed a day later would be a different model's
-answer to a question about this model's decision.
-
 Usage:
-    python -m models.screener --feature-set-id v3 --universe --top-k 10
+    python -m models.screener --feature-set-id v3 --universe
 """
 from __future__ import annotations
 
 import argparse
 import dataclasses
 import datetime as dt
+import json
 import logging
 from collections.abc import Callable
 
 import pandas as pd
+from sqlalchemy.dialects.postgresql import JSONB
 
+from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine
 from data.ingest.universe import resolve_symbols
-from models.evidence import PickEvidence, evidence_rows, extract_evidence
+from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
-from models.regime.trend_chop_classifier import TREND, RuleBasedRegime
-from models.train import load_feature_frame, load_training_frame
+from models.regime.trend_chop_classifier import TREND
+from models.train import feature_columns, load_feature_frame, load_training_frame
+from monitoring import reasoning
 from risk.sizing import scale_to_full_deployment, target_position_size
 
 logger = logging.getLogger(__name__)
 
 _MODEL_VERSION = "ensemble_v1"
+
+# A trade whose predicted move doesn't even cover getting in and out is a
+# guaranteed loser even when the prediction is right. min_abs_return
+# therefore floors at the estimated round-trip transaction cost (see
+# backtest/cost_model.py — the spread-only minimum without ADV data)
+# instead of the old 0.0, which passed literally any nonzero forecast.
+DEFAULT_MIN_ABS_RETURN = round_trip_cost_fraction()
 
 
 @dataclasses.dataclass
@@ -53,39 +59,40 @@ class TradeCandidate:
     direction_agreement: float
     conviction_score: float
     target_position_pct: float
-    regime: str = TREND  # "trend" | "chop", per-symbol (see per_symbol_regimes)
-    # Why the model wanted this symbol — attached after sizing, and None when
-    # the ensemble can't report contributions. Never gates the trade itself.
-    evidence: PickEvidence | None = None
+    # Plain-English phase 2-4 reasoning (see monitoring/reasoning.py), populated
+    # by run_screen for both strategies (phase-4 wording follows the strategy).
+    # trading_loop.py merges in phases 1/5/6/7 once execution facts exist.
+    # None only for candidates built outside run_screen.
+    reasoning: list[dict] | None = None
 
 
-def per_symbol_regimes(
-    latest_features: pd.DataFrame,
-    adx_threshold: float = 25.0,
-    adx_col: str = "adx_14",
-) -> dict[str, str]:
+def load_latest_features(
+    feature_set_id: str, symbols: list[str], target_mode: str | None = None
+) -> pd.DataFrame:
     """
-    Tag each symbol trend/chop from its latest ADX via RuleBasedRegime, so
-    risk.sizing's chop dampening actually engages per symbol instead of the
-    whole book being sized as if everything were trending.
+    The most recent feature row per symbol — what gets scored "as of today".
 
-    Symbols with a missing/NaN ADX (not enough price history yet) fall back
-    to TREND — full size, matching the behavior before regimes were wired in —
-    rather than silently getting damped by a NaN comparison.
+    In relative mode the features are cross-sectionally z-scored across the
+    snapshot, exactly as load_training_frame z-scores each training date.
+    That has to match: a model trained on per-date z-scores and then scored
+    on raw feature levels would be reading a completely different scale from
+    the one it learned on, and would produce confident nonsense.
+
+    The z-score is taken across the whole snapshot rather than per ts. The
+    rows are the newest per symbol and so are nearly all the same date;
+    grouping by ts would give a stale symbol a group of one, whose z-score
+    is 0.0 by definition — no information at all, rather than its position
+    against today's peers.
     """
-    if adx_col not in latest_features.columns:
-        return {}
-    known = latest_features.loc[latest_features[adx_col].notna(), ["symbol", adx_col]]
-    if known.empty:
-        return {}
-    labels = RuleBasedRegime(adx_threshold=adx_threshold).predict(known[adx_col])
-    return dict(zip(known["symbol"], labels))
-
-
-def load_latest_features(feature_set_id: str, symbols: list[str]) -> pd.DataFrame:
-    """The most recent feature row per symbol — what gets scored "as of today"."""
+    target_mode = settings.target_mode if target_mode is None else target_mode
     df = load_feature_frame(feature_set_id, symbols)
-    return df.sort_values("ts").groupby("symbol", as_index=False).tail(1).reset_index(drop=True)
+    latest = df.sort_values("ts").groupby("symbol", as_index=False).tail(1).reset_index(drop=True)
+    if target_mode == "absolute":
+        return latest
+
+    cols = feature_columns(latest)
+    snapshot = latest.assign(_as_of="snapshot")
+    return cross_sectional_zscore(snapshot, cols, date_col="_as_of").drop(columns="_as_of")
 
 
 def build_correlation_matrix(prices: pd.DataFrame, lookback_days: int = 60) -> pd.DataFrame:
@@ -104,13 +111,16 @@ def score_universe(
     latest_features: pd.DataFrame,
     feature_cols: list[str],
     min_direction_agreement: float = 0.8,
-    min_abs_return: float = 0.0,
+    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
 ) -> pd.DataFrame:
     """
     latest_features: one row per symbol (see load_latest_features), with a
     'symbol' column plus all of `feature_cols` (missing ones are fine —
     LightGBM handles NaN features natively).
     Returns: symbol, predicted_return, direction_agreement, conviction_score, confident.
+
+    min_abs_return defaults to the estimated round-trip transaction cost:
+    a prediction smaller than the cost of trading it is not "confident".
     """
     empty = pd.DataFrame(
         columns=["symbol", "predicted_return", "direction_agreement", "conviction_score", "confident"]
@@ -146,25 +156,31 @@ def select_trades(
     top_k: int = 10,
     current_positions: dict[str, float] | None = None,
     is_shortable_fn: Callable[[str], bool] | None = None,
-    regime_by_symbol: dict[str, str] | None = None,
+    allow_shorts: bool = True,
 ) -> list[TradeCandidate]:
     """
+    The diversified-book path — the default strategy (STRATEGY_MODE=
+    diversified). See select_concentrated_trades below for the 2-trade
+    alternative; run_screen dispatches between them on settings.strategy_mode.
+
     Filters `scored` down to the top_k confident candidates and sizes each
     via risk.sizing.target_position_size — reused unchanged; it already
     handles signed forecasts, regime damping, and correlation caps
     generically, nothing here is symbol- or ETF-specific.
-
-    `regime_by_symbol` (see per_symbol_regimes) overrides `regime` for the
-    symbols it contains; `regime` is the fallback for everything else.
 
     Short candidates that fail `is_shortable_fn` (when given — pass e.g.
     execution.broker_alpaca.AlpacaBroker.is_shortable) are dropped rather
     than resized to zero, so the caller can see which symbols got skipped.
     Pass None to skip the check entirely (e.g. offline/backtest scoring
     with no live broker connection).
+
+    allow_shorts=False drops every short candidate the same way, before
+    sizing, and lets the next long candidate take the freed top_k slot.
+    run_screen passes settings.allow_shorts (default False — shorts lost
+    -1.069% per trade in the walk-forward). The parameter defaults to True
+    here because this function is the mechanism; the policy lives in config.
     """
     current_positions = current_positions or {}
-    regime_by_symbol = regime_by_symbol or {}
     confident = scored.loc[scored["confident"]].sort_values("conviction_score", ascending=False)
 
     candidates: list[TradeCandidate] = []
@@ -176,14 +192,15 @@ def select_trades(
         forecast = row["predicted_return"]
         side = "long" if forecast >= 0 else "short"
 
+        if side == "short" and not allow_shorts:
+            continue
         if side == "short" and is_shortable_fn is not None and not is_shortable_fn(symbol):
             continue
 
-        symbol_regime = regime_by_symbol.get(symbol, regime)
         size = target_position_size(
             forecast=forecast,
             forecast_scale=forecast_scale,
-            regime=symbol_regime,
+            regime=regime,
             symbol=symbol,
             current_positions=current_positions,
             correlation_matrix=correlation_matrix,
@@ -202,59 +219,325 @@ def select_trades(
                 direction_agreement=float(row["direction_agreement"]),
                 conviction_score=float(row["conviction_score"]),
                 target_position_pct=float(size),
-                regime=symbol_regime,
             )
         )
 
     return candidates
 
 
+def _make_candidate(row: pd.Series, weight: float, total_deploy_pct: float) -> TradeCandidate:
+    forecast = row["predicted_return"]
+    side = "long" if forecast >= 0 else "short"
+    sign = 1.0 if forecast >= 0 else -1.0
+    return TradeCandidate(
+        symbol=row["symbol"],
+        side=side,
+        predicted_return=float(forecast),
+        direction_agreement=float(row["direction_agreement"]),
+        conviction_score=float(row["conviction_score"]),
+        target_position_pct=float(sign * weight * total_deploy_pct),
+    )
+
+
+def select_concentrated_trades(
+    scored: pd.DataFrame,
+    max_leg_pct: float,
+    min_leg_pct: float,
+    total_deploy_pct: float = 1.0,
+    is_shortable_fn: Callable[[str], bool] | None = None,
+    allow_shorts: bool = True,
+) -> list[TradeCandidate]:
+    """
+    The concentrated strategy (STRATEGY_MODE=concentrated): put all deployable capital into the top 2
+    highest-conviction candidates instead of spreading across many names —
+    the point is to make a small number of high-confidence bets, not to
+    track the market with a diversified book.
+
+    The split between the two legs is weighted by each pick's relative
+    conviction_score (direction_agreement * |predicted_return|), bounded to
+    [min_leg_pct, max_leg_pct] of the *dominant* leg so one pick can't
+    swallow the whole deployment even at an extreme confidence ratio.
+    min_leg_pct should be 1 - max_leg_pct so both bounds are satisfiable
+    simultaneously with exactly two candidates.
+
+    If only one candidate clears the confidence bar, it gets the full
+    total_deploy_pct alone rather than forcing a weaker second trade just
+    to fill the split. If none do, returns [].
+
+    allow_shorts=False skips short candidates entirely when picking the two
+    legs, so a rejected short frees its slot for the next long rather than
+    leaving the book half-deployed. See settings.allow_shorts for why it
+    defaults off in production.
+
+    `total_deploy_pct` is the fraction of portfolio value to put to work in
+    total, both legs combined — pass less than 1.0 for e.g. regime-based
+    damping (see run_screen).
+    """
+    confident = scored.loc[scored["confident"]].sort_values("conviction_score", ascending=False)
+
+    picks: list[pd.Series] = []
+    for _, row in confident.iterrows():
+        if len(picks) >= 2:
+            break
+        is_short = row["predicted_return"] < 0
+        if is_short and not allow_shorts:
+            continue
+        if is_short and is_shortable_fn is not None and not is_shortable_fn(row["symbol"]):
+            continue
+        picks.append(row)
+
+    if not picks:
+        return []
+
+    if len(picks) == 1:
+        return [_make_candidate(picks[0], weight=1.0, total_deploy_pct=total_deploy_pct)]
+
+    scores = [max(row["conviction_score"], 0.0) for row in picks]
+    total_score = sum(scores)
+    weights = [0.5, 0.5] if total_score <= 0 else [s / total_score for s in scores]
+
+    if weights[0] > max_leg_pct:
+        weights = [max_leg_pct, 1.0 - max_leg_pct]
+    elif weights[0] < min_leg_pct:
+        weights = [min_leg_pct, 1.0 - min_leg_pct]
+
+    return [_make_candidate(row, weight, total_deploy_pct) for row, weight in zip(picks, weights, strict=False)]
+
+
+def _attach_reasoning(
+    candidates: list[TradeCandidate],
+    ensemble: EnsembleForecastModel,
+    latest_features: pd.DataFrame,
+    feature_cols: list[str],
+    scored: pd.DataFrame,
+    regime: str,
+    max_leg_pct: float,
+    min_leg_pct: float,
+    min_direction_agreement: float,
+    top_n: int = 5,
+    strategy: str = "concentrated",
+    top_k: int | None = None,
+) -> None:
+    """
+    Mutates each candidate in place, attaching plain-English reasoning for
+    phases 2-4 of the decision (see monitoring/reasoning.py for the full
+    7-phase model; phases 1/5/6/7 get merged in later by trading_loop.py,
+    once execution/reconciliation facts exist). Phase 2/3 are built from
+    the top `top_n` SHAP feature contributions (LightGBM pred_contrib) —
+    genuine per-prediction attribution, not just global feature importance.
+    Phase 4 wording follows the strategy: the concentrated split story for
+    the 2-trade mode, the top-k book story for the diversified default.
+    """
+    if not candidates:
+        return
+
+    symbols = [c.symbol for c in candidates]
+    rows = latest_features.set_index("symbol").loc[symbols]
+    X = rows.reindex(columns=feature_cols)
+    contributions = ensemble.predict_contributions(X)
+    n_confident = int(scored["confident"].sum())
+
+    for candidate in candidates:
+        contrib_row = contributions.loc[candidate.symbol].drop("base_value")
+        top_feature_names = contrib_row.abs().sort_values(ascending=False).head(top_n).index
+        top_features = [
+            {
+                "feature_name": feat,
+                "value": None if pd.isna(rows.loc[candidate.symbol, feat]) else float(rows.loc[candidate.symbol, feat]),
+                "contribution": float(contrib_row[feat]),
+            }
+            for feat in top_feature_names
+        ]
+        if strategy == "diversified":
+            phase4 = reasoning.phase_selection_diversified(
+                candidate.symbol,
+                candidate.side,
+                candidate.target_position_pct,
+                n_confident,
+                len(candidates),
+                top_k or len(candidates),
+            )
+        else:
+            phase4 = reasoning.phase_selection(
+                candidate.symbol,
+                candidate.side,
+                candidate.target_position_pct,
+                n_confident,
+                len(candidates),
+                max_leg_pct,
+                min_leg_pct,
+            )
+        candidate.reasoning = [
+            reasoning.phase_signals(regime, top_features),
+            reasoning.phase_forecast(
+                candidate.predicted_return, candidate.direction_agreement, candidate.conviction_score, min_direction_agreement
+            ),
+            phase4,
+        ]
+
+
+@dataclasses.dataclass
+class ScreenResult:
+    """
+    A screen's full output: the shortlist AND the whole scored universe.
+    The weekly cycle's hold rules (execution/hold_rules.py) need a fresh
+    prediction for every HELD symbol, including ones that didn't make the
+    shortlist — "has this position's predicted return flipped sign?" can't
+    be answered from the top-k candidates alone.
+    """
+
+    candidates: list[TradeCandidate]
+    scored: pd.DataFrame  # see score_universe: symbol, predicted_return, direction_agreement, …
+
+    def predicted_return_by_symbol(self) -> dict[str, float]:
+        if self.scored.empty:
+            return {}
+        return dict(zip(self.scored["symbol"], self.scored["predicted_return"], strict=False))
+
+
 def run_screen(
     feature_set_id: str,
     symbols: list[str],
-    target_horizon_days: int = 5,
+    target_horizon_days: int | None = None,
     n_ensemble_models: int = 5,
     min_direction_agreement: float = 0.8,
-    min_abs_return: float = 0.0,
-    top_k: int = 10,
+    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
+    total_deploy_pct: float = 1.0,
 ) -> list[TradeCandidate]:
-    """Trains a fresh ensemble on all available history, scores today's snapshot, returns sized candidates."""
-    train_df = load_training_frame(feature_set_id, symbols, target_horizon_days)
-    feature_cols = [c for c in train_df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
-    forecast_scale = float(train_df["fwd_return"].std())
+    """The shortlist-only view of run_screen_with_scores — see ScreenResult for who needs more."""
+    return run_screen_with_scores(
+        feature_set_id,
+        symbols,
+        target_horizon_days=target_horizon_days,
+        n_ensemble_models=n_ensemble_models,
+        min_direction_agreement=min_direction_agreement,
+        min_abs_return=min_abs_return,
+        regime=regime,
+        is_shortable_fn=is_shortable_fn,
+        total_deploy_pct=total_deploy_pct,
+    ).candidates
 
+
+def run_screen_with_scores(
+    feature_set_id: str,
+    symbols: list[str],
+    target_horizon_days: int | None = None,
+    n_ensemble_models: int = 5,
+    min_direction_agreement: float = 0.8,
+    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
+    regime: str = TREND,
+    is_shortable_fn: Callable[[str], bool] | None = None,
+    total_deploy_pct: float = 1.0,
+) -> ScreenResult:
+    """
+    Trains a fresh ensemble on all available history, scores today's
+    snapshot, and sizes `total_deploy_pct` of capital by whichever strategy
+    STRATEGY_MODE selects: the diversified top-k book (default, sized under
+    the conservative caps in risk/sizing.py) or the concentrated top-2
+    split (select_concentrated_trades).
+
+    `total_deploy_pct` defaults to 1.0 (the normal weekly-cycle behavior --
+    100% of the book). execution/contradiction_monitor.py's mid-week
+    reactivation passes a smaller value: the fraction of capital a
+    contradiction-close just freed up, so it can redeploy only that slice
+    via this exact same selection logic rather than reshuffling the whole
+    book. Regime is still used to gate which candidates clear the confidence
+    bar upstream, but no longer dampens total deployment on top of that (see
+    git history -- the old chop-dampening was leveraged-ETF-specific decay
+    protection that doesn't apply to plain equity/short positions).
+    """
+    # None -> the configured horizon (TARGET_HORIZON_DAYS), so the screener
+    # always trains on the same forward-return definition the evaluation
+    # harness graded, rather than a hardcoded 5.
+    if target_horizon_days is None:
+        target_horizon_days = settings.target_horizon_days
+    train_df = load_training_frame(feature_set_id, symbols, target_horizon_days)
+    feature_cols = feature_columns(train_df)
+
+    # Fitted on `target` — the absolute forward return, or the
+    # cross-sectional excess over the same-day universe, per TARGET_MODE.
+    # In relative mode a prediction reads "expected to beat the equal-weight
+    # universe by this much over the horizon", not "expected to rise this
+    # much", and the confidence thresholds downstream are interpreted in
+    # those units.
     ensemble = EnsembleForecastModel(n_models=n_ensemble_models)
-    ensemble.fit(train_df[feature_cols], train_df["fwd_return"])
+    ensemble.fit(train_df[feature_cols], train_df["target"])
 
     latest = load_latest_features(feature_set_id, symbols)
     scored = score_universe(ensemble, latest, feature_cols, min_direction_agreement, min_abs_return)
 
-    correlation_matrix = build_correlation_matrix(train_df[["symbol", "ts", "close"]])
-    regime_by_symbol = per_symbol_regimes(latest)
+    if not settings.allow_shorts and not scored.empty:
+        # Logged rather than silent: the shortlist can look thin for a
+        # perfectly good reason, and "the model wanted to short 6 names and
+        # wasn't allowed to" is the reason worth knowing. `scored` itself is
+        # left untouched — the hold rules read predicted_return for HELD
+        # positions and need the real sign to spot a forecast that flipped.
+        suppressed = int((scored.loc[scored["confident"], "predicted_return"] < 0).sum())
+        if suppressed:
+            logger.info(
+                "ALLOW_SHORTS is off: %d confident short candidate(s) dropped before sizing.",
+                suppressed,
+            )
 
-    candidates = select_trades(
-        scored,
-        regime=regime,
-        regime_by_symbol=regime_by_symbol,
-        forecast_scale=forecast_scale,
-        max_position_pct=settings.max_single_position_pct,
-        max_short_position_pct=settings.max_short_position_pct,
-        max_correlated_exposure_pct=settings.max_correlated_exposure_pct,
-        correlation_matrix=correlation_matrix,
-        top_k=top_k,
-        is_shortable_fn=is_shortable_fn,
-    )
-
-    if settings.full_deployment:
-        candidates = apply_full_deployment(
-            candidates,
+    if settings.strategy_mode == "concentrated":
+        candidates = select_concentrated_trades(
+            scored,
+            max_leg_pct=settings.max_concentrated_position_pct,
+            min_leg_pct=settings.min_concentrated_position_pct,
+            total_deploy_pct=total_deploy_pct,
+            is_shortable_fn=is_shortable_fn,
+            allow_shorts=settings.allow_shorts,
+        )
+    else:
+        # Diversified default: top-k book sized through the full risk
+        # pipeline (confidence scaling, regime damping, correlation caps).
+        # Scaled by the spread of what the model predicts, not of raw
+        # returns: in relative mode the two differ by roughly the market's
+        # own volatility, and using the wrong one would systematically
+        # mis-size every position.
+        forecast_scale = float(train_df["target"].std())
+        correlation_matrix = build_correlation_matrix(train_df[["symbol", "ts", "close"]])
+        candidates = select_trades(
+            scored,
+            regime=regime,
+            forecast_scale=forecast_scale,
             max_position_pct=settings.max_single_position_pct,
             max_short_position_pct=settings.max_short_position_pct,
+            max_correlated_exposure_pct=settings.max_correlated_exposure_pct,
+            correlation_matrix=correlation_matrix,
+            top_k=settings.screener_top_k,
+            is_shortable_fn=is_shortable_fn,
+            allow_shorts=settings.allow_shorts,
         )
+        # Reactivation semantics: when only a freed slice of the portfolio
+        # is on the table, every size shrinks proportionally to fit it.
+        if total_deploy_pct < 1.0:
+            for candidate in candidates:
+                candidate.target_position_pct *= total_deploy_pct
+        if settings.full_deployment:
+            candidates = apply_full_deployment(
+                candidates,
+                max_position_pct=settings.max_single_position_pct,
+                max_short_position_pct=settings.max_short_position_pct,
+                target_allocation=total_deploy_pct,
+            )
 
-    return attach_evidence(candidates, ensemble, latest, feature_cols)
+    _attach_reasoning(
+        candidates,
+        ensemble,
+        latest,
+        feature_cols,
+        scored,
+        regime,
+        settings.max_concentrated_position_pct,
+        settings.min_concentrated_position_pct,
+        min_direction_agreement,
+        strategy=settings.strategy_mode,
+        top_k=settings.screener_top_k,
+    )
+    return ScreenResult(candidates=candidates, scored=scored)
 
 
 def apply_full_deployment(
@@ -295,53 +578,11 @@ def apply_full_deployment(
     return candidates
 
 
-def attach_evidence(
-    candidates: list[TradeCandidate],
-    ensemble: EnsembleForecastModel,
-    latest_features: pd.DataFrame,
-    feature_cols: list[str],
-) -> list[TradeCandidate]:
-    """
-    Fill in each candidate's `evidence` from the ensemble's per-feature
-    contributions, for the shortlist only.
-
-    Explaining a decision must never be able to change or block it, so this
-    runs after sizing and swallows any failure: a broken or contribution-less
-    model costs the "Why this pick?" panel, not the trade.
-    """
-    if not candidates:
-        return candidates
-    try:
-        evidence = extract_evidence(
-            ensemble, latest_features, feature_cols, symbols=[c.symbol for c in candidates]
-        )
-    except Exception:  # noqa: BLE001 — evidence is explanatory, never load-bearing
-        logger.exception("Could not extract per-feature evidence; picks are unaffected.")
-        return candidates
-
-    for candidate in candidates:
-        candidate.evidence = evidence.get(candidate.symbol)
-    return candidates
-
-
-def log_candidates(
-    candidates: list[TradeCandidate],
-    feature_set_id: str,
-    mode: str = "paper",
-    ts: dt.datetime | None = None,
-) -> int:
-    """
-    Writes the shortlist to the decisions table — proposed, not executed
-    (executed_position left null).
-
-    `ts` stamps every candidate in the run identically, which is what makes a
-    "batch" a well-defined set downstream (the approval loop's pending query,
-    the dashboard's latest_batch). Pass the same value to log_evidence so the
-    evidence rows link back to these decisions.
-    """
+def log_candidates(candidates: list[TradeCandidate], feature_set_id: str, mode: str = "paper", regime: str | None = None) -> int:
+    """Writes the shortlist to the decisions table — proposed, not executed (executed_position left null)."""
     if not candidates:
         return 0
-    now = ts or dt.datetime.now(tz=dt.UTC)
+    now = dt.datetime.now(tz=dt.UTC)
     rows = [
         {
             "ts": now,
@@ -349,43 +590,17 @@ def log_candidates(
             "feature_set_id": feature_set_id,
             "model_version": _MODEL_VERSION,
             "forecast": c.predicted_return,
-            "direction_agreement": c.direction_agreement,
-            "regime": c.regime,
+            "regime": regime,
             "target_position": c.target_position_pct,
             "executed_position": None,
             "mode": mode,
+            "reasoning": json.dumps(c.reasoning) if c.reasoning is not None else None,
         }
         for c in candidates
     ]
     df = pd.DataFrame(rows)
     engine = get_engine()
-    df.to_sql("decisions", engine, if_exists="append", index=False)
-    return len(rows)
-
-
-def log_evidence(
-    candidates: list[TradeCandidate], feature_set_id: str, ts: dt.datetime | None = None
-) -> int:
-    """
-    Writes each candidate's per-feature evidence to `decision_evidence`,
-    keyed by the same (ts, symbol) the matching decisions rows carry — so
-    `ts` must be the value log_candidates was given for this batch.
-
-    Candidates without evidence (see attach_evidence) are simply skipped;
-    the decision row still stands on its own, the panel just has nothing to
-    show for it.
-    """
-    now = ts or dt.datetime.now(tz=dt.UTC)
-    rows = [
-        row
-        for candidate in candidates
-        if candidate.evidence is not None
-        for row in evidence_rows(candidate.evidence, now, feature_set_id, _MODEL_VERSION)
-    ]
-    if not rows:
-        return 0
-    engine = get_engine()
-    pd.DataFrame(rows).to_sql("decision_evidence", engine, if_exists="append", index=False)
+    df.to_sql("decisions", engine, if_exists="append", index=False, dtype={"reasoning": JSONB})
     return len(rows)
 
 
@@ -394,11 +609,17 @@ def main() -> None:
     parser.add_argument("--feature-set-id", required=True)
     parser.add_argument("--symbols", default=None)
     parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
-    parser.add_argument("--target-horizon-days", type=int, default=5)
+    parser.add_argument(
+        "--target-horizon-days", type=int, default=None,
+        help=f"Forward-return horizon in trading days (default: TARGET_HORIZON_DAYS = {settings.target_horizon_days}).",
+    )
     parser.add_argument("--n-ensemble-models", type=int, default=5)
     parser.add_argument("--min-direction-agreement", type=float, default=0.8)
-    parser.add_argument("--min-abs-return", type=float, default=0.0)
-    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument(
+        "--min-abs-return", type=float, default=DEFAULT_MIN_ABS_RETURN,
+        help="Minimum |predicted return| to shortlist. Defaults to the estimated round-trip "
+             "transaction cost — a prediction below the cost of trading it is a guaranteed loser.",
+    )
     parser.add_argument("--log", action="store_true", help="Write the shortlist to the decisions table.")
     args = parser.parse_args()
 
@@ -410,28 +631,19 @@ def main() -> None:
         n_ensemble_models=args.n_ensemble_models,
         min_direction_agreement=args.min_direction_agreement,
         min_abs_return=args.min_abs_return,
-        top_k=args.top_k,
     )
 
     if not candidates:
         print("No candidates cleared the confidence bar this run.")
         return
 
-    print(f"{'symbol':<8}{'side':<7}{'regime':<7}{'pred_return':>13}{'agreement':>12}{'target_pct':>12}")
+    print(f"{'symbol':<8}{'side':<7}{'pred_return':>13}{'agreement':>12}{'target_pct':>12}")
     for c in candidates:
-        print(
-            f"{c.symbol:<8}{c.side:<7}{c.regime:<7}"
-            f"{c.predicted_return:>13.4f}{c.direction_agreement:>12.2f}{c.target_position_pct:>12.4f}"
-        )
+        print(f"{c.symbol:<8}{c.side:<7}{c.predicted_return:>13.4f}{c.direction_agreement:>12.2f}{c.target_position_pct:>12.4f}")
 
     if args.log:
-        # One timestamp for both writes — it's the link between a decision and
-        # the evidence explaining it.
-        batch_ts = dt.datetime.now(tz=dt.UTC)
-        n = log_candidates(candidates, args.feature_set_id, ts=batch_ts)
-        n_evidence = log_evidence(candidates, args.feature_set_id, ts=batch_ts)
+        n = log_candidates(candidates, args.feature_set_id)
         print(f"\nLogged {n} candidate(s) to decisions (mode=paper, not executed).")
-        print(f"Logged {n_evidence} evidence row(s) to decision_evidence.")
 
 
 if __name__ == "__main__":

@@ -16,14 +16,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 
 import pandas as pd
+import requests
 
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
 from data.ingest.http import DEFAULT_SLEEP_SECONDS, polygon_get
 from data.ingest.universe import resolve_symbols
+
+logger = logging.getLogger(__name__)
 
 POLYGON_FINANCIALS_URL = "https://api.polygon.io/vX/reference/financials"
 
@@ -57,7 +61,14 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
             "limit": 20,
             "apiKey": settings.polygon_api_key,
         }
-        resp = polygon_get(POLYGON_FINANCIALS_URL, params)
+        # Same fix as news.py: don't let one symbol's transient network error
+        # (read timeout, DNS blip) discard the whole batch of already-fetched
+        # symbols — skip just this one and keep going.
+        try:
+            resp = polygon_get(POLYGON_FINANCIALS_URL, params)
+        except requests.RequestException:
+            logger.warning("Failed to fetch fundamentals for %s — skipping this symbol.", symbol, exc_info=True)
+            continue
         results = resp.json().get("results", [])
 
         for report in results:
@@ -88,6 +99,14 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
     df = pd.DataFrame(rows, columns=["symbol", "ts", "metric", "value", "source"])
     if not df.empty:
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        # Polygon can return more than one report with the same filing_date
+        # for the same symbol (e.g. a restated/amended filing) — two rows
+        # with an identical (symbol, ts, metric) key in one batch makes
+        # upsert_dataframe's ON CONFLICT DO UPDATE fail outright (a single
+        # statement can't "affect the same row twice"), the same class of
+        # bug fixed for news.py's shared-story case. Keep the last one
+        # (Polygon returns revisions after the original in practice).
+        df = df.drop_duplicates(subset=["symbol", "ts", "metric"], keep="last")
     return df
 
 

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trading-system.dashboard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/kp/Downloads/trading-system/.venv/bin/python</string>
+        <string>-m</string>
+        <string>monitoring.dashboard.server</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/kp/Downloads/trading-system</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/kp/Downloads/trading-system/logs/dashboard.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/kp/Downloads/trading-system/logs/dashboard.error.log</string>
+
+    <!-- Unlike the weekly cycle, this should just always be up. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>

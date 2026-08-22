@@ -7,7 +7,9 @@ venv/
 *.egg-info/
 mlruns/
 mlflow.db
+artifacts/
 *.log
+logs/
 .DS_Store
 data_backfill/
 *.parquet

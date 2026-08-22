@@ -17,14 +17,18 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import logging
 import time
 
 import pandas as pd
+import requests
 
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
 from data.ingest.http import DEFAULT_SLEEP_SECONDS, polygon_get
 from data.ingest.universe import resolve_symbols
+
+logger = logging.getLogger(__name__)
 
 POLYGON_NEWS_URL = "https://api.polygon.io/v2/reference/news"
 
@@ -71,7 +75,15 @@ def fetch_news(symbols: list[str], since_hours: int, sleep_seconds: float = DEFA
             "limit": 1000,
             "apiKey": settings.polygon_api_key,
         }
-        resp = polygon_get(POLYGON_NEWS_URL, params)
+        # Hit live twice: a single transient network error (read timeout, DNS
+        # blip) on one symbol used to propagate all the way up and discard
+        # the whole batch -- losing ~2 hours of already-fetched symbols for
+        # the full universe. Skip just the failed symbol instead.
+        try:
+            resp = polygon_get(POLYGON_NEWS_URL, params)
+        except requests.RequestException:
+            logger.warning("Failed to fetch news for %s — skipping this symbol.", symbol, exc_info=True)
+            continue
         rows.extend(
             {
                 "id": _stable_id(article["id"], symbol),

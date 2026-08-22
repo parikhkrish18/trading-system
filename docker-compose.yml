@@ -8,7 +8,9 @@ services:
       POSTGRES_USER: ${DB_USER:-trading}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me_locally}
     ports:
-      - "${DB_PORT:-5432}:5432"
+      # Loopback only: the DB password defaults to a known value, so the
+      # port must not be reachable from the network.
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     volumes:
       - timescale_data:/var/lib/postgresql/data
     healthcheck:
@@ -24,7 +26,8 @@ services:
     depends_on:
       - timescaledb
     ports:
-      - "5000:5000"
+      # Loopback only — MLflow has no authentication at all.
+      - "127.0.0.1:5000:5000"
     volumes:
       - mlflow_artifacts:/mlflow/artifacts
     command: >
@@ -44,7 +47,9 @@ services:
       - timescaledb
     env_file: .env
     ports:
-      - "8501:8501"
+      # Loopback only: the dashboard can run the test suite via POST and
+      # shows account state — not something to expose to the LAN by default.
+      - "127.0.0.1:8501:8501"
 
 volumes:
   timescale_data:

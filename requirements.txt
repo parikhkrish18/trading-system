@@ -1,33 +1,41 @@
+# Pinned to the exact versions installed in the working .venv (pip freeze,
+# 2026-08-11) so a fresh install, CI, and the Docker image all run the same
+# code that was tested — a floating ">=" resolved at build time is how a
+# surprise minor release breaks a trading run. Upgrade deliberately: bump a
+# pin, run the suite, commit both together.
+
 # --- core ---
-pandas>=2.2
-numpy>=1.26
-pydantic>=2.6
-pydantic-settings>=2.2
-python-dotenv>=1.0
-sqlalchemy>=2.0
-psycopg2-binary>=2.9
+pandas==2.3.3
+numpy==2.5.1
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-dotenv==1.2.2
+SQLAlchemy==2.0.51
+psycopg2-binary==2.9.12
 
 # --- modeling ---
-lightgbm>=4.3
-scikit-learn>=1.4
-mlflow>=2.12
+lightgbm==4.7.0
+scikit-learn==1.9.0
+scipy==1.18.0  # paired significance tests in scripts/compare_horizons.py
+mlflow==3.14.0
 
 # --- backtest / data ---
-yfinance>=0.2.40      # fallback / cheap price source for local dev
-alpaca-py>=0.28        # optional broker + market data when BROKER=alpaca
-ib-insync>=0.9.86      # IBKR broker when BROKER=ibkr
-beautifulsoup4>=4.12   # macro calendar scraper (data/ingest/macro_calendar.py)
+yfinance==1.5.2        # fallback / cheap price source for local dev
+alpaca-py==0.43.5      # optional broker + market data when BROKER=alpaca
+ib-insync==0.9.86      # IBKR broker when BROKER=ibkr
+beautifulsoup4==4.15.0 # universe + macro calendar scrapers
 
 # --- monitoring / alerts ---
-streamlit>=1.33
-requests>=2.31
+fastapi==0.141.1
+uvicorn==0.52.0
+requests==2.34.2
 
 # --- LLM (sentiment scoring) ---
-anthropic>=0.34
+anthropic==0.120.2
 
 # --- orchestration (optional, Phase 0 only needs this if you want the UI) ---
-prefect>=2.16
+prefect==3.8.1
 
 # --- dev / test ---
-pytest>=8.1
-ruff>=0.4
+pytest==9.1.1
+ruff==0.16.1

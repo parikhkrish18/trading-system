@@ -87,6 +87,31 @@ def test_fetch_news_same_article_shared_across_symbols_produces_two_rows(monkeyp
     assert set(df["symbol"]) == {"AAPL", "MSFT"}
 
 
+def test_fetch_news_skips_a_symbol_that_errors_instead_of_losing_the_whole_batch(monkeypatch):
+    """
+    Regression test, hit live: a single transient network error (read
+    timeout, DNS blip) on one symbol used to propagate out of fetch_news
+    entirely, discarding every other symbol already successfully fetched --
+    losing ~2 hours of work for a 500-symbol universe pull. One bad symbol
+    must not take down the whole batch.
+    """
+    import requests
+
+    def fake_get(url, params=None, timeout=None):
+        if params["ticker"] == "BAD":
+            raise requests.exceptions.ConnectionError("read timed out")
+        return _FakeResponse(
+            {"results": [{"id": f"article-{params['ticker']}", "published_utc": "2026-07-27T12:00:00Z", "title": "ok"}]}
+        )
+
+    monkeypatch.setattr(news, "polygon_get", fake_get)
+    monkeypatch.setattr(news.settings, "polygon_api_key", "test-key")
+
+    df = news.fetch_news(["SPY", "BAD", "QQQ"], since_hours=24, sleep_seconds=0)
+
+    assert set(df["symbol"]) == {"SPY", "QQQ"}  # BAD skipped, the rest survived
+
+
 def test_fetch_news_empty_results_returns_empty_dataframe(monkeypatch):
     monkeypatch.setattr(news, "polygon_get",lambda *a, **k: _FakeResponse({"results": []}))
     monkeypatch.setattr(news.settings, "polygon_api_key", "test-key")

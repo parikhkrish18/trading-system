@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trading System Monitor</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Trading System Monitor</h1>
+    <div class="topbar-right">
+      <span id="mode-badge" class="badge">…</span>
+      <button id="refresh-btn" class="btn">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="controls-section">
+      <h2>Manual Controls <span class="muted">(runs in the background — a cycle still needs Telegram approval before any order)</span></h2>
+      <div class="summary-row">
+        <div id="job-ingest-status" class="stat-card">Never run</div>
+        <button id="run-ingest-btn" class="btn">Run data ingestion</button>
+        <div id="job-cycle-status" class="stat-card">Never run</div>
+        <button id="run-cycle-btn" class="btn">Run trading cycle</button>
+      </div>
+      <details id="job-output-wrap">
+        <summary>Last job output</summary>
+        <pre id="job-output"></pre>
+      </details>
+    </section>
+
+    <section id="positions-section">
+      <h2>Positions <span class="muted" id="positions-count"></span></h2>
+      <div id="positions-summary" class="summary-row"></div>
+      <div id="positions-list" class="positions-grid"></div>
+    </section>
+
+    <section id="closed-trades-section">
+      <h2>Closed Trades <span class="muted">(realized P&amp;L)</span></h2>
+      <div class="summary-row" id="closed-trades-summary"></div>
+      <div class="table-wrap">
+        <table id="closed-trades-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
+              <th>Shares</th><th>Entry px</th><th>Exit px</th><th>Realized P/L</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="equity-section">
+      <h2>Equity &amp; Drawdown <span class="muted">(background shading = CHOP regime)</span></h2>
+      <div class="summary-row" id="equity-summary"></div>
+      <div class="chart-pair">
+        <div class="chart-box">
+          <h3>Equity</h3>
+          <div id="equity-chart"></div>
+        </div>
+        <div class="chart-box">
+          <h3>Drawdown</h3>
+          <div id="drawdown-chart"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="breakers-section">
+      <h2>Circuit Breakers</h2>
+      <div id="breakers-list" class="breakers-grid"></div>
+    </section>
+
+    <section id="analysis-section">
+      <h2>Model Analysis <span class="muted">(walk-forward folds, MLflow)</span></h2>
+      <div class="chart-box">
+        <h3>Directional accuracy over time</h3>
+        <div id="analysis-chart"></div>
+      </div>
+      <div class="table-wrap">
+        <table id="analysis-table">
+          <thead>
+            <tr>
+              <th>Fold</th><th>Feature set</th><th>Test window</th>
+              <th>MAE</th><th>RMSE</th><th>Dir. acc.</th><th>Dir. acc. (confident)</th><th>% confident</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="report-card-section">
+      <h2>Model Report Card <span class="muted">(walk-forward folds, plain English)</span></h2>
+      <div class="summary-row" id="report-card-summary"></div>
+      <div class="chart-box">
+        <h3>Directional accuracy per fold — all predictions vs. only when the models agreed</h3>
+        <div id="report-card-chart"></div>
+      </div>
+      <div id="report-card-callouts"></div>
+    </section>
+
+    <section id="whatif-section">
+      <h2>What-If Thresholds <span class="muted">(re-filter the latest picks, nothing is retrained)</span></h2>
+      <div class="filter-row whatif-sliders">
+        <label for="whatif-agreement">Min model agreement <span id="whatif-agreement-value">80%</span>
+          <input type="range" id="whatif-agreement" min="0.5" max="1.0" step="0.05" value="0.8" />
+        </label>
+        <label for="whatif-move">Min predicted move <span id="whatif-move-value">0.0%</span>
+          <input type="range" id="whatif-move" min="0.0" max="0.10" step="0.005" value="0.0" />
+        </label>
+      </div>
+      <div class="summary-row" id="whatif-summary"></div>
+      <div class="table-wrap">
+        <table id="whatif-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Direction</th><th>Market regime</th>
+              <th>Predicted move</th><th>Target size</th><th>Model agreement</th><th>Placed?</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="feature-importance-section">
+      <h2>Feature Importance Over Time <span class="muted">(last 200 decisions)</span></h2>
+      <div id="feature-importance-list" class="feature-freq-list"></div>
+    </section>
+
+    <section id="decisions-section">
+      <h2>Decision History</h2>
+      <div class="summary-row" id="live-accuracy-summary"></div>
+      <div class="filter-row">
+        <input id="decision-symbol-filter" placeholder="Filter by symbol (e.g. TSLA)" />
+        <button id="decision-filter-btn" class="btn btn-secondary">Filter</button>
+      </div>
+      <div class="table-wrap">
+        <table id="decisions-table">
+          <thead>
+            <tr>
+              <th>Time</th><th>Symbol</th><th>Forecast</th><th>Regime</th>
+              <th>Target</th><th>Executed</th><th>Mode</th><th>Reasoning</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="tests-section">
+      <h2>Test Suite</h2>
+      <div class="summary-row">
+        <div id="test-status" class="stat-card">Never run</div>
+        <button id="run-tests-btn" class="btn">Run tests now</button>
+      </div>
+      <details id="test-output-wrap">
+        <summary>Full output</summary>
+        <pre id="test-output"></pre>
+      </details>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

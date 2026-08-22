@@ -22,6 +22,14 @@ filled. An unshortable order will be rejected by IBKR itself at submission
 time — that rejection surfaces via the returned trade's orderStatus, and
 callers (the screener/trading loop) must check and log it rather than
 assume the order went through just because placeOrder() didn't raise.
+
+Extended-hours limitation: unlike broker_alpaca.py, this module always
+submits regular-hours market orders — no outsideRth handling yet. IBKR
+does support extended-hours execution (Order.outsideRth=True, generally
+still wants a limit order for the same thin-liquidity reasons), it's just
+not implemented here. An order submitted outside RTH will queue at IBKR
+until the next open, same as broker_alpaca.py's behavior when
+ALLOW_EXTENDED_HOURS_TRADING is off.
 """
 from __future__ import annotations
 
@@ -130,7 +138,7 @@ class IBKRBroker:
             return None
 
         side = "BUY" if delta > 0 else "SELL"
-        qty = abs(int(round(delta)))
+        qty = abs(round(delta))
         if qty < 1:
             return None
 

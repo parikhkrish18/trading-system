@@ -1,0 +1,33 @@
+# The dashboard Dockerfile does COPY . . — everything not listed here ends
+# up baked into the image. Keep secrets, VCS history, local state and bulk
+# artifacts out.
+
+# Secrets — the real .env holds live API keys; the container gets its env
+# via docker-compose `env_file`, never baked into a layer.
+.env
+
+# VCS / editor / local notes
+.git
+.github
+.gitignore
+MY_NOTES.md
+DEMO_SCRIPT.md
+
+# Python build/runtime litter
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Local state and bulk data — regenerated, never shipped
+logs/
+mlruns/
+mlflow.db
+*.log
+data_backfill/
+*.parquet
+.ipynb_checkpoints/
+.DS_Store

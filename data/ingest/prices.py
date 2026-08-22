@@ -26,8 +26,17 @@ from data.validators.checks import run_all_validators
 def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
     import yfinance as yf
 
+    # yfinance expects dual-class tickers with a dash (BRK-B), but our
+    # canonical symbol everywhere else — Wikipedia's universe scrape,
+    # Polygon, Alpaca — uses a dot (BRK.B), matching the SEC's own
+    # convention. Translate only for this vendor's API call; store and
+    # return the canonical dotted form so downstream code never has to
+    # know this quirk exists. Hit live: BRK.B and BF.B both silently
+    # failed ("possibly delisted") before this fix.
+    yf_symbol = {s: s.replace(".", "-") for s in symbols}
+
     raw = yf.download(
-        symbols,
+        list(yf_symbol.values()),
         start=start.isoformat(),
         end=end.isoformat(),
         auto_adjust=False,
@@ -38,13 +47,23 @@ def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.Data
     frames = []
     for sym in symbols:
         try:
-            sub = raw[sym].copy() if len(symbols) > 1 else raw.copy()
+            # group_by="ticker" gives (ticker, field) MultiIndex columns even
+            # for a single ticker on current yfinance — select the ticker
+            # level whenever it exists, not only when len(symbols) > 1.
+            # Hit live: every single-symbol ingest (e.g. the SPY regime
+            # proxy) crashed on flat-column selection instead.
+            sub = raw[yf_symbol[sym]].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
         except KeyError:
             continue
         sub = sub.rename(
             columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
         )
-        sub = sub[["open", "high", "low", "close", "volume"]].dropna(how="all")
+        # how="any", not "all": a row missing even one OHLCV field (e.g. a
+        # vendor glitch that returns a null close but valid open/high/low)
+        # violates the prices table's NOT NULL constraints and fails the
+        # whole batch's single INSERT — better to drop that one row here
+        # than poison every symbol's data for the day.
+        sub = sub[["open", "high", "low", "close", "volume"]].dropna(how="any")
         sub["symbol"] = sym
         sub["ts"] = pd.to_datetime(sub.index, utc=True)
         sub["source"] = "yfinance"

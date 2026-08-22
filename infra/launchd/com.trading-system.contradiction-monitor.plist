@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trading-system.contradiction-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/kp/Downloads/trading-system/.venv/bin/python</string>
+        <string>-m</string>
+        <string>execution.contradiction_monitor</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/kp/Downloads/trading-system</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/kp/Downloads/trading-system/logs/contradiction-monitor.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/kp/Downloads/trading-system/logs/contradiction-monitor.error.log</string>
+
+    <!--
+      Fires every hour, all day — deliberately not a market-hours
+      StartCalendarInterval list, since ET-to-IST offset shifts across US
+      DST transitions and a fixed hour list would drift. Instead
+      execution/contradiction_monitor.py itself checks Alpaca's clock and
+      no-ops outside market hours, so this plist only needs to be "often
+      enough," not "exactly when."
+    -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

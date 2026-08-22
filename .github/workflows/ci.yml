@@ -7,6 +7,28 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+
+    # A couple of tests (tests/test_db.py) intentionally hit a real Postgres
+    # connection rather than faking one -- upsert_dataframe relies on
+    # Postgres-specific ON CONFLICT syntax that SQLite's parser doesn't
+    # handle for the INSERT...SELECT form, so a real connection is the only
+    # faithful way to test it. Matches config/settings.py's defaults so no
+    # env vars need to be set explicitly.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: trading
+          POSTGRES_PASSWORD: change_me_locally
+          POSTGRES_DB: trading
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 

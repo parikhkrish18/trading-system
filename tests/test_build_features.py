@@ -1,7 +1,12 @@
+import sys
+
 import pandas as pd
 import pytest
 
+from data.ingest import universe
+from features import build_features
 from features.build_features import (
+    build_and_store,
     build_event_risk_features,
     build_fundamentals_features,
     build_qualitative_features,
@@ -88,3 +93,80 @@ def test_build_fundamentals_features_as_of_joins_latest_known_value():
 
 def test_build_fundamentals_features_empty_inputs():
     assert build_fundamentals_features(pd.DataFrame(), pd.DataFrame()).empty
+
+
+def test_build_and_store_defaults_to_a_bounded_lookback_window(monkeypatch):
+    """
+    Regression test, hit live: build_and_store used to pull *all* price
+    history with no date filter -- against a 5-year full-universe backfill
+    that produced a features batch large enough to stall a single-transaction
+    upsert for 3+ hours. The prices query must always carry a lookback bound.
+    """
+    captured = {}
+
+    def fake_read_sql(query, engine, **kwargs):
+        captured.setdefault("queries", []).append(query)
+        return pd.DataFrame(columns=["symbol", "ts", "open", "high", "low", "close", "volume"])
+
+    monkeypatch.setattr(build_features, "get_engine", lambda: object())
+    monkeypatch.setattr(build_features.pd, "read_sql", fake_read_sql)
+
+    build_and_store(["AAPL"], "v3")
+
+    prices_query = captured["queries"][0]
+    assert "interval '3 years'" in prices_query
+
+
+def test_build_and_store_lookback_years_is_configurable(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(build_features, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        build_features.pd,
+        "read_sql",
+        lambda query, engine, **kwargs: (captured.setdefault("queries", []).append(query), pd.DataFrame())[1],
+    )
+
+    build_and_store(["AAPL"], "v3", lookback_years=1)
+
+    assert "interval '1 years'" in captured["queries"][0]
+
+
+def test_main_universe_flag_builds_the_active_universe(monkeypatch):
+    """
+    --universe was documented in the README and in data/ingest/universe.py's
+    docstring but never implemented here, so a full-universe rebuild meant
+    hand-pasting ~500 tickers. It must resolve to the active universe list
+    the ingest CLIs use, not to a --symbols string.
+    """
+    captured = {}
+    # resolve_symbols looks load_active_universe up in its own module globals.
+    monkeypatch.setattr(universe, "load_active_universe", lambda: ["AAPL", "MSFT"])
+    monkeypatch.setattr(
+        build_features, "build_and_store",
+        lambda symbols, feature_set_id: captured.update(symbols=symbols, fsid=feature_set_id) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["build_features", "--universe", "--feature-set-id", "v4"])
+
+    build_features.main()
+
+    assert captured["symbols"] == ["AAPL", "MSFT"]
+    assert captured["fsid"] == "v4"
+
+
+def test_main_still_accepts_an_explicit_symbol_list(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        build_features, "build_and_store",
+        lambda symbols, feature_set_id: captured.update(symbols=symbols) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["build_features", "--symbols", "aapl,msft", "--feature-set-id", "v4"])
+
+    build_features.main()
+
+    assert captured["symbols"] == ["AAPL", "MSFT"]
+
+
+def test_main_requires_one_of_symbols_or_universe(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["build_features", "--feature-set-id", "v4"])
+    with pytest.raises(SystemExit):
+        build_features.main()

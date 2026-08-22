@@ -1,10 +1,10 @@
 """
-Pure display transforms for the dashboard's "Latest picks" panel, split out of
-monitoring/dashboard/app.py so the reshaping is testable without a Streamlit or
-DB context — same split as monitoring/forecast_accuracy.py.
+Pure display transforms for the dashboard's "Latest picks" panel, kept apart
+from monitoring/dashboard/server.py so the reshaping is testable without an
+HTTP or DB context — same split as monitoring/forecast_accuracy.py.
 
-Nothing here touches the DB or Streamlit: every function takes a DataFrame of
-`decisions` rows (see data/schema/001_init.sql) and returns plain data.
+Nothing here touches the DB or the web layer: every function takes a DataFrame
+of `decisions` rows (see data/schema/001_init.sql) and returns plain data.
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import pandas as pd
 
 from models.regime.trend_chop_classifier import CHOP, TREND
 
-# Display column names, kept in one place so app.py's Styler and column captions
-# can't drift from what latest_picks_table() actually emits.
+# Display column names, kept in one place so the frontend's captions can't
+# drift from what latest_picks_table() actually emits.
 COL_SYMBOL = "Symbol"
 COL_DIRECTION = "Direction"
 COL_REGIME = "Market regime"

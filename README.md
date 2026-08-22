@@ -1,18 +1,28 @@
 # Trading System
 
-Weekly/biweekly rebalanced **equity long/short screener**: scans the S&P 500,
-scores every name with an ensemble forecast model, and only shortlists
-trades the model is actually confident about (ensemble members agree on
-direction + predicted return clears a threshold) — long or short, whichever
-the data supports. Built for a 3-person team on $25k–$110k capital.
+Weekly/biweekly rebalanced **equity screener**: scans the S&P 500, scores
+every name with an ensemble forecast model, and only shortlists trades the
+model is actually confident about (ensemble members agree on direction +
+predicted return clears a threshold). Long-only by default — the short
+side is built and tested but switched off (`ALLOW_SHORTS`, see below).
+Built for a 3-person team on $25k–$110k capital.
 
 This is engineering scaffolding for the system described in the build plan —
 **not financial advice, and not a signal source.** Nothing here should be
 used with real money until it has been through Phases 6–7 (paper trading,
 then small live capital) end to end. Directional accuracy on the current
-feature set has hovered around ~50% (a coin flip) in walk-forward testing —
-see `models/train.py`'s `directional_accuracy_when_confident` metric before
-trusting any shortlist this produces.
+feature set has hovered around ~50% (a coin flip) in walk-forward testing.
+
+**It has not beaten buying and holding the same universe.** Every
+evaluation now reports a `benchmark_return` — the equal-weight forward
+return of every candidate row in the same test window — next to the
+model's return, and `excess_return` (model minus benchmark) is the
+headline metric. At a 20-day horizon the model returned +0.81% per trade
+net of costs against a +1.15% benchmark: an excess of **-0.34%, negative
+in 10 folds out of 10**. Read `excess_return` before trusting any
+shortlist this produces; a positive return with a negative excess means
+the strategy made money and would have made more doing nothing. See
+`models/evaluation.py`.
 
 **Not the leveraged-ETF strategy anymore.** The original design traded a
 fixed list of 4 leveraged ETFs (SPY/QQQ/TQQQ/SQQQ). That's been replaced by
@@ -44,40 +54,53 @@ Fully working now:
   (`models/forecast/ensemble.py`) — a single LightGBM model has no native
   confidence signal, so this trains K models with different seeds and only
   treats a prediction as trustworthy if they agree on direction (Phase 3)
-- **The screener** (`models/screener.py`): scores the full universe, ranks
-  by conviction (agreement × magnitude), sizes the shortlist via
-  `risk/sizing.py`, and logs candidates to `decisions` (mode=paper,
-  nothing executed) — it does not place orders, see Non-goals below
-- Long **and short** support: `MAX_SHORT_POSITION_PCT` (more conservative
-  than the long cap — short losses are structurally uncapped), an
-  Alpaca `is_shortable()` pre-check, IBKR's lack of an equivalent
-  documented in `execution/broker_ibkr.py`
+- **The screener** (`models/screener.py`): scores the full universe,
+  concentrates into the top 2 highest-conviction picks (confidence-weighted
+  split, not a diversified top-10 book), and attaches genuine per-decision
+  reasoning (LightGBM `pred_contrib` — real Tree SHAP feature contributions,
+  not just global feature importance)
+- **`execution/trading_loop.py`**: takes the screener's shortlist and
+  actually places (paper) orders — pre/post-trade circuit breaker checks,
+  full rebalance (closes anything not in the new shortlist), reconciliation,
+  equity recording, extended-hours support (limit orders outside RTH, since
+  market orders aren't accepted at all then). Hard-enforced paper-only by
+  construction: never passes `confirm_live=True`. `scripts/run_weekly_cycle.py`
+  chains the full pipeline (universe/price/fundamentals/news refresh →
+  screen → trade); `infra/launchd/` schedules it weekly on macOS.
+- Short support, **off by default** (`ALLOW_SHORTS=false`): shorts paid
+  -1.069% per trade at a 41.6% win rate over the walk-forward (worse at
+  20 days: -2.71% at 42.7%), so short candidates are dropped before
+  sizing. The path is intact — `MAX_SHORT_POSITION_PCT` (more
+  conservative than the long cap, since short losses are structurally
+  uncapped), an Alpaca `is_shortable()` pre-check, IBKR's lack of an
+  equivalent documented in `execution/broker_ibkr.py` — so it can be
+  switched back on if shorts ever earn it
 - Leveraged-ETF **daily-reset decay simulator** (Phase 4, kept but inactive
   — see above)
 - Event-driven backtest engine + cost model (Phase 4)
 - Position sizing + circuit breakers (Phase 5)
 - Alpaca paper/live broker wrapper (Phase 5)
 - **IBKR broker wrapper** via TWS/IB Gateway (default; same ports as Blue Chip bot)
-- Streamlit monitoring dashboard: decisions, price history, forecast-accuracy
-  trend, equity/drawdown chart, circuit-breaker status panel (Phase 8) — the
-  latter two need `monitoring.equity.record_equity_snapshot()` and
-  `monitoring.breaker_state.check_and_record_breakers()` wired into the
-  execution loop once paper trading is running, to have data to show
-- Slack alerting (needs `SLACK_WEBHOOK_URL`)
+- Custom monitoring dashboard (`monitoring/dashboard/server.py` — FastAPI +
+  vanilla JS, no Streamlit): every open position with live P&L and the
+  model's actual reasoning for entering it, decision history, walk-forward
+  analysis from MLflow, live directional hit-rate, equity/drawdown,
+  circuit-breaker status, and the test suite runnable on demand. `make dashboard`
+- Alerting: Slack webhook (`SLACK_WEBHOOK_URL`) with automatic fallback to
+  the Telegram approval bot when Slack is unconfigured/down; entry points
+  also log to a rotating `logs/trading-system.log`
 - Unit tests across ingestion, features, the ensemble model, the screener,
   sizing, and the highest-risk modules (decay sim, validators, circuit breakers)
 
 Stubbed with a clear interface, needs a vendor/API key + your judgment calls:
-- Regime (trend-vs-chop) classifier — the rule-based ADX version is now wired
-  into the screener per symbol (each name is tagged trend/chop from its latest
-  `adx_14` and chop names get their position damped via `risk/sizing.py`;
-  the tag is also logged to `decisions.regime`). The trainable variant is
-  still unwired — swap it in once you have labeled regime history; no vendor
-  needed, this one's a training-data problem, not an API problem
+- Regime (trend-vs-chop) classifier (rule-based ADX stub — swap in a trained
+  model once you have walk-forward infra validated and labeled regime history;
+  no vendor needed, this one's a training-data problem, not an API problem)
 
-Explicitly **not built yet**: nothing wires the screener's output to
-`execution/broker.py` — it produces and logs candidates, it doesn't place
-orders. That's the next step before paper trading can actually run.
+The screener-to-broker wiring above (`execution/trading_loop.py`, driven by
+`scripts/run_weekly_cycle.py`) is paper-only by construction: it never passes
+`confirm_live=True` to `get_broker()`, so going live requires deliberately
+editing code, not flipping an environment variable.
 
 ## Quickstart
 
@@ -92,7 +115,7 @@ python -m data.ingest.fundamentals --universe   # slow on a rate-limited Polygon
 python -m data.ingest.news --universe
 python -m features.build_features --universe --feature-set-id v3
 python -m models.train --universe --feature-set-id v3 --n-folds 6
-python -m models.screener --universe --feature-set-id v3 --top-k 10
+python -m models.screener --universe --feature-set-id v3   # book size comes from SCREENER_TOP_K in .env, default 10
 pytest                                    # run unit tests
 ```
 
@@ -133,3 +156,15 @@ tests/       unit tests
 - MLflow (self-hosted) for model/run tracking.
 - S&P 500 as the tradeable universe — not a broader index, to keep vendor
   rate limits and data quality manageable on a free-tier API key.
+
+## Known evaluation caveat: survivorship bias
+
+The universe is scraped from **today's** Wikipedia S&P 500 list. Any
+backtest or walk-forward run over history therefore only ever sees
+companies that survived long enough to still be in the index now — the
+losers that were removed (bankrupt, acquired at a discount, demoted) are
+exactly the names the evaluation can't see, which biases every historical
+metric upward. Every universe refresh now appends a dated membership
+snapshot to the `universe_snapshot` table (`data/schema/006_universe_snapshot.sql`),
+so runs from here on can use point-in-time membership; history from before
+the first snapshot stays biased and should be read accordingly.

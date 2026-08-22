@@ -1,9 +1,8 @@
 """
-Regime classifier: trend vs. chop. The screener uses this per symbol
-(models/screener.py:per_symbol_regimes) to damp position sizes for names
-in a choppy, range-bound state — see risk.sizing.regime_adjusted_size.
-(Originally written to gate the leveraged-ETF book, where chop additionally
-causes daily-reset decay — see backtest/decay_sim.py, kept but inactive.)
+Regime classifier: trend vs. chop. This is what gates whether the
+leveraged-ETF position gets sized up, down, or flattened — a leveraged ETF
+held through a choppy, range-bound market bleeds value through daily-reset
+decay (see backtest/decay_sim.py) even if the underlying is flat.
 
 Ships two implementations:
   - RuleBasedRegime: ADX-threshold rule, zero training required, good enough
