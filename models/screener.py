@@ -334,6 +334,25 @@ def _attach_reasoning(
         ]
 
 
+@dataclasses.dataclass
+class ScreenResult:
+    """
+    A screen's full output: the shortlist AND the whole scored universe.
+    The weekly cycle's hold rules (execution/hold_rules.py) need a fresh
+    prediction for every HELD symbol, including ones that didn't make the
+    shortlist — "has this position's predicted return flipped sign?" can't
+    be answered from the top-k candidates alone.
+    """
+
+    candidates: list[TradeCandidate]
+    scored: pd.DataFrame  # see score_universe: symbol, predicted_return, direction_agreement, …
+
+    def predicted_return_by_symbol(self) -> dict[str, float]:
+        if self.scored.empty:
+            return {}
+        return dict(zip(self.scored["symbol"], self.scored["predicted_return"], strict=False))
+
+
 def run_screen(
     feature_set_id: str,
     symbols: list[str],
@@ -345,6 +364,31 @@ def run_screen(
     is_shortable_fn: Callable[[str], bool] | None = None,
     total_deploy_pct: float = 1.0,
 ) -> list[TradeCandidate]:
+    """The shortlist-only view of run_screen_with_scores — see ScreenResult for who needs more."""
+    return run_screen_with_scores(
+        feature_set_id,
+        symbols,
+        target_horizon_days=target_horizon_days,
+        n_ensemble_models=n_ensemble_models,
+        min_direction_agreement=min_direction_agreement,
+        min_abs_return=min_abs_return,
+        regime=regime,
+        is_shortable_fn=is_shortable_fn,
+        total_deploy_pct=total_deploy_pct,
+    ).candidates
+
+
+def run_screen_with_scores(
+    feature_set_id: str,
+    symbols: list[str],
+    target_horizon_days: int | None = None,
+    n_ensemble_models: int = 5,
+    min_direction_agreement: float = 0.8,
+    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
+    regime: str = TREND,
+    is_shortable_fn: Callable[[str], bool] | None = None,
+    total_deploy_pct: float = 1.0,
+) -> ScreenResult:
     """
     Trains a fresh ensemble on all available history, scores today's
     snapshot, and sizes `total_deploy_pct` of capital by whichever strategy
@@ -426,7 +470,7 @@ def run_screen(
         strategy=settings.strategy_mode,
         top_k=settings.screener_top_k,
     )
-    return candidates
+    return ScreenResult(candidates=candidates, scored=scored)
 
 
 def apply_full_deployment(

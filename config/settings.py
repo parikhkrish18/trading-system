@@ -135,6 +135,22 @@ class Settings(BaseSettings):
     # measures whether a given value actually earns its keep.
     target_horizon_days: int = Field(default=20, alias="TARGET_HORIZON_DAYS")
 
+    # --- Hold rules (execution/hold_rules.py) ---
+    # With multi-week holds (TARGET_HORIZON_DAYS above), a position must NOT
+    # be closed just because something else scored marginally higher on
+    # Monday. A held position is closed only when a real exit condition
+    # fires; these settings define "real".
+    #
+    # Consecutive weekly cycles a position can miss the shortlist before it
+    # is proposed for closing. 2 means: slip out once, you're held; still
+    # out the following week, the close goes to the human.
+    hold_max_missed_cycles: int = Field(default=2, alias="HOLD_MAX_MISSED_CYCLES")
+    # Unrealized-loss fraction at which a close is proposed (stop loss).
+    hold_stop_loss_pct: float = Field(default=0.08, alias="HOLD_STOP_LOSS_PCT")
+    # Unrealized-gain fraction at which a close is proposed — the top of the
+    # 3-10% move band the swing horizon targets.
+    hold_take_profit_pct: float = Field(default=0.10, alias="HOLD_TAKE_PROFIT_PCT")
+
     # --- Strategy selection ---
     # "diversified" (default) = top-k book sized by risk.sizing.select_trades
     # under the conservative caps above. "concentrated" = the 2-trade

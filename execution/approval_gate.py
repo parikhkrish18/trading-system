@@ -65,6 +65,7 @@ AUTO = "auto"
 _REASON_LABELS = {
     "screen": "weekly screen pick",
     "out_of_book": "no longer in this cycle's book",
+    "exit_rule": "hold-rule exit condition fired",
     "contradiction": "signals now contradict this position",
     "reactivation": "redeploying freed capital",
 }

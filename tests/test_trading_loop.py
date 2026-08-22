@@ -5,13 +5,20 @@ import pytest
 
 from execution import trading_loop
 from execution.approval_gate import ApprovalOutcome, number_proposals
-from models.screener import TradeCandidate
+from models.screener import ScreenResult, TradeCandidate
 from monitoring import reasoning
 from risk.circuit_breakers import BreakerResult
 
 # Grabbed before the autouse _no_real_db_writes fixture replaces the module
 # attribute with a no-op, so tests can still exercise the real function.
 _real_log_decisions = trading_loop._log_decisions
+
+
+def _screen(candidates, scored=None):
+    """Wrap a candidate list the way run_screen_with_scores returns it."""
+    if scored is None:
+        scored = pd.DataFrame(columns=["symbol", "predicted_return"])
+    return ScreenResult(candidates=list(candidates or []), scored=scored)
 
 
 def _approve_all(proposals, *, context, **kwargs):
@@ -102,6 +109,17 @@ def _no_followups(monkeypatch):
     monkeypatch.setattr(trading_loop, "send_followup", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_hold_state_io(monkeypatch):
+    """
+    Hold-rule state lives in the DB; tests run without one. No prior
+    misses by default — tests exercising the miss counter patch
+    load_missed_cycles themselves.
+    """
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {})
+    monkeypatch.setattr(trading_loop, "store_missed_cycles", lambda engine, counts: None)
+
+
 def test_log_decisions_builds_full_phase_reasoning_for_candidates_and_closures(monkeypatch):
     """
     Exercises the real _log_decisions (not the autouse no-op mock) to check
@@ -153,7 +171,7 @@ def test_run_cycle_flattens_and_skips_trading_on_pretrade_breaker(monkeypatch):
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [BreakerResult(True, "drawdown breach")])
 
     screen_called = []
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: screen_called.append(1))
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen(screen_called.append(1)))
 
     result = trading_loop.run_cycle("v3", ["AAPL"])
 
@@ -169,8 +187,8 @@ def test_run_cycle_dry_run_never_touches_broker(monkeypatch):
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
     monkeypatch.setattr(
-        trading_loop, "run_screen",
-        lambda *a, **k: [_candidate("AAPL", "long", 0.1)],
+        trading_loop, "run_screen_with_scores",
+        lambda *a, **k: _screen([_candidate("AAPL", "long", 0.1)]),
     )
 
     result = trading_loop.run_cycle("v3", ["AAPL"], dry_run=True)
@@ -186,7 +204,7 @@ def test_run_cycle_no_candidates_returns_early(monkeypatch):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([]))
 
     result = trading_loop.run_cycle("v3", ["AAPL"])
 
@@ -196,17 +214,20 @@ def test_run_cycle_no_candidates_returns_early(monkeypatch):
 
 def test_run_cycle_closes_positions_not_in_new_candidate_set(monkeypatch):
     """
-    The core rebalance fix: switching from a top-10 diversified book to a
-    top-2 concentrated one means everything not in this cycle's shortlist
-    must actually get closed, not just left open from a prior cycle.
+    Positions that have been out of the shortlist HOLD_MAX_MISSED_CYCLES
+    consecutive cycles get closed. Here OLD1/OLD2 already missed once, so
+    this cycle's miss is their second — the exit condition fires.
+    (A single miss is a hold — see the hold-rule tests further down.)
     """
     broker = _FakeBroker(positions={"OLD1": 10.0, "OLD2": -5.0, "TSLA": 3.0})
     monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("TSLA", "long", 0.5)])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("TSLA", "long", 0.5)]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"TSLA": 100.0})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"OLD1": 1, "OLD2": 1})
 
     result = trading_loop.run_cycle("v3", ["TSLA", "OLD1", "OLD2"])
 
@@ -239,8 +260,10 @@ def test_run_cycle_proposals_carry_reasoning_and_close_pnl(monkeypatch):
         reasoning.phase_signals("trend", [{"feature_name": "mom_ret_5d", "value": 0.05, "contribution": 0.02}]),
         reasoning.phase_forecast(0.02, 0.9, 0.018),
     ]
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [candidate])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([candidate]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"TSLA": 100.0})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"OLD1": 1})  # this miss is its second -> close proposed
 
     seen = {}
 
@@ -266,8 +289,10 @@ def test_run_cycle_proposals_survive_a_broker_without_pnl_support(monkeypatch):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"OLD1": 1})
 
     seen = {}
 
@@ -282,15 +307,17 @@ def test_run_cycle_proposals_survive_a_broker_without_pnl_support(monkeypatch):
     assert close_p.current_pnl_usd is None
 
 
-def test_run_cycle_no_candidates_still_closes_stale_positions(monkeypatch):
-    """Zero confidence this cycle should mean fully in cash, not 'leave whatever was open.'"""
+def test_run_cycle_no_candidates_still_closes_positions_whose_exit_fired(monkeypatch):
+    """Zero fresh candidates doesn't mute the exit rules: a position at its miss limit is still proposed for closing."""
     broker = _FakeBroker(positions={"OLD1": 10.0})
     monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"OLD1": 1})
 
     result = trading_loop.run_cycle("v3", ["OLD1"])
 
@@ -305,8 +332,8 @@ def test_run_cycle_isolates_per_symbol_order_failures(monkeypatch):
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
     monkeypatch.setattr(
-        trading_loop, "run_screen",
-        lambda *a, **k: [_candidate("BAD", "long", 0.1), _candidate("GOOD", "long", 0.05)],
+        trading_loop, "run_screen_with_scores",
+        lambda *a, **k: _screen([_candidate("BAD", "long", 0.1), _candidate("GOOD", "long", 0.05)]),
     )
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"BAD": 100.0, "GOOD": 50.0})
 
@@ -334,7 +361,7 @@ def test_run_cycle_flattens_on_posttrade_breaker(monkeypatch):
 
     monkeypatch.setattr(trading_loop, "_run_breaker_check", fake_check)
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("AAPL", "long", 0.1)]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"AAPL": 100.0})
 
     result = trading_loop.run_cycle("v3", ["AAPL"])
@@ -356,7 +383,7 @@ def test_run_cycle_never_passes_confirm_live(monkeypatch):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([]))
 
     trading_loop.run_cycle("v3", ["AAPL"])
 
@@ -399,8 +426,8 @@ def test_run_cycle_trades_only_the_approved_subset(monkeypatch):
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
     monkeypatch.setattr(
-        trading_loop, "run_screen",
-        lambda *a, **k: [_candidate("YES", "long", 0.1), _candidate("NOPE", "long", 0.1)],
+        trading_loop, "run_screen_with_scores",
+        lambda *a, **k: _screen([_candidate("YES", "long", 0.1), _candidate("NOPE", "long", 0.1)]),
     )
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"YES": 100.0, "NOPE": 100.0})
 
@@ -417,8 +444,10 @@ def test_run_cycle_gates_closes_too(monkeypatch):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("TSLA", "long", 0.5)])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("TSLA", "long", 0.5)]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"TSLA": 100.0})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"KEEP": 1})  # exit fires -> close proposed
 
     # Approve the TSLA open; reject closing KEEP.
     trading_loop.run_cycle("v3", ["TSLA", "KEEP"], request_fn=_gate_returning({"TSLA"}))
@@ -435,7 +464,7 @@ def test_run_cycle_timeout_rejects_everything_and_places_no_orders(monkeypatch):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("AAPL", "long", 0.1)]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"AAPL": 100.0})
 
     result = trading_loop.run_cycle("v3", ["AAPL", "OLD"], request_fn=_timeout_gate)
@@ -452,8 +481,10 @@ def test_run_cycle_logs_rejected_proposals_with_their_status(monkeypatch):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("AAPL", "long", 0.1)]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"AAPL": 100.0})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"OLD": 1})  # exit fires -> close proposed
     monkeypatch.setattr(trading_loop, "_log_decisions", lambda *a, **k: captured.update(kwargs=k, args=a))
 
     trading_loop.run_cycle("v3", ["AAPL", "OLD"], request_fn=_timeout_gate)
@@ -538,7 +569,7 @@ def test_run_cycle_dry_run_never_asks_anyone(monkeypatch):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("AAPL", "long", 0.1)]))
 
     def _never(*a, **k):
         raise AssertionError("dry run must never reach the approval gate")
@@ -557,7 +588,7 @@ def test_run_cycle_fetches_prices_after_the_gate_not_before(monkeypatch):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: [_candidate("AAPL", "long", 0.1)])
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("AAPL", "long", 0.1)]))
 
     def fake_prices(symbols):
         order.append("prices")
@@ -581,7 +612,7 @@ def _wire_basic_cycle(monkeypatch, broker, candidates, prices):
     monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
     monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
-    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: candidates)
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen(candidates))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: prices)
 
 
@@ -664,6 +695,8 @@ def test_kept_positions_shrink_what_the_approved_picks_can_deploy(monkeypatch):
     """A rejected close stays open and its capital is NOT re-allocated on top."""
     broker = _FakeBroker(positions={"KEEP": 100.0}, portfolio_value=100_000.0)  # 100 sh * $400 = 40% of book
     monkeypatch.setattr(trading_loop.settings, "max_single_position_pct", 1.0)
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"KEEP": 1})  # exit fires -> close proposed (and rejected below)
     _wire_basic_cycle(
         monkeypatch, broker, [_candidate("AAPL", "long", 0.1)], {"AAPL": 100.0, "KEEP": 400.0}
     )
@@ -688,3 +721,136 @@ def test_approved_sizes_land_in_the_decisions_log(monkeypatch):
 
     (logged_candidate,) = captured["args"][0]
     assert logged_candidate.target_position_pct == pytest.approx(1.0)  # full book, one approved pick
+
+
+# --- multi-week hold rules (stop the weekly churn) --------------------------
+
+
+def test_position_that_merely_slips_in_rank_is_held(monkeypatch):
+    """The whole point of the hold rules: one missed Monday is not an exit condition."""
+    broker = _FakeBroker(positions={"HELD": 10.0})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("NEW", "long", 0.1)], {"NEW": 100.0, "HELD": 50.0})
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["NEW", "HELD"], request_fn=gate)
+
+    proposed_closes = [p.symbol for p in seen["proposals"] if p.action == "close"]
+    assert proposed_closes == []  # HELD slipped in rank but nothing fired
+    assert ("HELD", 0.0) not in broker.submitted
+
+
+def test_position_whose_prediction_flips_sign_is_proposed_for_closing(monkeypatch):
+    """A confident prediction against the held side is a real exit condition, even on the first miss."""
+    broker = _FakeBroker(positions={"FLIP": 10.0})  # held long
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 99)  # isolate the flip condition
+    scored = pd.DataFrame({"symbol": ["FLIP"], "predicted_return": [-0.03]})  # model now says down 3%
+    broker2 = broker
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker2)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([], scored=scored))
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"FLIP": 100.0})
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["FLIP"], request_fn=gate)
+
+    (close_p,) = seen["proposals"]
+    assert close_p.action == "close" and close_p.symbol == "FLIP"
+    assert "against the long position" in close_p.reasoning[0]["summary"]
+    assert ("FLIP", 0.0) in broker.submitted  # approved -> closed
+
+
+def test_stop_loss_breach_is_proposed_for_closing(monkeypatch):
+    broker = _FakeBroker(positions={"DOWN": 10.0})
+    broker.get_positions_detailed = lambda: [
+        {"symbol": "DOWN", "qty": 10.0, "unrealized_plpc": -0.12, "unrealized_pl": -1200.0}
+    ]
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 99)
+    monkeypatch.setattr(trading_loop.settings, "hold_stop_loss_pct", 0.08)
+    _wire_basic_cycle(monkeypatch, broker, [], {"DOWN": 50.0})
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["DOWN"], request_fn=gate)
+
+    (close_p,) = seen["proposals"]
+    assert "stop loss" in close_p.reasoning[0]["summary"]
+
+
+def test_take_profit_breach_is_proposed_for_closing(monkeypatch):
+    broker = _FakeBroker(positions={"UP": 10.0})
+    broker.get_positions_detailed = lambda: [
+        {"symbol": "UP", "qty": 10.0, "unrealized_plpc": 0.11, "unrealized_pl": 1100.0}
+    ]
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 99)
+    monkeypatch.setattr(trading_loop.settings, "hold_take_profit_pct", 0.10)
+    _wire_basic_cycle(monkeypatch, broker, [], {"UP": 50.0})
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["UP"], request_fn=gate)
+
+    (close_p,) = seen["proposals"]
+    assert "profit target" in close_p.reasoning[0]["summary"]
+
+
+def test_position_already_closed_by_the_contradiction_monitor_is_not_double_closed(monkeypatch):
+    """
+    The contradiction monitor closed GONE mid-week, so the broker no longer
+    holds it. The weekly cycle must not propose closing it again, and its
+    stale miss counter must be dropped from the persisted hold state.
+    """
+    broker = _FakeBroker(positions={"KEPT": 10.0})  # GONE is absent: the monitor already closed it
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("KEPT", "long", 0.1)], {"KEPT": 100.0})
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"GONE": 1, "KEPT": 0})
+
+    stored = {}
+    monkeypatch.setattr(trading_loop, "store_missed_cycles", lambda engine, counts: stored.update(counts=counts))
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["KEPT", "GONE"], request_fn=gate)
+
+    assert all(p.symbol != "GONE" for p in seen["proposals"])  # nothing proposed for a position that no longer exists
+    assert "GONE" not in stored["counts"]  # stale state dropped
+    assert "KEPT" in stored["counts"]
+
+
+def test_miss_counter_advances_and_persists_for_held_positions(monkeypatch):
+    broker = _FakeBroker(positions={"HELD": 10.0})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 3)
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("NEW", "long", 0.1)], {"NEW": 100.0, "HELD": 50.0})
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"HELD": 1})
+
+    stored = {}
+    monkeypatch.setattr(trading_loop, "store_missed_cycles", lambda engine, counts: stored.update(counts=counts))
+
+    trading_loop.run_cycle("v3", ["NEW", "HELD"])
+
+    assert stored["counts"]["HELD"] == 2  # second consecutive miss recorded, position still held
+    assert stored["counts"]["NEW"] == 0  # fresh open starts clean

@@ -378,6 +378,27 @@ def phase_selection_closed(symbol: str) -> dict:
     }
 
 
+def phase_hold_exit(symbol: str, reasons: list[str], missed_cycles: int) -> dict:
+    """
+    Phase 4, for a held position whose exit condition fired under the
+    multi-week hold rules (execution/hold_rules.py). Unlike the old
+    "wasn't in this week's top picks" story, this says WHICH real exit
+    condition triggered — merely slipping in rank no longer closes anything.
+    """
+    return {
+        "phase": 4,
+        "title": "Candidate Selection & Sizing",
+        "summary": f"{symbol}: exit condition fired — {'; '.join(reasons)}.",
+        "lines": [
+            "Positions are held across weekly cycles until a real exit condition fires "
+            "(consecutive shortlist misses, a confident prediction flip, or a stop/target breach) — "
+            "slipping in rank for one week is not one.",
+            *[f"Fired: {reason}." for reason in reasons],
+            f"Cycles out of the shortlist so far: {missed_cycles}.",
+        ],
+    }
+
+
 def phase_selection(
     symbol: str,
     side: str,

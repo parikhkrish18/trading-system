@@ -30,10 +30,11 @@ from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
 from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.broker import get_broker
+from execution.hold_rules import evaluate_holds, load_missed_cycles, store_missed_cycles
 from execution.reconciliation import reconcile_positions, summarize
 from features.quant.momentum import adx
 from models.regime.trend_chop_classifier import CHOP, RuleBasedRegime
-from models.screener import build_correlation_matrix, run_screen
+from models.screener import build_correlation_matrix, run_screen_with_scores
 from monitoring import reasoning
 from monitoring.alerts import alert_circuit_breaker, configure_file_logging, send_slack_alert
 from monitoring.breaker_state import check_and_record_breakers
@@ -227,6 +228,14 @@ def _allocation_confirmation(allocation, approved_candidates) -> str:
     return message
 
 
+def _store_hold_state(engine, counts: dict[str, int]) -> None:
+    """Persist the consecutive-miss counters; a state write must never kill a completed cycle."""
+    try:
+        store_missed_cycles(engine, counts)
+    except Exception:
+        logger.warning("Could not persist hold state — miss counters will restart from the last stored values.")
+
+
 def _flatten_and_alert(broker, reason: str) -> None:
     logger.critical("Circuit breaker triggered: %s — flattening all positions.", reason)
     broker.flatten_all()
@@ -258,6 +267,7 @@ def _log_decisions(
     rejected_candidates=(),
     rejected_close_symbols=(),
     approval_status_by_symbol: dict[str, str] | None = None,
+    close_phase4_by_symbol: dict[str, dict] | None = None,
 ) -> None:
     """
     Logs one decisions row per symbol touched this cycle — new/adjusted
@@ -298,7 +308,7 @@ def _log_decisions(
         rows.append(_row(c.symbol, c.predicted_return, c.target_position_pct, executed.get(c.symbol), c.direction_agreement, full_reasoning))
 
     for symbol in closing_symbols:
-        phase4 = reasoning.phase_selection_closed(symbol)
+        phase4 = (close_phase4_by_symbol or {}).get(symbol) or reasoning.phase_selection_closed(symbol)
         phase5 = reasoning.phase_execution(symbol, "closed", None, order_type)
         phase6 = phase6_by_symbol.get(symbol) or reasoning.phase_reconciliation(symbol, 0.0, executed.get(symbol, 0.0), False)
         phase7 = reasoning.phase_ongoing_monitoring(closed=True)
@@ -314,7 +324,7 @@ def _log_decisions(
 
     for symbol in rejected_close_symbols:
         status = statuses.get(symbol, "rejected")
-        phase4 = reasoning.phase_selection_closed(symbol)
+        phase4 = (close_phase4_by_symbol or {}).get(symbol) or reasoning.phase_selection_closed(symbol)
         phase5 = reasoning.phase_execution_rejected(symbol, status)
         # closed=False: the close was refused, so the position is still open
         # and still under hourly contradiction watch.
@@ -348,7 +358,8 @@ def run_cycle(
 
     regime = _market_regime(engine)
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
-    candidates = run_screen(feature_set_id, symbols, regime=regime, is_shortable_fn=is_shortable_fn)
+    screen = run_screen_with_scores(feature_set_id, symbols, regime=regime, is_shortable_fn=is_shortable_fn)
+    candidates = screen.candidates
 
     # Phases 2-4 (signals, forecast, selection/sizing) were built per-candidate
     # inside run_screen — surface a one-line summary per phase here so Slack
@@ -373,20 +384,47 @@ def run_cycle(
             logger.info("  %s %s target=%.4f pred_return=%.4f agreement=%.2f", c.symbol, c.side, c.target_position_pct, c.predicted_return, c.direction_agreement)
         return CycleResult("dry_run", len(candidates), 0, None, broker.get_portfolio_value())
 
-    # Full rebalance to the new target book, not just adjustments layered on
-    # top of whatever was already open: anything currently held that isn't
-    # one of this cycle's candidates gets closed. Without this, "top 2"
-    # would only ever mean "2 new positions added," while last cycle's
-    # picks — no longer confident, by definition, since they didn't make
-    # this cycle's shortlist — would sit open indefinitely.
+    # Multi-week holds: a position is NOT closed just because something
+    # scored marginally higher this Monday. execution/hold_rules.py decides
+    # which held positions have a REAL exit condition (N consecutive
+    # shortlist misses, a confident prediction flip, a stop/target breach);
+    # everything else is held. The hourly contradiction monitor is the
+    # fourth exit path and runs separately — a position it already closed
+    # simply isn't in current_positions here, so nothing double-closes.
     portfolio_value = broker.get_portfolio_value()
     current_positions = broker.get_positions()
     candidate_symbols = {c.symbol for c in candidates}
-    closing_symbols = [s for s, qty in current_positions.items() if s not in candidate_symbols and qty != 0]
+    pnl_by_symbol = current_pnl_by_symbol(broker)
+    try:
+        prior_missed = load_missed_cycles(engine)
+    except Exception:
+        logger.warning("Could not load hold state — treating every held position as freshly out of the shortlist.")
+        prior_missed = {}
+    hold_decisions = evaluate_holds(
+        positions=current_positions,
+        shortlist=candidate_symbols,
+        predictions=screen.predicted_return_by_symbol(),
+        pnl_pct={s: pnl for s, (pnl, _) in pnl_by_symbol.items()},
+        prior_missed=prior_missed,
+        max_missed_cycles=settings.hold_max_missed_cycles,
+        stop_loss_pct=settings.hold_stop_loss_pct,
+        take_profit_pct=settings.hold_take_profit_pct,
+    )
+    closing_decisions = [d for d in hold_decisions if d.close]
+    held_decisions = [d for d in hold_decisions if not d.close and d.symbol not in candidate_symbols]
+    closing_symbols = [d.symbol for d in closing_decisions]
+    close_phase4_by_symbol = {
+        d.symbol: reasoning.phase_hold_exit(d.symbol, d.reasons, d.missed_cycles) for d in closing_decisions
+    }
+    if held_decisions:
+        held_summary = ", ".join(f"{d.symbol} ({d.missed_cycles} missed cycle(s))" for d in held_decisions)
+        logger.info("Holding despite missing the shortlist — no exit condition fired: %s", held_summary)
+        send_slack_alert(f"Held positions (no exit condition fired): {held_summary}", severity="info")
 
     if not candidates and not closing_symbols:
-        logger.info("No candidates cleared the confidence bar, and nothing open to close — staying in cash.")
-        send_slack_alert("No confident candidates this cycle — nothing traded.", severity="info")
+        logger.info("No candidates cleared the confidence bar, and no exit condition fired — holding the book as-is.")
+        send_slack_alert("No confident candidates this cycle — nothing traded, existing positions held.", severity="info")
+        _store_hold_state(engine, {d.symbol: d.missed_cycles for d in held_decisions})
         return CycleResult("no_candidates", 0, 0, None, portfolio_value)
 
     # --- The human gate. Everything below this point only acts on what a
@@ -394,16 +432,15 @@ def run_cycle(
     # opens), replies polled until answered or timeout, silence = rejected.
     # request_fn is injectable for tests; the default asks a real phone.
     # Every proposal carries its "why" (the screener's reasoning phases for
-    # opens, the selection story for closes) plus current P&L for closes —
-    # the human on the phone gets the same explanation Slack and the
-    # dashboard do, not just a ticker and a size.
-    pnl_by_symbol = current_pnl_by_symbol(broker)
+    # opens, the fired exit condition for closes) plus current P&L for
+    # closes — the human on the phone gets the same explanation Slack and
+    # the dashboard do, not just a ticker and a size.
     proposals = [
         ProposedTrade(
             index=0, symbol=s, action="close",
             side="long" if current_positions.get(s, 0) >= 0 else "short",
-            target_position_pct=0.0, reason="out_of_book",
-            reasoning=[reasoning.phase_selection_closed(s)],
+            target_position_pct=0.0, reason="exit_rule",
+            reasoning=[close_phase4_by_symbol[s]],
             current_pnl_pct=pnl_by_symbol.get(s, (None, None))[0],
             current_pnl_usd=pnl_by_symbol.get(s, (None, None))[1],
         )
@@ -437,12 +474,15 @@ def run_cycle(
 
     # Prices fetched AFTER the gate, not before: a human reply can take up
     # to the full approval timeout, and shares must be sized off quotes
-    # from after that wait, not before it. Kept positions (rejected closes,
-    # rejected re-picks of held names) are included so their tied-up
-    # capital can be valued when computing what's deployable.
-    kept_symbols = rejected_close_symbols + [
-        c.symbol for c in rejected_candidates if current_positions.get(c.symbol)
-    ]
+    # from after that wait, not before it. Kept positions (holds with no
+    # exit condition, rejected closes, rejected re-picks of held names) are
+    # included so their tied-up capital can be valued when computing what's
+    # deployable.
+    kept_symbols = (
+        rejected_close_symbols
+        + [c.symbol for c in rejected_candidates if current_positions.get(c.symbol)]
+        + [d.symbol for d in held_decisions]
+    )
     prices = _latest_prices(
         [c.symbol for c in approved_candidates] + approved_close_symbols + kept_symbols
     )
@@ -533,6 +573,17 @@ def run_cycle(
         rejected_candidates=rejected_candidates,
         rejected_close_symbols=rejected_close_symbols,
         approval_status_by_symbol=approval_status_by_symbol,
+        close_phase4_by_symbol=close_phase4_by_symbol,
+    )
+
+    # Hold state reflects what is ACTUALLY still open after execution: an
+    # approved close that failed at the broker keeps its miss counter, a
+    # rejected close keeps counting (it will be re-proposed), a fresh open
+    # starts at zero, anything gone drops out.
+    missed_by_symbol = {d.symbol: d.missed_cycles for d in hold_decisions}
+    _store_hold_state(
+        engine,
+        {s: missed_by_symbol.get(s, 0) for s, qty in actual_positions.items() if qty != 0},
     )
 
     phase7_open = len(approved_candidates)
