@@ -683,7 +683,28 @@ async function loadModeBadge() {
 }
 
 // ---------- Orchestration ----------
+// Every panel fetches independently, so a missing token would otherwise
+// show up as a dozen separately-broken panels and no explanation. One probe
+// up front turns that into a single sentence saying what to do.
+async function checkAccess() {
+  const banner = document.getElementById("auth-banner");
+  try {
+    await fetchJSON("/api/jobs");
+    banner.hidden = true;
+    return true;
+  } catch (e) {
+    if (!/^403/.test(e.message)) {
+      banner.hidden = true;
+      return true; // some other failure — let the panels report it themselves
+    }
+    banner.textContent = e.message;
+    banner.hidden = false;
+    return false;
+  }
+}
+
 async function loadAll() {
+  if (!(await checkAccess())) return;
   await Promise.allSettled([
     loadModeBadge(),
     loadPositions(),
@@ -703,7 +724,10 @@ async function loadAll() {
 
 const tokenInput = document.getElementById("api-token-input");
 tokenInput.value = getApiToken();
-tokenInput.addEventListener("change", () => setApiToken(tokenInput.value.trim()));
+tokenInput.addEventListener("change", () => {
+  setApiToken(tokenInput.value.trim());
+  loadAll(); // a freshly-pasted token should fill the page, not need a second click
+});
 
 document.getElementById("refresh-btn").addEventListener("click", loadAll);
 document.getElementById("run-tests-btn").addEventListener("click", runTestsNow);

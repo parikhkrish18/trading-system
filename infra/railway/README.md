@@ -111,20 +111,33 @@ columns natively.
 
 ## What the token protects
 
-`DASHBOARD_API_TOKEN` gates the state-changing endpoints — `POST
-/api/tests/run` and `POST /api/jobs/*/run`. Once the dashboard is bound to
-a public interface it is not optional: with a non-loopback bind and no
-token, `monitoring/dashboard/server.py::_require_api_token` refuses those
-endpoints outright rather than leaving an open interface one blank variable
-away from running subprocesses.
+`DASHBOARD_API_TOKEN` gates **every** `/api` route — the reads as much as
+`POST /api/tests/run` and `POST /api/jobs/*/run`. Once the dashboard is
+bound to a public interface it is not optional: with a non-loopback bind
+and no token, `monitoring/dashboard/server.py::_require_api_token` refuses
+outright rather than leaving the interface one blank variable from being
+open.
 
-The read-only `GET` endpoints are **not** gated. Anyone who reaches the URL
-can see positions, decisions and equity. That is the current design; if the
-holdings need to be private, that is a separate change and a real one.
+Reads are gated because of what they return — every open position and its
+size, the model's reasoning for holding it, and the equity curve. On paper
+money that is only embarrassing; the point is that publishing it must not
+become the habit before real money, and a URL that was public for months
+does not quietly become private later.
 
-Paste the same token into the dashboard's "Operator token" box (top right)
-to use the buttons; it is kept in that browser's localStorage and sent as a
-bearer header.
+The gate is declared once on the `FastAPI` app rather than per route, so an
+endpoint added later is private by default instead of private only if its
+author remembered. A test walks the route table and fails if any `/api`
+route escapes it.
+
+The static page itself (HTML, JS, CSS) stays reachable — it has to load
+before anyone can type a token into it, and it carries no data of its own.
+
+On a hosted dashboard, paste the token into the **Operator token** box at
+the top right. It is kept in that browser's localStorage and sent as a
+bearer header; the server remains the thing that enforces it. Until it is
+entered the page shows a single explanatory banner rather than a dozen
+broken panels. On localhost nothing changes: a loopback bind with no token
+configured needs no ceremony.
 
 ## What hosting does not change
 

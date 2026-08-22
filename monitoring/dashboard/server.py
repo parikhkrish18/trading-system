@@ -41,7 +41,51 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LAST_TEST_RUN_PATH = REPO_ROOT / "logs" / "last_test_run.json"
 
-app = FastAPI(title="Trading System Monitor")
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _require_api_token(request: Request) -> None:
+    """
+    The gate on every /api route — reads included. Three cases:
+
+    - Token configured: every caller must present it as a bearer header,
+      loopback or not — configuring a token means wanting it checked.
+    - No token, loopback bind: allowed. The only people who can reach a
+      127.0.0.1 dashboard are already on the machine, so local development
+      needs no ceremony.
+    - No token, non-loopback bind: 403 always. An open interface with an
+      endpoint that runs subprocesses must not be one blank env var away
+      from the network.
+
+    Reads are gated as well as writes. What this dashboard returns is the
+    book — every open position, its size, the model's reasoning for holding
+    it, and the equity curve. On paper money that is merely embarrassing;
+    the habit of publishing it is what must not survive to real money, and a
+    URL that was public for months does not quietly become private later.
+    """
+    token = settings.dashboard_api_token
+    if token:
+        supplied = request.headers.get("authorization", "")
+        if not hmac.compare_digest(supplied, f"Bearer {token}"):
+            raise HTTPException(status_code=403, detail="Missing or invalid bearer token.")
+        return
+    if settings.dashboard_host not in _LOOPBACK_HOSTS:
+        raise HTTPException(
+            status_code=403,
+            detail="This endpoint is disabled: the dashboard is bound to a non-loopback "
+                   "interface and DASHBOARD_API_TOKEN is not set.",
+        )
+
+
+# The gate is declared once, on the app, rather than per route: a new
+# endpoint added later is then private by default instead of private only
+# if its author remembered. tests/test_dashboard_server.py enforces that no
+# /api route escapes it.
+#
+# The static frontend is mounted separately (see the bottom of this file)
+# and is deliberately NOT behind the gate — the page has to load before
+# anyone can type a token into it.
+app = FastAPI(title="Trading System Monitor", dependencies=[Depends(_require_api_token)])
 
 
 def _clean_records(df: pd.DataFrame) -> list[dict]:
@@ -441,36 +485,7 @@ def get_last_test_run() -> dict | None:
     return json.loads(LAST_TEST_RUN_PATH.read_text())
 
 
-_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
-
-
-def _require_api_token(request: Request) -> None:
-    """
-    Gate for mutating endpoints. Three cases:
-
-    - Token configured: every caller must present it as a bearer header,
-      loopback or not — configuring a token means wanting it checked.
-    - No token, loopback bind: allowed. The only people who can reach a
-      127.0.0.1 dashboard are already on the machine.
-    - No token, non-loopback bind: 403 always. An open interface with an
-      endpoint that runs subprocesses must not be one blank env var away
-      from the network.
-    """
-    token = settings.dashboard_api_token
-    if token:
-        supplied = request.headers.get("authorization", "")
-        if not hmac.compare_digest(supplied, f"Bearer {token}"):
-            raise HTTPException(status_code=403, detail="Missing or invalid bearer token.")
-        return
-    if settings.dashboard_host not in _LOOPBACK_HOSTS:
-        raise HTTPException(
-            status_code=403,
-            detail="This endpoint is disabled: the dashboard is bound to a non-loopback "
-                   "interface and DASHBOARD_API_TOKEN is not set.",
-        )
-
-
-@app.post("/api/tests/run", dependencies=[Depends(_require_api_token)])
+@app.post("/api/tests/run")
 def run_tests() -> dict:
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "--tb=short"],
@@ -500,9 +515,9 @@ def run_tests() -> dict:
 # request returns immediately. IMPORTANT SAFETY PROPERTY: the "Run trading
 # cycle" button only STARTS the cycle — scripts/run_weekly_cycle.py still
 # walks through the Telegram approval gate before any order exists, so the
-# button authorizes computation, never trades. Both endpoints share the
-# _require_api_token gate with POST /api/tests/run: they are state-changing
-# and must not be reachable from an open interface without a token.
+# button authorizes computation, never trades. Like every /api route these
+# sit behind the app-level _require_api_token gate; being state-changing,
+# they are the ones that would hurt most if that ever came off.
 # --------------------------------------------------------------------------
 
 LAST_JOBS_PATH = REPO_ROOT / "logs" / "last_manual_jobs.json"
@@ -589,14 +604,14 @@ def _spawn(target, name: str) -> None:
 
 @app.get("/api/jobs")
 def get_jobs() -> dict:
-    """Status of the manual-trigger jobs — read-only, so no token needed (same as the other GETs)."""
+    """Status of the manual-trigger jobs."""
     with _JOBS_LOCK:
         return {
             name: {"label": _JOB_COMMANDS[name]["label"], **state} for name, state in _JOBS.items()
         }
 
 
-@app.post("/api/jobs/{job_name}/run", dependencies=[Depends(_require_api_token)])
+@app.post("/api/jobs/{job_name}/run")
 def run_job(job_name: str) -> dict:
     if job_name not in _JOB_COMMANDS:
         raise HTTPException(status_code=404, detail=f"Unknown job {job_name!r}. Available: {sorted(_JOB_COMMANDS)}.")
@@ -616,7 +631,11 @@ def run_job(job_name: str) -> dict:
     return {"job": job_name, **snapshot}
 
 
-# Static frontend, mounted last so it doesn't shadow /api/* routes.
+# Static frontend, mounted last so it doesn't shadow /api/* routes. A mount
+# is not a route, so the app-level token dependency does not apply to it —
+# which is what we want: the page, its JS and its CSS have to be reachable
+# for anyone to type a token in. The page ships no data of its own; every
+# number on it arrives through a gated /api call.
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 
