@@ -583,3 +583,127 @@ def test_configured_token_is_checked_even_on_loopback(monkeypatch, client, _runn
     resp = client.post("/api/tests/run")
 
     assert resp.status_code == 403
+
+
+# --- manual triggers (ingest / trading cycle) --------------------------------
+
+
+@pytest.fixture
+def _job_env(monkeypatch, tmp_path):
+    """Fresh job registry, synchronous worker, fake subprocess, tmp cache file."""
+    monkeypatch.setattr(server, "LAST_JOBS_PATH", tmp_path / "last_manual_jobs.json")
+    monkeypatch.setattr(server, "_JOBS", {name: server._fresh_job_state() for name in server._JOB_COMMANDS})
+    # Run the worker inline so tests see the final state deterministically.
+    monkeypatch.setattr(server, "_spawn", lambda target, name: target(name))
+
+    class _OkResult:
+        returncode = 0
+        stdout = "ingested 503 symbols\n"
+        stderr = ""
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _OkResult())
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
+
+
+def test_run_job_starts_and_records_a_finished_run(client, _job_env):
+    resp = client.post("/api/jobs/ingest/run")
+
+    assert resp.status_code == 200
+    status = client.get("/api/jobs").json()["ingest"]
+    assert status["status"] == "finished"
+    assert status["exit_code"] == 0
+    assert "ingested 503 symbols" in status["output_tail"]
+    assert status["started_at"] is not None and status["finished_at"] is not None
+
+
+def test_run_job_records_a_failed_run(client, _job_env, monkeypatch):
+    class _BadResult:
+        returncode = 2
+        stdout = ""
+        stderr = "universe table is empty\n"
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _BadResult())
+
+    client.post("/api/jobs/cycle/run")
+
+    status = client.get("/api/jobs").json()["cycle"]
+    assert status["status"] == "failed"
+    assert status["exit_code"] == 2
+    assert "universe table is empty" in status["output_tail"]
+
+
+def test_run_job_refuses_a_second_copy_while_one_is_running(client, _job_env):
+    server._JOBS["ingest"]["status"] = "running"
+    server._JOBS["ingest"]["started_at"] = "2026-08-22T10:00:00+00:00"
+
+    resp = client.post("/api/jobs/ingest/run")
+
+    assert resp.status_code == 409
+    assert "already running" in resp.json()["detail"]
+
+
+def test_run_job_unknown_name_is_404(client, _job_env):
+    assert client.post("/api/jobs/nope/run").status_code == 404
+
+
+def test_run_job_request_returns_before_completion_semantics(client, _job_env, monkeypatch):
+    """The endpoint must hand work to _spawn (background), not run it in-request."""
+    spawned = []
+    monkeypatch.setattr(server, "_spawn", lambda target, name: spawned.append(name))
+
+    resp = client.post("/api/jobs/ingest/run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "running"  # reported as started, not finished
+    assert spawned == ["ingest"]
+
+
+def test_run_job_is_token_gated_like_tests_run(client, _job_env, monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+
+    no_token = client.post("/api/jobs/ingest/run")
+    right = client.post("/api/jobs/ingest/run", headers={"Authorization": "Bearer sekrit"})
+
+    assert no_token.status_code == 403
+    assert right.status_code == 200
+
+
+def test_run_job_forbidden_on_open_interface_without_a_token(client, _job_env, monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+
+    assert client.post("/api/jobs/cycle/run").status_code == 403
+
+
+def test_jobs_status_endpoint_is_readable_without_a_token(client, _job_env, monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
+
+    resp = client.get("/api/jobs")
+
+    assert resp.status_code == 200
+    assert set(resp.json()) == {"ingest", "cycle"}
+
+
+def test_finished_jobs_survive_a_restart_but_running_does_not(client, _job_env, tmp_path):
+    client.post("/api/jobs/ingest/run")  # writes the cache file
+
+    reloaded = server._load_last_jobs()
+    assert reloaded["ingest"]["status"] == "finished"
+
+    # A "running" state from a dead process must not be resurrected.
+    server.LAST_JOBS_PATH.write_text(json.dumps({"ingest": {"status": "running", "started_at": "x"}}))
+    reloaded = server._load_last_jobs()
+    assert reloaded["ingest"]["status"] == "never_run"
+
+
+def test_cycle_job_command_still_goes_through_the_pipeline_entrypoint(client, _job_env):
+    """
+    The button starts scripts/run_weekly_cycle.py — the entrypoint whose
+    cycle runs the Telegram approval gate. It must never call the broker
+    or trading loop directly, or the button WOULD authorize trades.
+    """
+    command = server._JOB_COMMANDS["cycle"]["command"]
+    assert "scripts.run_weekly_cycle" in command
+    assert not any("broker" in part for part in command)

@@ -577,6 +577,58 @@ async function runTestsNow() {
   }
 }
 
+// ---------- Manual triggers (ingest / trading cycle) ----------
+// Same shape as the tests panel: POST to start, then poll /api/jobs while
+// anything is running. The cycle button only STARTS a cycle — trades still
+// wait on the Telegram approval gate.
+
+let jobsPollTimer = null;
+
+function renderJobStatus(name, job) {
+  const box = document.getElementById(`job-${name}-status`);
+  const btn = document.getElementById(name === "ingest" ? "run-ingest-btn" : "run-cycle-btn");
+  if (!box) return;
+  const labels = { never_run: "Never run", running: "⏳ Running…", finished: "✅ Finished", failed: "❌ Failed" };
+  const when = job.finished_at || job.started_at;
+  box.innerHTML = `<div class="value">${labels[job.status] || job.status}</div><div class="label">${job.label}${when ? ` — ${fmt.time(when)}` : ""}</div>`;
+  box.className = `stat-card ${job.status === "finished" ? "good" : job.status === "failed" ? "bad" : ""}`;
+  if (btn) {
+    btn.disabled = job.status === "running";
+    btn.textContent = job.status === "running"
+      ? "Running… (runs in background)"
+      : name === "ingest" ? "Run data ingestion" : "Run trading cycle";
+  }
+}
+
+async function loadJobs() {
+  const jobs = await fetchJSON("/api/jobs");
+  let tail = "";
+  let anyRunning = false;
+  for (const [name, job] of Object.entries(jobs)) {
+    renderJobStatus(name, job);
+    anyRunning = anyRunning || job.status === "running";
+    if (job.output_tail) tail += `=== ${name} ===\n${job.output_tail}\n\n`;
+  }
+  document.getElementById("job-output").textContent = tail;
+  // Keep polling while something is running; stop when everything settles.
+  if (anyRunning && !jobsPollTimer) {
+    jobsPollTimer = setInterval(loadJobs, 5000);
+  } else if (!anyRunning && jobsPollTimer) {
+    clearInterval(jobsPollTimer);
+    jobsPollTimer = null;
+  }
+}
+
+async function startJob(name) {
+  try {
+    await fetchJSON(`/api/jobs/${name}/run`, { method: "POST" });
+  } catch (e) {
+    // 409 = already running, 403 = token required — either way just show current state.
+    console.warn(`Could not start ${name}:`, e);
+  }
+  await loadJobs();
+}
+
 // ---------- Mode badge ----------
 async function loadModeBadge() {
   try {
@@ -605,11 +657,14 @@ async function loadAll() {
     loadLiveAccuracy(),
     loadDecisions(),
     loadLastTestRun(),
+    loadJobs(),
   ]);
 }
 
 document.getElementById("refresh-btn").addEventListener("click", loadAll);
 document.getElementById("run-tests-btn").addEventListener("click", runTestsNow);
+document.getElementById("run-ingest-btn").addEventListener("click", () => startJob("ingest"));
+document.getElementById("run-cycle-btn").addEventListener("click", () => startJob("cycle"));
 document.getElementById("decision-filter-btn").addEventListener("click", () => {
   loadDecisions(document.getElementById("decision-symbol-filter").value.trim().toUpperCase());
 });

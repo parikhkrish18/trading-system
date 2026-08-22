@@ -18,6 +18,7 @@ import hmac
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import mlflow
@@ -490,6 +491,129 @@ def run_tests() -> dict:
     LAST_TEST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAST_TEST_RUN_PATH.write_text(json.dumps(payload))
     return payload
+
+
+# --------------------------------------------------------------------------
+# Manual triggers — data ingestion and a full trading cycle, from the UI.
+#
+# Both run as detached background subprocesses with a visible status; the
+# request returns immediately. IMPORTANT SAFETY PROPERTY: the "Run trading
+# cycle" button only STARTS the cycle — scripts/run_weekly_cycle.py still
+# walks through the Telegram approval gate before any order exists, so the
+# button authorizes computation, never trades. Both endpoints share the
+# _require_api_token gate with POST /api/tests/run: they are state-changing
+# and must not be reachable from an open interface without a token.
+# --------------------------------------------------------------------------
+
+LAST_JOBS_PATH = REPO_ROOT / "logs" / "last_manual_jobs.json"
+_JOB_OUTPUT_TAIL_CHARS = 8000
+
+_JOB_COMMANDS: dict[str, dict] = {
+    "ingest": {
+        "label": "Data ingestion (prices, full universe)",
+        "command": [sys.executable, "-m", "scripts.run_daily_ingest", "--universe", "--source", "yfinance"],
+        "timeout_s": 3600,
+    },
+    "cycle": {
+        "label": "Full trading cycle (ingest -> screen -> approval gate -> paper orders)",
+        "command": [sys.executable, "-m", "scripts.run_weekly_cycle", "--feature-set-id", settings.feature_set_id],
+        # Fundamentals + news for ~500 symbols on the free vendor tier take
+        # ~2h alone (see run_weekly_cycle's docstring), plus the approval
+        # wait — a short timeout would kill every legitimate run.
+        "timeout_s": 4 * 3600,
+    },
+}
+
+
+def _fresh_job_state() -> dict:
+    return {"status": "never_run", "started_at": None, "finished_at": None, "exit_code": None, "output_tail": ""}
+
+
+def _load_last_jobs() -> dict[str, dict]:
+    """Completed runs survive a server restart, same idea as LAST_TEST_RUN_PATH."""
+    states = {name: _fresh_job_state() for name in _JOB_COMMANDS}
+    try:
+        stored = json.loads(LAST_JOBS_PATH.read_text())
+        for name, state in stored.items():
+            # A job can't still be "running" in a previous process's lifetime.
+            if name in states and state.get("status") in ("finished", "failed"):
+                states[name] = {**_fresh_job_state(), **state}
+    except (OSError, ValueError):
+        pass
+    return states
+
+
+_JOBS: dict[str, dict] = _load_last_jobs()
+_JOBS_LOCK = threading.Lock()
+
+
+def _persist_jobs() -> None:
+    try:
+        LAST_JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LAST_JOBS_PATH.write_text(json.dumps(_JOBS))
+    except OSError:
+        pass  # a failed cache write must not fail the job itself
+
+
+def _run_job_subprocess(name: str) -> None:
+    """The background worker: run the command, record how it ended."""
+    spec = _JOB_COMMANDS[name]
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed command list, no user input
+            spec["command"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=spec["timeout_s"]
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        status = "finished" if result.returncode == 0 else "failed"
+        exit_code = result.returncode
+    except subprocess.TimeoutExpired:
+        output = f"Timed out after {spec['timeout_s']}s and was killed."
+        status, exit_code = "failed", None
+    except Exception as exc:  # a crashed worker must still leave a readable status
+        output = f"{type(exc).__name__}: {exc}"
+        status, exit_code = "failed", None
+
+    with _JOBS_LOCK:
+        _JOBS[name].update(
+            status=status,
+            finished_at=dt.datetime.now(tz=dt.UTC).isoformat(),
+            exit_code=exit_code,
+            output_tail=output[-_JOB_OUTPUT_TAIL_CHARS:],
+        )
+        _persist_jobs()
+
+
+def _spawn(target, name: str) -> None:
+    """Thread launch, separated so tests can run the worker synchronously."""
+    threading.Thread(target=target, args=(name,), daemon=True, name=f"manual-job-{name}").start()
+
+
+@app.get("/api/jobs")
+def get_jobs() -> dict:
+    """Status of the manual-trigger jobs — read-only, so no token needed (same as the other GETs)."""
+    with _JOBS_LOCK:
+        return {
+            name: {"label": _JOB_COMMANDS[name]["label"], **state} for name, state in _JOBS.items()
+        }
+
+
+@app.post("/api/jobs/{job_name}/run", dependencies=[Depends(_require_api_token)])
+def run_job(job_name: str) -> dict:
+    if job_name not in _JOB_COMMANDS:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_name!r}. Available: {sorted(_JOB_COMMANDS)}.")
+    with _JOBS_LOCK:
+        if _JOBS[job_name]["status"] == "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"{job_name} is already running (started {_JOBS[job_name]['started_at']}) — refusing a second copy.",
+            )
+        _JOBS[job_name] = {
+            **_fresh_job_state(),
+            "status": "running",
+            "started_at": dt.datetime.now(tz=dt.UTC).isoformat(),
+        }
+        snapshot = dict(_JOBS[job_name])
+    _spawn(_run_job_subprocess, job_name)
+    return {"job": job_name, **snapshot}
 
 
 # Static frontend, mounted last so it doesn't shadow /api/* routes.

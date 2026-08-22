@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     # --- MLflow ---
     mlflow_tracking_uri: str = Field(default="http://localhost:5000", alias="MLFLOW_TRACKING_URI")
 
+    # --- Feature set ---
+    # Which feature set the dashboard-triggered pipeline runs on. CLI
+    # invocations still pass --feature-set-id explicitly; this only feeds
+    # the manual-trigger endpoints in monitoring/dashboard/server.py.
+    feature_set_id: str = Field(default="v4", alias="FEATURE_SET_ID")
+
     # --- Dashboard ---
     # Bearer token protecting mutating dashboard endpoints (POST
     # /api/tests/run). Blank is fine on localhost; required when the

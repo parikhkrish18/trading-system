@@ -5,6 +5,7 @@ failure (Phase 8, point 2: "alerts on ... data pipeline failures").
 
 Usage:
     python -m scripts.run_daily_ingest --symbols SPY,QQQ,TQQQ,SQQQ
+    python -m scripts.run_daily_ingest --universe --source yfinance
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import datetime as dt
 import logging
 
 from data.ingest.prices import ingest_prices
+from data.ingest.universe import resolve_symbols
 from monitoring.alerts import alert_pipeline_failure, configure_file_logging
 
 logging.basicConfig(level=logging.INFO)
@@ -31,11 +33,12 @@ def run_job(name: str, fn, *args, **kwargs) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", required=True)
+    parser.add_argument("--symbols", default=None)
+    parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
     parser.add_argument("--source", default="alpaca", choices=["alpaca", "yfinance"])
     args = parser.parse_args()
     configure_file_logging()  # logs survive the console closing
-    symbols = [s.strip().upper() for s in args.symbols.split(",")]
+    symbols = resolve_symbols(args.symbols, args.universe)
 
     today = dt.datetime.now(tz=dt.UTC).date()
     run_job(
