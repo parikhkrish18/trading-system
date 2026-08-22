@@ -157,6 +157,20 @@ class Settings(BaseSettings):
     # 3-10% move band the swing horizon targets.
     hold_take_profit_pct: float = Field(default=0.10, alias="HOLD_TAKE_PROFIT_PCT")
 
+    # --- Direction ---
+    # Whether the screener may propose short candidates at all.
+    #
+    # Off by default on the evidence: across the 10-fold walk-forward, short
+    # trades paid -1.069% per trade at a 41.6% win rate, against +0.225% and
+    # 52.1% for longs. Shorts were only 5% of trades and still dragged the
+    # book down. When false, short candidates are dropped before sizing (see
+    # models/screener.py) rather than sized to zero, so they never reach the
+    # approval gate at all. The whole short code path — sizing caps,
+    # shortability checks, the short leg of the concentrated split — is left
+    # intact so this can be turned back on the day shorts demonstrate a
+    # positive excess return over the benchmark.
+    allow_shorts: bool = Field(default=False, alias="ALLOW_SHORTS")
+
     # --- Strategy selection ---
     # "diversified" (default) = top-k book sized by risk.sizing.select_trades
     # under the conservative caps above. "concentrated" = the 2-trade

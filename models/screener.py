@@ -1,8 +1,9 @@
 """
 Confidence-ranked equity screener. Scores every symbol in a universe with
 the ensemble forecast model, then concentrates all deployable capital into
-the top 2 highest-conviction picks — long or short, whichever the data
-actually supports — rather than spreading thinly across many names. The
+the top 2 highest-conviction picks — long only by default; see
+settings.allow_shorts, off because shorts lost -1.069% per trade at a
+41.6% win rate in the walk-forward — rather than spreading thinly. The
 point is to make a small number of high-confidence bets instead of
 tracking the market with a diversified book. If nothing in the mega-caps
 clears the confidence bar but some other S&P 500 name does, that's what
@@ -131,6 +132,7 @@ def select_trades(
     top_k: int = 10,
     current_positions: dict[str, float] | None = None,
     is_shortable_fn: Callable[[str], bool] | None = None,
+    allow_shorts: bool = True,
 ) -> list[TradeCandidate]:
     """
     The diversified-book path — the default strategy (STRATEGY_MODE=
@@ -147,6 +149,12 @@ def select_trades(
     than resized to zero, so the caller can see which symbols got skipped.
     Pass None to skip the check entirely (e.g. offline/backtest scoring
     with no live broker connection).
+
+    allow_shorts=False drops every short candidate the same way, before
+    sizing, and lets the next long candidate take the freed top_k slot.
+    run_screen passes settings.allow_shorts (default False — shorts lost
+    -1.069% per trade in the walk-forward). The parameter defaults to True
+    here because this function is the mechanism; the policy lives in config.
     """
     current_positions = current_positions or {}
     confident = scored.loc[scored["confident"]].sort_values("conviction_score", ascending=False)
@@ -160,6 +168,8 @@ def select_trades(
         forecast = row["predicted_return"]
         side = "long" if forecast >= 0 else "short"
 
+        if side == "short" and not allow_shorts:
+            continue
         if side == "short" and is_shortable_fn is not None and not is_shortable_fn(symbol):
             continue
 
@@ -211,6 +221,7 @@ def select_concentrated_trades(
     min_leg_pct: float,
     total_deploy_pct: float = 1.0,
     is_shortable_fn: Callable[[str], bool] | None = None,
+    allow_shorts: bool = True,
 ) -> list[TradeCandidate]:
     """
     The concentrated strategy (STRATEGY_MODE=concentrated): put all deployable capital into the top 2
@@ -229,6 +240,11 @@ def select_concentrated_trades(
     total_deploy_pct alone rather than forcing a weaker second trade just
     to fill the split. If none do, returns [].
 
+    allow_shorts=False skips short candidates entirely when picking the two
+    legs, so a rejected short frees its slot for the next long rather than
+    leaving the book half-deployed. See settings.allow_shorts for why it
+    defaults off in production.
+
     `total_deploy_pct` is the fraction of portfolio value to put to work in
     total, both legs combined — pass less than 1.0 for e.g. regime-based
     damping (see run_screen).
@@ -240,6 +256,8 @@ def select_concentrated_trades(
         if len(picks) >= 2:
             break
         is_short = row["predicted_return"] < 0
+        if is_short and not allow_shorts:
+            continue
         if is_short and is_shortable_fn is not None and not is_shortable_fn(row["symbol"]):
             continue
         picks.append(row)
@@ -420,6 +438,19 @@ def run_screen_with_scores(
     latest = load_latest_features(feature_set_id, symbols)
     scored = score_universe(ensemble, latest, feature_cols, min_direction_agreement, min_abs_return)
 
+    if not settings.allow_shorts and not scored.empty:
+        # Logged rather than silent: the shortlist can look thin for a
+        # perfectly good reason, and "the model wanted to short 6 names and
+        # wasn't allowed to" is the reason worth knowing. `scored` itself is
+        # left untouched — the hold rules read predicted_return for HELD
+        # positions and need the real sign to spot a forecast that flipped.
+        suppressed = int((scored.loc[scored["confident"], "predicted_return"] < 0).sum())
+        if suppressed:
+            logger.info(
+                "ALLOW_SHORTS is off: %d confident short candidate(s) dropped before sizing.",
+                suppressed,
+            )
+
     if settings.strategy_mode == "concentrated":
         candidates = select_concentrated_trades(
             scored,
@@ -427,6 +458,7 @@ def run_screen_with_scores(
             min_leg_pct=settings.min_concentrated_position_pct,
             total_deploy_pct=total_deploy_pct,
             is_shortable_fn=is_shortable_fn,
+            allow_shorts=settings.allow_shorts,
         )
     else:
         # Diversified default: top-k book sized through the full risk
@@ -443,6 +475,7 @@ def run_screen_with_scores(
             correlation_matrix=correlation_matrix,
             top_k=settings.screener_top_k,
             is_shortable_fn=is_shortable_fn,
+            allow_shorts=settings.allow_shorts,
         )
         # Reactivation semantics: when only a freed slice of the portfolio
         # is on the table, every size shrinks proportionally to fit it.
