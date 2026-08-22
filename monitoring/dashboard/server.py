@@ -625,7 +625,13 @@ def main() -> None:
 
     # Loopback by default — exposing the dashboard to the network is an
     # explicit DASHBOARD_HOST=0.0.0.0 decision (the Docker image makes it).
-    uvicorn.run("monitoring.dashboard.server:app", host=settings.dashboard_host, port=8501, reload=False)
+    # The port comes from $PORT when a host injects one; see settings.
+    uvicorn.run(
+        "monitoring.dashboard.server:app",
+        host=settings.dashboard_host,
+        port=settings.dashboard_port,
+        reload=False,
+    )
 
 
 if __name__ == "__main__":

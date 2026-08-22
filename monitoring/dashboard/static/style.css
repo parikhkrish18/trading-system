@@ -67,6 +67,16 @@ h3 { font-size: 13px; color: var(--text-muted); margin: 0 0 8px; font-weight: 60
 .badge.paper { color: var(--amber); border-color: var(--amber); }
 .badge.live { color: var(--red); border-color: var(--red); }
 
+.token-input {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: inherit;
+  font-size: 12px;
+  width: 150px;
+}
+
 .btn {
   padding: 7px 14px;
   border-radius: 6px;

@@ -7,8 +7,44 @@ const fmt = {
   time: (v) => (v ? new Date(v).toLocaleString() : "—"),
 };
 
+// ---------- Operator token ----------
+// The mutating endpoints (POST /api/tests/run, /api/jobs/*/run) are gated by
+// DASHBOARD_API_TOKEN, which is mandatory once the dashboard is bound to a
+// public interface. Without this the hosted dashboard's own buttons would be
+// permanently 403 and the only way to run a job would be curl. The token
+// lives in this browser's localStorage and is never sent anywhere except as
+// a bearer header back to this same origin.
+const TOKEN_STORAGE_KEY = "dashboardApiToken";
+
+function getApiToken() {
+  try {
+    return localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+  } catch {
+    return ""; // private browsing / storage disabled — the field just won't persist
+  }
+}
+
+function setApiToken(value) {
+  try {
+    if (value) localStorage.setItem(TOKEN_STORAGE_KEY, value);
+    else localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    /* not persisting is survivable; the in-page value still works this session */
+  }
+}
+
 async function fetchJSON(url, opts) {
-  const res = await fetch(url, opts);
+  const options = { ...opts };
+  const token = getApiToken();
+  if (token) options.headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` };
+  const res = await fetch(url, options);
+  if (res.status === 403) {
+    throw new Error(
+      token
+        ? "403 — the operator token was rejected. Check it matches DASHBOARD_API_TOKEN on the server."
+        : "403 — this action needs the operator token. Paste DASHBOARD_API_TOKEN into the box at the top right."
+    );
+  }
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
   return res.json();
 }
@@ -622,11 +658,15 @@ async function loadJobs() {
 async function startJob(name) {
   try {
     await fetchJSON(`/api/jobs/${name}/run`, { method: "POST" });
+    await loadJobs();
   } catch (e) {
-    // 409 = already running, 403 = token required — either way just show current state.
-    console.warn(`Could not start ${name}:`, e);
+    // 409 = already running, 403 = missing/rejected token. Show it: a button
+    // that silently does nothing is the worst way to report a missing token.
+    await loadJobs();
+    document.getElementById("job-output").textContent =
+      `Could not start ${name}: ${e.message}\n\n` + document.getElementById("job-output").textContent;
+    document.getElementById("job-output-wrap").open = true;
   }
-  await loadJobs();
 }
 
 // ---------- Mode badge ----------
@@ -660,6 +700,10 @@ async function loadAll() {
     loadJobs(),
   ]);
 }
+
+const tokenInput = document.getElementById("api-token-input");
+tokenInput.value = getApiToken();
+tokenInput.addEventListener("change", () => setApiToken(tokenInput.value.trim()));
 
 document.getElementById("refresh-btn").addEventListener("click", loadAll);
 document.getElementById("run-tests-btn").addEventListener("click", runTestsNow);

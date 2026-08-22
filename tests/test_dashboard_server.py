@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
+from config.settings import Settings
 from monitoring.dashboard import server
 
 
@@ -707,3 +708,53 @@ def test_cycle_job_command_still_goes_through_the_pipeline_entrypoint(client, _j
     command = server._JOB_COMMANDS["cycle"]["command"]
     assert "scripts.run_weekly_cycle" in command
     assert not any("broker" in part for part in command)
+
+
+# --------------------------------------------------------------------------
+# Where the server binds — the hosting contract
+# --------------------------------------------------------------------------
+
+
+def _captured_uvicorn_kwargs(monkeypatch) -> dict:
+    """Run main() with uvicorn stubbed out, and report how it was called."""
+    captured: dict = {}
+
+    class _FakeUvicorn:
+        @staticmethod
+        def run(app, **kwargs):
+            captured.update(app=app, **kwargs)
+
+    monkeypatch.setitem(__import__("sys").modules, "uvicorn", _FakeUvicorn)
+    server.main()
+    return captured
+
+
+def test_main_binds_the_configured_host_and_port(monkeypatch):
+    """
+    A platform host (Railway, and PaaS generally) picks the port itself and
+    injects it as $PORT, then routes the public domain there. Binding a
+    hardcoded port instead means the health check hits nothing and the
+    deploy is marked failed, so the port must come from settings.
+    """
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+    monkeypatch.setattr(server.settings, "dashboard_port", 3141)
+
+    captured = _captured_uvicorn_kwargs(monkeypatch)
+
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 3141
+
+
+def test_bind_defaults_stay_loopback_8501_when_nothing_is_injected(monkeypatch):
+    """
+    The unhosted default stays the deliberate loopback bind. Built from a
+    clean environment rather than the ambient `settings`, so a developer's
+    own .env cannot make this pass or fail.
+    """
+    for var in ("PORT", "DASHBOARD_HOST"):
+        monkeypatch.delenv(var, raising=False)
+
+    fresh = Settings(_env_file=None)
+
+    assert fresh.dashboard_host == "127.0.0.1"
+    assert fresh.dashboard_port == 8501
