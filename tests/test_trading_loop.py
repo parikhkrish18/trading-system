@@ -854,3 +854,17 @@ def test_miss_counter_advances_and_persists_for_held_positions(monkeypatch):
 
     assert stored["counts"]["HELD"] == 2  # second consecutive miss recorded, position still held
     assert stored["counts"]["NEW"] == 0  # fresh open starts clean
+
+
+def test_market_regime_data_gap_alerts_loudly_instead_of_failing_silent(monkeypatch):
+    """The CHOP fallback on missing proxy history must page someone — it hid for weeks as a silent warning."""
+    monkeypatch.setattr(trading_loop.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["ts", "high", "low", "close"]))
+    alerts = []
+    monkeypatch.setattr(trading_loop, "send_slack_alert", lambda msg, severity="info": alerts.append((msg, severity)))
+
+    regime = trading_loop._market_regime(engine=object())
+
+    assert regime == "chop"
+    (msg, severity) = alerts[0]
+    assert "SPY" in msg and "DATA GAP" in msg
+    assert severity == "warning"

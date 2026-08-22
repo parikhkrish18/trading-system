@@ -20,6 +20,18 @@ from monitoring.alerts import alert_pipeline_failure, configure_file_logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Same proxy scripts/run_weekly_cycle.py ingests: not part of the tradeable
+# universe, only the input to execution/trading_loop._market_regime. Without
+# it in the DB the regime check silently defaults to CHOP every cycle.
+_REGIME_PROXY = "SPY"
+
+
+def with_regime_proxy(symbols: list[str]) -> list[str]:
+    """The ingest list plus the market-regime proxy, without duplicating it."""
+    if _REGIME_PROXY in symbols:
+        return list(symbols)
+    return [*symbols, _REGIME_PROXY]
+
 
 def run_job(name: str, fn, *args, **kwargs) -> None:
     try:
@@ -44,7 +56,7 @@ def main() -> None:
     run_job(
         "price_ingest",
         ingest_prices,
-        symbols,
+        with_regime_proxy(symbols),
         today - dt.timedelta(days=7),
         today,
         args.source,

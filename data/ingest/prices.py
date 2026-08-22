@@ -47,7 +47,12 @@ def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.Data
     frames = []
     for sym in symbols:
         try:
-            sub = raw[yf_symbol[sym]].copy() if len(symbols) > 1 else raw.copy()
+            # group_by="ticker" gives (ticker, field) MultiIndex columns even
+            # for a single ticker on current yfinance — select the ticker
+            # level whenever it exists, not only when len(symbols) > 1.
+            # Hit live: every single-symbol ingest (e.g. the SPY regime
+            # proxy) crashed on flat-column selection instead.
+            sub = raw[yf_symbol[sym]].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
         except KeyError:
             continue
         sub = sub.rename(

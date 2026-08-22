@@ -84,7 +84,18 @@ def _market_regime(engine, market_proxy: str = "SPY") -> str:
         params={"symbol": market_proxy},
     )
     if len(df) < 20:
-        logger.warning("Not enough %s price history for a regime read — defaulting to CHOP (conservative).", market_proxy)
+        # Loud on purpose: this fallback silently ran on EVERY live cycle
+        # for weeks because the proxy was never ingested — a missing data
+        # dependency, not a market condition, and it must page someone.
+        message = (
+            f"Market-regime check has no usable {market_proxy} price history "
+            f"({len(df)} row(s), need 20+) — defaulting to CHOP (conservative) for this cycle. "
+            f"This is a DATA GAP, not a market read: ingest {market_proxy} "
+            f"(python -m data.ingest.prices --symbols {market_proxy} ... or scripts/run_daily_ingest, "
+            "which now includes it) so the regime signal means something."
+        )
+        logger.error("%s", message)
+        send_slack_alert(message, severity="warning")
         return CHOP
     latest_adx = adx(df["high"], df["low"], df["close"]).iloc[-1]
     if pd.isna(latest_adx):

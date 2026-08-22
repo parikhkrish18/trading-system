@@ -77,3 +77,30 @@ def test_fetch_yfinance_single_symbol_still_drops_null_rows(monkeypatch):
 
     assert len(df) == 1
     assert df["close"].isna().sum() == 0
+
+
+def test_fetch_yfinance_single_symbol_with_multiindex_columns(monkeypatch):
+    """
+    Regression test, hit live: current yfinance returns (ticker, field)
+    MultiIndex columns for group_by="ticker" even with ONE ticker, and the
+    old flat-column selection crashed — which is how the SPY regime proxy
+    went unfilled and the regime check fell back to CHOP every cycle.
+    """
+    import yfinance
+
+    idx = pd.bdate_range("2026-01-02", periods=3)
+    frame = pd.concat(
+        {
+            "SPY": pd.DataFrame(
+                {"Open": [1, 2, 3], "High": [1, 2, 3], "Low": [1, 2, 3], "Close": [1, 2, 3], "Volume": [10, 20, 30]},
+                index=idx,
+            )
+        },
+        axis=1,
+    )
+    monkeypatch.setattr(yfinance, "download", lambda *a, **k: frame)
+
+    df = _fetch_yfinance(["SPY"], pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-06").date())
+
+    assert set(df["symbol"]) == {"SPY"}
+    assert len(df) == 3
