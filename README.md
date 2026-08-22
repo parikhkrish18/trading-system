@@ -1,18 +1,28 @@
 # Trading System
 
-Weekly/biweekly rebalanced **equity long/short screener**: scans the S&P 500,
-scores every name with an ensemble forecast model, and only shortlists
-trades the model is actually confident about (ensemble members agree on
-direction + predicted return clears a threshold) — long or short, whichever
-the data supports. Built for a 3-person team on $25k–$110k capital.
+Weekly/biweekly rebalanced **equity screener**: scans the S&P 500, scores
+every name with an ensemble forecast model, and only shortlists trades the
+model is actually confident about (ensemble members agree on direction +
+predicted return clears a threshold). Long-only by default — the short
+side is built and tested but switched off (`ALLOW_SHORTS`, see below).
+Built for a 3-person team on $25k–$110k capital.
 
 This is engineering scaffolding for the system described in the build plan —
 **not financial advice, and not a signal source.** Nothing here should be
 used with real money until it has been through Phases 6–7 (paper trading,
 then small live capital) end to end. Directional accuracy on the current
-feature set has hovered around ~50% (a coin flip) in walk-forward testing —
-see `models/train.py`'s `directional_accuracy_when_confident` metric before
-trusting any shortlist this produces.
+feature set has hovered around ~50% (a coin flip) in walk-forward testing.
+
+**It has not beaten buying and holding the same universe.** Every
+evaluation now reports a `benchmark_return` — the equal-weight forward
+return of every candidate row in the same test window — next to the
+model's return, and `excess_return` (model minus benchmark) is the
+headline metric. At a 20-day horizon the model returned +0.81% per trade
+net of costs against a +1.15% benchmark: an excess of **-0.34%, negative
+in 10 folds out of 10**. Read `excess_return` before trusting any
+shortlist this produces; a positive return with a negative excess means
+the strategy made money and would have made more doing nothing. See
+`models/evaluation.py`.
 
 **Not the leveraged-ETF strategy anymore.** The original design traded a
 fixed list of 4 leveraged ETFs (SPY/QQQ/TQQQ/SQQQ). That's been replaced by
@@ -57,10 +67,14 @@ Fully working now:
   construction: never passes `confirm_live=True`. `scripts/run_weekly_cycle.py`
   chains the full pipeline (universe/price/fundamentals/news refresh →
   screen → trade); `infra/launchd/` schedules it weekly on macOS.
-- Long **and short** support: `MAX_SHORT_POSITION_PCT` (more conservative
-  than the long cap — short losses are structurally uncapped), an
-  Alpaca `is_shortable()` pre-check, IBKR's lack of an equivalent
-  documented in `execution/broker_ibkr.py`
+- Short support, **off by default** (`ALLOW_SHORTS=false`): shorts paid
+  -1.069% per trade at a 41.6% win rate over the walk-forward (worse at
+  20 days: -2.71% at 42.7%), so short candidates are dropped before
+  sizing. The path is intact — `MAX_SHORT_POSITION_PCT` (more
+  conservative than the long cap, since short losses are structurally
+  uncapped), an Alpaca `is_shortable()` pre-check, IBKR's lack of an
+  equivalent documented in `execution/broker_ibkr.py` — so it can be
+  switched back on if shorts ever earn it
 - Leveraged-ETF **daily-reset decay simulator** (Phase 4, kept but inactive
   — see above)
 - Event-driven backtest engine + cost model (Phase 4)
