@@ -153,6 +153,47 @@ def test_relative_labels_are_smaller_than_absolute_ones_in_a_trending_market(mon
     assert relative["target"].mean() == pytest.approx(0.0, abs=1e-12)
 
 
+def test_the_cross_sectional_transforms_cannot_see_the_future(monkeypatch):
+    """
+    load_training_frame applies the label and feature transforms to the whole
+    frame BEFORE the walk-forward splits it, which looks like leakage and is
+    not: both group by ts, so a row's value depends only on other stocks on
+    its own date.
+
+    Proven directly rather than argued — transform the full history, then
+    transform a truncated copy that has never seen anything after the cutoff,
+    and require every overlapping row to come out bit-for-bit identical. If
+    any future date could influence an earlier row, these would differ.
+    """
+    rng = np.random.default_rng(0)
+    dates = pd.date_range("2026-01-01", periods=40)
+    frame = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "symbol": f"S{s}",
+                    "ts": dates,
+                    "close": 100 * np.cumprod(1 + rng.normal(scale=0.01, size=40)),
+                    "f1": rng.normal(size=40),
+                }
+            )
+            for s in range(12)
+        ],
+        ignore_index=True,
+    )
+    cutoff = dates[25]
+
+    monkeypatch.setattr(train, "load_feature_frame", lambda *a, **k: frame)
+    full = train.load_training_frame("v4", [], 2, target_mode="relative")
+    monkeypatch.setattr(train, "load_feature_frame", lambda *a, **k: frame[frame["ts"] < cutoff])
+    past_only = train.load_training_frame("v4", [], 2, target_mode="relative")
+
+    merged = full.merge(past_only, on=["symbol", "ts"], suffixes=("_full", "_past"))
+    assert len(merged) > 100  # the comparison is actually exercising rows
+    for col in ("f1", "target"):
+        assert list(merged[f"{col}_full"]) == pytest.approx(list(merged[f"{col}_past"]))
+
+
 # --------------------------------------------------------------------------
 # wiring: the mode has to reach the code that uses it
 # --------------------------------------------------------------------------

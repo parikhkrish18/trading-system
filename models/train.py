@@ -185,7 +185,10 @@ def load_training_frame(
     if target_mode not in ("absolute", "relative"):
         raise ValueError(f"target_mode must be 'absolute' or 'relative', got {target_mode!r}")
 
-    merged = load_feature_frame(feature_set_id, symbols)
+    # .copy() so the label columns are never written through a view onto a
+    # caller's frame — pandas raises SettingWithCopyWarning for exactly this,
+    # and a silent no-op write here would produce a frame with no labels.
+    merged = load_feature_frame(feature_set_id, symbols).copy()
     merged["fwd_return"] = merged.groupby("symbol")["close"].transform(
         lambda s: s.shift(-target_horizon_days) / s - 1
     )
