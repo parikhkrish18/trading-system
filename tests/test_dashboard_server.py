@@ -705,7 +705,7 @@ def test_jobs_status_endpoint_needs_the_token_too(client, _job_env, monkeypatch)
 
     ok = client.get("/api/jobs", headers={"Authorization": "Bearer sekrit"})
     assert ok.status_code == 200
-    assert set(ok.json()) == {"ingest", "cycle"}
+    assert set(ok.json()) == {"init_db", "ingest", "cycle"}
 
 
 def test_finished_jobs_survive_a_restart_but_running_does_not(client, _job_env, tmp_path):

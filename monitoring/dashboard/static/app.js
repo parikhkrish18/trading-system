@@ -620,9 +620,18 @@ async function runTestsNow() {
 
 let jobsPollTimer = null;
 
+// Idle button text per job. Keyed by job name so adding a job to
+// _JOB_COMMANDS server-side needs a line here and its markup, not a change
+// to the rendering logic.
+const JOB_BUTTON_LABELS = {
+  init_db: "First-run setup",
+  ingest: "Run data ingestion",
+  cycle: "Run trading cycle",
+};
+
 function renderJobStatus(name, job) {
   const box = document.getElementById(`job-${name}-status`);
-  const btn = document.getElementById(name === "ingest" ? "run-ingest-btn" : "run-cycle-btn");
+  const btn = document.getElementById(`run-${name}-btn`);
   if (!box) return;
   const labels = { never_run: "Never run", running: "⏳ Running…", finished: "✅ Finished", failed: "❌ Failed" };
   const when = job.finished_at || job.started_at;
@@ -632,7 +641,7 @@ function renderJobStatus(name, job) {
     btn.disabled = job.status === "running";
     btn.textContent = job.status === "running"
       ? "Running… (runs in background)"
-      : name === "ingest" ? "Run data ingestion" : "Run trading cycle";
+      : JOB_BUTTON_LABELS[name] || name;
   }
 }
 
@@ -731,6 +740,7 @@ tokenInput.addEventListener("change", () => {
 
 document.getElementById("refresh-btn").addEventListener("click", loadAll);
 document.getElementById("run-tests-btn").addEventListener("click", runTestsNow);
+document.getElementById("run-init_db-btn").addEventListener("click", () => startJob("init_db"));
 document.getElementById("run-ingest-btn").addEventListener("click", () => startJob("ingest"));
 document.getElementById("run-cycle-btn").addEventListener("click", () => startJob("cycle"));
 document.getElementById("decision-filter-btn").addEventListener("click", () => {

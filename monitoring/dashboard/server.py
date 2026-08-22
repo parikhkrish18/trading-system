@@ -524,6 +524,14 @@ LAST_JOBS_PATH = REPO_ROOT / "logs" / "last_manual_jobs.json"
 _JOB_OUTPUT_TAIL_CHARS = 8000
 
 _JOB_COMMANDS: dict[str, dict] = {
+    "init_db": {
+        "label": "First-run setup (schema, universe, price history, features)",
+        "command": [sys.executable, "-m", "scripts.init_database"],
+        # Years of history for ~500 symbols from yfinance, then a full
+        # feature build. Minutes rather than hours, but well past what the
+        # daily ingest job budgets for.
+        "timeout_s": 2 * 3600,
+    },
     "ingest": {
         "label": "Data ingestion (prices, full universe)",
         "command": [sys.executable, "-m", "scripts.run_daily_ingest", "--universe", "--source", "yfinance"],

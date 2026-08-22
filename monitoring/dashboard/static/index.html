@@ -38,6 +38,8 @@
     <section id="controls-section">
       <h2>Manual Controls <span class="muted">(runs in the background — a cycle still needs Telegram approval before any order)</span></h2>
       <div class="summary-row">
+        <div id="job-init_db-status" class="stat-card">Never run</div>
+        <button id="run-init_db-btn" class="btn" title="Only needed on an empty database. Idempotent — safe to re-run.">First-run setup</button>
         <div id="job-ingest-status" class="stat-card">Never run</div>
         <button id="run-ingest-btn" class="btn">Run data ingestion</button>
         <div id="job-cycle-status" class="stat-card">Never run</div>
