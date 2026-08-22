@@ -125,6 +125,16 @@ class Settings(BaseSettings):
     max_short_position_pct: float = Field(default=0.15, alias="MAX_SHORT_POSITION_PCT")
     max_correlated_exposure_pct: float = Field(default=0.50, alias="MAX_CORRELATED_EXPOSURE_PCT")
 
+    # --- Forecast horizon ---
+    # How many trading days ahead the model predicts (and therefore how
+    # long a position is meant to be held). 20 ≈ a calendar month: the
+    # swing-trade posture — multi-week holds targeting 3-10% moves, where
+    # the fixed round-trip cost floor eats proportionally less of the
+    # expected move than it does at 5 days. Used as the default by
+    # models/train.py and models/screener.py; scripts/compare_horizons.py
+    # measures whether a given value actually earns its keep.
+    target_horizon_days: int = Field(default=20, alias="TARGET_HORIZON_DAYS")
+
     # --- Strategy selection ---
     # "diversified" (default) = top-k book sized by risk.sizing.select_trades
     # under the conservative caps above. "concentrated" = the 2-trade

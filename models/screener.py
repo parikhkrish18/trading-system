@@ -337,7 +337,7 @@ def _attach_reasoning(
 def run_screen(
     feature_set_id: str,
     symbols: list[str],
-    target_horizon_days: int = 5,
+    target_horizon_days: int | None = None,
     n_ensemble_models: int = 5,
     min_direction_agreement: float = 0.8,
     min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
@@ -362,6 +362,11 @@ def run_screen(
     git history -- the old chop-dampening was leveraged-ETF-specific decay
     protection that doesn't apply to plain equity/short positions).
     """
+    # None -> the configured horizon (TARGET_HORIZON_DAYS), so the screener
+    # always trains on the same forward-return definition the evaluation
+    # harness graded, rather than a hardcoded 5.
+    if target_horizon_days is None:
+        target_horizon_days = settings.target_horizon_days
     train_df = load_training_frame(feature_set_id, symbols, target_horizon_days)
     feature_cols = [c for c in train_df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
 
@@ -493,7 +498,10 @@ def main() -> None:
     parser.add_argument("--feature-set-id", required=True)
     parser.add_argument("--symbols", default=None)
     parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
-    parser.add_argument("--target-horizon-days", type=int, default=5)
+    parser.add_argument(
+        "--target-horizon-days", type=int, default=None,
+        help=f"Forward-return horizon in trading days (default: TARGET_HORIZON_DAYS = {settings.target_horizon_days}).",
+    )
     parser.add_argument("--n-ensemble-models", type=int, default=5)
     parser.add_argument("--min-direction-agreement", type=float, default=0.8)
     parser.add_argument(

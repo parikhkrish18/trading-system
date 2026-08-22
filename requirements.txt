@@ -16,6 +16,7 @@ psycopg2-binary==2.9.12
 # --- modeling ---
 lightgbm==4.7.0
 scikit-learn==1.9.0
+scipy==1.18.0  # paired significance tests in scripts/compare_horizons.py
 mlflow==3.14.0
 
 # --- backtest / data ---

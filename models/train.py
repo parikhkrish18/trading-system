@@ -145,29 +145,41 @@ def load_training_frame(feature_set_id: str, symbols: list[str], target_horizon_
 def run_walk_forward(
     feature_set_id: str,
     symbols: list[str],
-    target_horizon_days: int = 5,
+    target_horizon_days: int | None = None,
     n_folds: int = 10,
     model_name: str = "forecast_lgbm",
     n_ensemble_models: int = 5,
     confident_agreement_threshold: float = 0.8,
     purge_days: int | None = None,
+    fold_dates: pd.DatetimeIndex | None = None,
 ) -> pd.DataFrame:
     """
     n_folds defaults to 10 (was 6, and long before that 3): a mean over a
     handful of folds hides how unstable the metric is — report the per-fold
     spread, not just the average (main() prints both).
 
+    target_horizon_days: None = the configured TARGET_HORIZON_DAYS.
+
     purge_days: how many trading days to cut off the end of each training
     window so no training label overlaps the test period (see module
     docstring). None = target_horizon_days (the correct value); 0 disables
     purging, which exists only to measure what the leakage was worth.
+
+    fold_dates: when given, fold boundaries are built from THIS date index
+    instead of the frame's own dates. A longer horizon loses its last
+    `horizon` days to the label shift, so two horizons run back-to-back
+    would otherwise get slightly different fold windows — passing one shared
+    index (scripts/compare_horizons.py does) keeps a fold-by-fold
+    comparison genuinely paired.
     """
+    if target_horizon_days is None:
+        target_horizon_days = settings.target_horizon_days
     purge_days = target_horizon_days if purge_days is None else purge_days
     df = load_training_frame(feature_set_id, symbols, target_horizon_days)
     feature_cols = [c for c in df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
 
     dates = pd.DatetimeIndex(sorted(pd.DatetimeIndex(df["ts"]).unique()))
-    folds = make_expanding_folds(dates, n_folds=n_folds)
+    folds = make_expanding_folds(fold_dates if fold_dates is not None else dates, n_folds=n_folds)
     if not folds:
         raise ValueError("Not enough history to build any walk-forward folds — reduce n_folds or backfill more data.")
 
@@ -299,7 +311,10 @@ def main() -> None:
     parser.add_argument("--feature-set-id", required=True)
     parser.add_argument("--symbols", default=None)
     parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
-    parser.add_argument("--target-horizon-days", type=int, default=5)
+    parser.add_argument(
+        "--target-horizon-days", type=int, default=None,
+        help=f"Forward-return horizon in trading days (default: TARGET_HORIZON_DAYS = {settings.target_horizon_days}).",
+    )
     parser.add_argument("--n-folds", type=int, default=10)
     parser.add_argument("--n-ensemble-models", type=int, default=5)
     parser.add_argument("--confident-agreement-threshold", type=float, default=0.8)
