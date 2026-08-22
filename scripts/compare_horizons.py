@@ -170,6 +170,12 @@ def main() -> None:
     parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
     parser.add_argument("--horizons", default="5,10,20,40", help="Comma-separated trading-day horizons to compare.")
     parser.add_argument("--baseline-horizon", type=int, default=5, help="The horizon the paired tests compare against.")
+    parser.add_argument(
+        "--target-mode", choices=("absolute", "relative"), default=None,
+        help="What the model predicts (default: TARGET_MODE). 'relative' trains on the "
+             "cross-sectional excess over the same-day universe mean with per-date "
+             "z-scored features; money is measured in absolute returns either way.",
+    )
     parser.add_argument("--n-folds", type=int, default=10)
     parser.add_argument("--n-ensemble-models", type=int, default=5)
     parser.add_argument("--out-csv", default=None, help="Optional path for the per-fold results (long form).")
@@ -184,8 +190,15 @@ def main() -> None:
     # so every horizon has labels inside every fold (see module docstring).
     longest = max(horizons)
     logger.info("Building shared fold dates from the %d-day frame…", longest)
+    # target_mode="absolute" here purely to skip the cross-sectional
+    # transforms: only the `ts` column is read, and the set of usable dates
+    # is identical either way.
     fold_dates = pd.DatetimeIndex(
-        sorted(pd.DatetimeIndex(load_training_frame(args.feature_set_id, symbols, longest)["ts"]).unique())
+        sorted(
+            pd.DatetimeIndex(
+                load_training_frame(args.feature_set_id, symbols, longest, "absolute")["ts"]
+            ).unique()
+        )
     )
 
     results_by_horizon: dict[int, pd.DataFrame] = {}
@@ -198,6 +211,7 @@ def main() -> None:
             n_folds=args.n_folds,
             n_ensemble_models=args.n_ensemble_models,
             fold_dates=fold_dates,
+            target_mode=args.target_mode,
         )
         results_by_horizon[horizon] = results
         print(f"\n=== horizon {horizon}d: per-fold spread ===")

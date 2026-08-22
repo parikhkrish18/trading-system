@@ -302,8 +302,18 @@ def _run_screen_harness(monkeypatch, mode, *, full_deployment=False, diversified
     monkeypatch.setattr(scr.settings, "max_correlated_exposure_pct", 0.50)
 
     dates = pd.bdate_range("2026-01-01", periods=3, tz="UTC")
+    # `target` is what the model is fitted on (absolute forward return here,
+    # cross-sectional excess under TARGET_MODE=relative); `fwd_return` stays
+    # absolute so money is always measured in money.
     train_df = pd.DataFrame(
-        {"symbol": ["A"] * 3, "ts": dates, "close": [1.0, 1.1, 1.2], "fwd_return": [0.01, 0.02, 0.03], "f1": [1, 2, 3]}
+        {
+            "symbol": ["A"] * 3,
+            "ts": dates,
+            "close": [1.0, 1.1, 1.2],
+            "fwd_return": [0.01, 0.02, 0.03],
+            "target": [0.01, 0.02, 0.03],
+            "f1": [1, 2, 3],
+        }
     )
     monkeypatch.setattr(scr, "load_training_frame", lambda *a, **k: train_df)
 

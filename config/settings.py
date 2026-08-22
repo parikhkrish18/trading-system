@@ -141,6 +141,27 @@ class Settings(BaseSettings):
     # measures whether a given value actually earns its keep.
     target_horizon_days: int = Field(default=20, alias="TARGET_HORIZON_DAYS")
 
+    # --- Prediction target ---
+    # What the model is trained to predict.
+    #
+    # "absolute" (the original) = each stock's raw forward return. That
+    # number is dominated by whatever the whole market did, so the model
+    # spent its capacity learning market drift and was then credited with
+    # the drift as if it were skill: 94.6% of its trades were longs in a
+    # rising market, and it still lost to buy-and-hold at every horizon.
+    #
+    # "relative" (default) = the cross-sectional excess return: a stock's
+    # forward return minus the equal-weight mean forward return of the
+    # universe on the SAME date. The market term cancels, leaving only the
+    # part a stock-picker could have added — which is exactly what
+    # excess_return grades. Features are z-scored per date to match, so the
+    # model ranks stocks against same-day peers instead of absolute levels.
+    #
+    # Both modes are kept switchable so the comparison can be re-run; the
+    # evaluation harness always measures money in absolute returns
+    # regardless of which label the model was trained on.
+    target_mode: str = Field(default="relative", alias="TARGET_MODE")  # "absolute" | "relative"
+
     # --- Hold rules (execution/hold_rules.py) ---
     # With multi-week holds (TARGET_HORIZON_DAYS above), a position must NOT
     # be closed just because something else scored marginally higher on

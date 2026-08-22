@@ -17,6 +17,7 @@ from models.confidence_eval import (
     paired_comparison,
     summarize_variant,
 )
+from models.evaluation import cross_sectional_excess
 
 
 def _prediction_frame():
@@ -216,7 +217,11 @@ def test_evaluate_includes_all_diversity_variant_combos():
     assert baseline_row["vs_baseline_mean_diff"].iloc[0] == pytest.approx(0.0)
 
 
-def _training_frame(n_days=60, n_symbols=3, seed=0):
+def _training_frame(n_days=60, n_symbols=3, seed=0, target_mode="absolute"):
+    """
+    A load_training_frame-shaped frame: `target` is what the ensemble is
+    fitted on, `fwd_return` is the absolute return every money metric reads.
+    """
     rng = np.random.default_rng(seed)
     dates = pd.date_range("2026-01-01", periods=n_days)
     rows = []
@@ -233,7 +238,12 @@ def _training_frame(n_days=60, n_symbols=3, seed=0):
                 }
             )
         )
-    return pd.concat(rows, ignore_index=True)
+    df = pd.concat(rows, ignore_index=True)
+    if target_mode == "absolute":
+        df["target"] = df["fwd_return"]
+    else:
+        df["target"] = cross_sectional_excess(df, "fwd_return", "ts")
+    return df
 
 
 def test_collect_fold_predictions_walks_folds_without_leakage():

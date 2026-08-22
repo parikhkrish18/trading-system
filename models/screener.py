@@ -32,9 +32,10 @@ from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine
 from data.ingest.universe import resolve_symbols
+from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND
-from models.train import load_feature_frame, load_training_frame
+from models.train import feature_columns, load_feature_frame, load_training_frame
 from monitoring import reasoning
 from risk.sizing import scale_to_full_deployment, target_position_size
 
@@ -65,10 +66,33 @@ class TradeCandidate:
     reasoning: list[dict] | None = None
 
 
-def load_latest_features(feature_set_id: str, symbols: list[str]) -> pd.DataFrame:
-    """The most recent feature row per symbol — what gets scored "as of today"."""
+def load_latest_features(
+    feature_set_id: str, symbols: list[str], target_mode: str | None = None
+) -> pd.DataFrame:
+    """
+    The most recent feature row per symbol — what gets scored "as of today".
+
+    In relative mode the features are cross-sectionally z-scored across the
+    snapshot, exactly as load_training_frame z-scores each training date.
+    That has to match: a model trained on per-date z-scores and then scored
+    on raw feature levels would be reading a completely different scale from
+    the one it learned on, and would produce confident nonsense.
+
+    The z-score is taken across the whole snapshot rather than per ts. The
+    rows are the newest per symbol and so are nearly all the same date;
+    grouping by ts would give a stale symbol a group of one, whose z-score
+    is 0.0 by definition — no information at all, rather than its position
+    against today's peers.
+    """
+    target_mode = settings.target_mode if target_mode is None else target_mode
     df = load_feature_frame(feature_set_id, symbols)
-    return df.sort_values("ts").groupby("symbol", as_index=False).tail(1).reset_index(drop=True)
+    latest = df.sort_values("ts").groupby("symbol", as_index=False).tail(1).reset_index(drop=True)
+    if target_mode == "absolute":
+        return latest
+
+    cols = feature_columns(latest)
+    snapshot = latest.assign(_as_of="snapshot")
+    return cross_sectional_zscore(snapshot, cols, date_col="_as_of").drop(columns="_as_of")
 
 
 def build_correlation_matrix(prices: pd.DataFrame, lookback_days: int = 60) -> pd.DataFrame:
@@ -430,10 +454,16 @@ def run_screen_with_scores(
     if target_horizon_days is None:
         target_horizon_days = settings.target_horizon_days
     train_df = load_training_frame(feature_set_id, symbols, target_horizon_days)
-    feature_cols = [c for c in train_df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
+    feature_cols = feature_columns(train_df)
 
+    # Fitted on `target` — the absolute forward return, or the
+    # cross-sectional excess over the same-day universe, per TARGET_MODE.
+    # In relative mode a prediction reads "expected to beat the equal-weight
+    # universe by this much over the horizon", not "expected to rise this
+    # much", and the confidence thresholds downstream are interpreted in
+    # those units.
     ensemble = EnsembleForecastModel(n_models=n_ensemble_models)
-    ensemble.fit(train_df[feature_cols], train_df["fwd_return"])
+    ensemble.fit(train_df[feature_cols], train_df["target"])
 
     latest = load_latest_features(feature_set_id, symbols)
     scored = score_universe(ensemble, latest, feature_cols, min_direction_agreement, min_abs_return)
@@ -463,7 +493,11 @@ def run_screen_with_scores(
     else:
         # Diversified default: top-k book sized through the full risk
         # pipeline (confidence scaling, regime damping, correlation caps).
-        forecast_scale = float(train_df["fwd_return"].std())
+        # Scaled by the spread of what the model predicts, not of raw
+        # returns: in relative mode the two differ by roughly the market's
+        # own volatility, and using the wrong one would systematically
+        # mis-size every position.
+        forecast_scale = float(train_df["target"].std())
         correlation_matrix = build_correlation_matrix(train_df[["symbol", "ts", "close"]])
         candidates = select_trades(
             scored,

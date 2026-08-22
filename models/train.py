@@ -24,9 +24,17 @@ inflates every metric. Each fold purges the last `target_horizon_days`
 trading days of its training window so no training label overlaps the test
 period.
 
+PREDICTION TARGET: the model is fitted on the `target` column, which is
+either the absolute forward return or the cross-sectional excess over the
+same-day universe mean (TARGET_MODE / --target-mode, see
+load_training_frame). Money is ALWAYS measured on absolute `fwd_return`,
+in both modes, against the equal-weight buy-and-hold benchmark — see
+models/evaluation.py for why every return figure here carries a baseline.
+
 Usage:
     python -m models.train --feature-set-id v1 --symbols SPY,QQQ,TQQQ,SQQQ \\
         --target-horizon-days 5 --n-folds 10
+    python -m models.train --feature-set-id v4 --universe --target-mode absolute
 """
 from __future__ import annotations
 
@@ -42,7 +50,7 @@ from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
-from models.evaluation import trade_metrics
+from models.evaluation import cross_sectional_excess, cross_sectional_zscore, trade_metrics
 from models.forecast.ensemble import EnsembleForecastModel
 
 
@@ -129,18 +137,66 @@ def load_feature_frame(feature_set_id: str, symbols: list[str]) -> pd.DataFrame:
     return wide.merge(prices, on=["symbol", "ts"], how="inner").sort_values(["symbol", "ts"])
 
 
-def load_training_frame(feature_set_id: str, symbols: list[str], target_horizon_days: int) -> pd.DataFrame:
+NON_FEATURE_COLUMNS = ("symbol", "ts", "close", "fwd_return", "target")
+
+
+def feature_columns(df: pd.DataFrame) -> list[str]:
+    """Everything in a training frame that is a model input, in frame order."""
+    return [c for c in df.columns if c not in NON_FEATURE_COLUMNS]
+
+
+def load_training_frame(
+    feature_set_id: str,
+    symbols: list[str],
+    target_horizon_days: int,
+    target_mode: str | None = None,
+) -> pd.DataFrame:
     """
     Adds the forward-return target on top of load_feature_frame. Target is
     built from *future* prices relative to each row's ts — this is the one
     place look-ahead would sneak in if the join were done wrong, so keep
     this function small and test it directly.
+
+    Always produces TWO return columns:
+
+      fwd_return  the stock's absolute forward return. Never transformed.
+                  Everything that measures money — the trade metrics, the
+                  buy-and-hold benchmark — reads this, whatever the model
+                  was trained on.
+      target      what the model is trained to predict.
+
+    target_mode (None = settings.target_mode):
+      "absolute"  target == fwd_return. The original behaviour.
+      "relative"  target = fwd_return minus the equal-weight mean fwd_return
+                  of the universe on the same date, and every feature is
+                  replaced by its cross-sectional z-score within its date.
+                  The market move cancels out of both label and features, so
+                  the model can only earn its keep by ranking stocks against
+                  each other.
+
+    The cross-sectional transforms are computed on the whole frame before
+    the walk-forward splits it. That is not leakage: both use only rows
+    sharing the SAME ts, so a training row's target and features depend on
+    other stocks on that same day and never on any later date. The purge
+    gap still handles the genuine leakage vector, which is the forward
+    shift.
     """
+    target_mode = settings.target_mode if target_mode is None else target_mode
+    if target_mode not in ("absolute", "relative"):
+        raise ValueError(f"target_mode must be 'absolute' or 'relative', got {target_mode!r}")
+
     merged = load_feature_frame(feature_set_id, symbols)
     merged["fwd_return"] = merged.groupby("symbol")["close"].transform(
         lambda s: s.shift(-target_horizon_days) / s - 1
     )
-    return merged.dropna(subset=["fwd_return"])
+    merged = merged.dropna(subset=["fwd_return"])
+
+    if target_mode == "absolute":
+        merged["target"] = merged["fwd_return"]
+        return merged
+
+    merged["target"] = cross_sectional_excess(merged, "fwd_return", "ts")
+    return cross_sectional_zscore(merged, feature_columns(merged), "ts")
 
 
 def run_walk_forward(
@@ -153,6 +209,7 @@ def run_walk_forward(
     confident_agreement_threshold: float = 0.8,
     purge_days: int | None = None,
     fold_dates: pd.DatetimeIndex | None = None,
+    target_mode: str | None = None,
 ) -> pd.DataFrame:
     """
     n_folds defaults to 10 (was 6, and long before that 3): a mean over a
@@ -160,6 +217,12 @@ def run_walk_forward(
     spread, not just the average (main() prints both).
 
     target_horizon_days: None = the configured TARGET_HORIZON_DAYS.
+
+    target_mode: None = the configured TARGET_MODE ("absolute" | "relative",
+    see load_training_frame). The model is fitted on the `target` column,
+    but every money metric — the trade returns, the buy-and-hold benchmark,
+    the excess — is computed from absolute `fwd_return` in both modes, so
+    the two are directly comparable.
 
     purge_days: how many trading days to cut off the end of each training
     window so no training label overlaps the test period (see module
@@ -175,9 +238,10 @@ def run_walk_forward(
     """
     if target_horizon_days is None:
         target_horizon_days = settings.target_horizon_days
+    target_mode = settings.target_mode if target_mode is None else target_mode
     purge_days = target_horizon_days if purge_days is None else purge_days
-    df = load_training_frame(feature_set_id, symbols, target_horizon_days)
-    feature_cols = [c for c in df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
+    df = load_training_frame(feature_set_id, symbols, target_horizon_days, target_mode)
+    feature_cols = feature_columns(df)
 
     dates = pd.DatetimeIndex(sorted(pd.DatetimeIndex(df["ts"]).unique()))
     folds = make_expanding_folds(fold_dates if fold_dates is not None else dates, n_folds=n_folds)
@@ -210,6 +274,7 @@ def run_walk_forward(
                     "test_end": str(fold.test_end),
                     "feature_set_id": feature_set_id,
                     "target_horizon_days": target_horizon_days,
+                    "target_mode": target_mode,
                     "n_features": len(feature_cols),
                     "n_ensemble_models": n_ensemble_models,
                     "confident_agreement_threshold": confident_agreement_threshold,
@@ -220,20 +285,26 @@ def run_walk_forward(
             )
 
             model = EnsembleForecastModel(n_models=n_ensemble_models)
-            model.fit(train_df[feature_cols], train_df["fwd_return"])
+            model.fit(train_df[feature_cols], train_df["target"])
             ensemble_out = model.predict(test_df[feature_cols])
             preds = ensemble_out["mean_prediction"].to_numpy()
-            actual = test_df["fwd_return"].to_numpy()
-            # The absolute forward return, always — error and accuracy are
-            # measured against whatever the model was trained to predict,
-            # but money is measured in money.
+            # `actual` is whatever the model was trained to predict, so MAE,
+            # RMSE and directional accuracy stay measured against the model's
+            # own objective. `market` is the absolute forward return, always
+            # — money is measured in money regardless of the target mode.
+            actual = test_df["target"].to_numpy()
             market = test_df["fwd_return"].to_numpy()
 
             mae = mean_absolute_error(actual, preds)
             rmse = np.sqrt(mean_squared_error(actual, preds))
             # Directional accuracy matters at least as much as magnitude error
             # for a system that ultimately just takes long/short/flat decisions.
+            # Two versions, because in relative mode they answer different
+            # questions: did the stock beat the market (the model's own
+            # objective), and did it go up at all (what a long actually needs).
+            # In absolute mode the two are identical by construction.
             directional_acc = float(np.mean(np.sign(preds) == np.sign(actual)))
+            directional_acc_absolute = float(np.mean(np.sign(preds) == np.sign(market)))
 
             # Does ensemble agreement actually correlate with being right?
             # This is what calibrates the screener's confidence threshold —
@@ -264,6 +335,7 @@ def run_walk_forward(
                     "mae": mae,
                     "rmse": rmse,
                     "directional_accuracy": directional_acc,
+                    "directional_accuracy_absolute": directional_acc_absolute,
                     "directional_accuracy_when_confident": directional_acc_confident,
                     "pct_rows_confident": pct_confident,
                     "mean_ensemble_std": float(ensemble_out["std_prediction"].mean()),
@@ -288,6 +360,7 @@ def run_walk_forward(
                     "mae": mae,
                     "rmse": rmse,
                     "directional_accuracy": directional_acc,
+                    "directional_accuracy_absolute": directional_acc_absolute,
                     "directional_accuracy_when_confident": directional_acc_confident,
                     "pct_rows_confident": pct_confident,
                     **metrics,
@@ -302,6 +375,7 @@ def run_walk_forward(
 # past by accident.
 SPREAD_COLUMNS = (
     "directional_accuracy",
+    "directional_accuracy_absolute",
     "directional_accuracy_when_confident",
     "benchmark_return",
     "model_return_net",
@@ -383,6 +457,12 @@ def main() -> None:
         "--target-horizon-days", type=int, default=None,
         help=f"Forward-return horizon in trading days (default: TARGET_HORIZON_DAYS = {settings.target_horizon_days}).",
     )
+    parser.add_argument(
+        "--target-mode", choices=("absolute", "relative"), default=None,
+        help=f"What the model predicts: 'absolute' forward return, or 'relative' "
+             f"cross-sectional excess over the same-day universe mean with per-date "
+             f"z-scored features (default: TARGET_MODE = {settings.target_mode}).",
+    )
     parser.add_argument("--n-folds", type=int, default=10)
     parser.add_argument("--n-ensemble-models", type=int, default=5)
     parser.add_argument("--confident-agreement-threshold", type=float, default=0.8)
@@ -402,6 +482,7 @@ def main() -> None:
         n_ensemble_models=args.n_ensemble_models,
         confident_agreement_threshold=args.confident_agreement_threshold,
         purge_days=args.purge_days,
+        target_mode=args.target_mode,
     )
 
     print(results.to_string(index=False))

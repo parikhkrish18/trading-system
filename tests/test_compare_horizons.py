@@ -200,7 +200,7 @@ def test_run_walk_forward_defaults_to_the_configured_horizon(monkeypatch):
     monkeypatch.setattr(train.settings, "target_horizon_days", 7)
     captured = {}
 
-    def _capture(feature_set_id, symbols, horizon):
+    def _capture(feature_set_id, symbols, horizon, *args, **kwargs):
         captured["horizon"] = horizon
         raise RuntimeError("stop here — only the horizon resolution is under test")
 
@@ -218,7 +218,7 @@ def test_run_screen_defaults_to_the_configured_horizon(monkeypatch):
     monkeypatch.setattr(screener.settings, "target_horizon_days", 13)
     captured = {}
 
-    def _capture(feature_set_id, symbols, horizon):
+    def _capture(feature_set_id, symbols, horizon, *args, **kwargs):
         captured["horizon"] = horizon
         raise RuntimeError("stop here — only the horizon resolution is under test")
 
@@ -236,7 +236,7 @@ def test_explicit_horizon_still_wins_over_the_config(monkeypatch):
     monkeypatch.setattr(train.settings, "target_horizon_days", 20)
     captured = {}
 
-    def _capture(feature_set_id, symbols, horizon):
+    def _capture(feature_set_id, symbols, horizon, *args, **kwargs):
         captured["horizon"] = horizon
         raise RuntimeError("stop")
 

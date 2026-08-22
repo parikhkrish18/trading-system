@@ -45,7 +45,12 @@ from config.settings import settings
 from data.ingest.universe import resolve_symbols
 from models.evaluation import trade_metrics
 from models.forecast.ensemble import EnsembleForecastModel, summarize_members
-from models.train import load_training_frame, make_expanding_folds, purged_train_cutoff
+from models.train import (
+    feature_columns,
+    load_training_frame,
+    make_expanding_folds,
+    purged_train_cutoff,
+)
 
 # The production filter as of the v4 run — every variant is tested against
 # this, on the same per-fold predictions, with a paired test.
@@ -84,7 +89,10 @@ def collect_fold_predictions(
         ensemble = EnsembleForecastModel(
             n_models=n_ensemble_models, base_seed=base_seed, diversity=diversity
         )
-        ensemble.fit(train_df[feature_cols], train_df["fwd_return"], ts=train_df["ts"])
+        # Trained on `target` (absolute or market-relative, per TARGET_MODE),
+        # but fwd_return is what gets persisted alongside the predictions:
+        # every downstream metric measures money, and money is absolute.
+        ensemble.fit(train_df[feature_cols], train_df["target"], ts=train_df["ts"])
         members = ensemble.predict_members(test_df[feature_cols])
 
         out = test_df[["symbol", "ts", "fwd_return"]].reset_index(drop=True)
@@ -293,16 +301,23 @@ def main() -> None:
     df = None
     feature_cols: list[str] = []
 
+    # The target mode is part of the cache key: predictions trained on
+    # absolute forward returns and predictions trained on cross-sectional
+    # excess are different numbers in different units, and silently reusing
+    # one for the other would invalidate every result below it. The existing
+    # artifacts/*_seed.csv.gz files predate this and are absolute-mode.
+    mode_suffix = "" if settings.target_mode == "absolute" else f"_{settings.target_mode}"
+
     preds_by_diversity: dict[str, pd.DataFrame] = {}
     for diversity in ("seed", "structural"):
-        cache = out_dir / f"predictions_{args.feature_set_id}_{diversity}.csv.gz"
+        cache = out_dir / f"predictions_{args.feature_set_id}_{diversity}{mode_suffix}.csv.gz"
         if cache.exists() and not args.force_retrain:
             print(f"[{diversity}] reusing {cache}")
             preds = pd.read_csv(cache, parse_dates=["ts"])
         else:
             if df is None:
                 df = load_training_frame(args.feature_set_id, symbols, args.target_horizon_days)
-                feature_cols = [c for c in df.columns if c not in ("symbol", "ts", "close", "fwd_return")]
+                feature_cols = feature_columns(df)
             print(f"[{diversity}] training {args.n_folds} folds x {args.n_ensemble_models} members...")
             preds = collect_fold_predictions(
                 df,
@@ -323,9 +338,11 @@ def main() -> None:
     print("\n=== Aggregate (mean over folds; paired tests vs seed/agree80 on excess_conf) ===")
     print(aggregate.to_string(index=False))
 
-    aggregate.to_csv(out_dir / f"aggregate_{args.feature_set_id}.csv", index=False)
+    aggregate.to_csv(out_dir / f"aggregate_{args.feature_set_id}{mode_suffix}.csv", index=False)
     for (diversity, name), table in fold_tables.items():
-        table.to_csv(out_dir / f"folds_{args.feature_set_id}_{diversity}_{name}.csv", index=False)
+        table.to_csv(
+            out_dir / f"folds_{args.feature_set_id}_{diversity}_{name}{mode_suffix}.csv", index=False
+        )
     print(f"\nPer-fold tables written to {out_dir}")
 
     if not args.no_mlflow:
@@ -341,6 +358,7 @@ def main() -> None:
                         "n_folds": args.n_folds,
                         "n_ensemble_models": args.n_ensemble_models,
                         "target_horizon_days": args.target_horizon_days,
+                        "target_mode": settings.target_mode,
                         "round_trip_cost_fraction": cost,
                     }
                 )
