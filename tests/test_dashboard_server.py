@@ -4,7 +4,23 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
+from config.settings import Settings
 from monitoring.dashboard import server
+
+
+@pytest.fixture(autouse=True)
+def _local_dev_bind(monkeypatch):
+    """
+    Every /api route is token-gated now, so each test has to say which side
+    of that gate it is on. The default is the local-development case —
+    loopback bind, no token configured — which is the one nearly every test
+    here cares nothing about. The gate's own tests override it.
+
+    Pinned explicitly rather than inherited from the ambient settings so a
+    developer's own .env cannot decide whether the suite passes.
+    """
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
 
 
 @pytest.fixture
@@ -677,13 +693,19 @@ def test_run_job_forbidden_on_open_interface_without_a_token(client, _job_env, m
     assert client.post("/api/jobs/cycle/run").status_code == 403
 
 
-def test_jobs_status_endpoint_is_readable_without_a_token(client, _job_env, monkeypatch):
+def test_jobs_status_endpoint_needs_the_token_too(client, _job_env, monkeypatch):
+    """
+    Job status used to be readable without a token on the grounds that it
+    only reads. It names what the system is doing right now, and it is an
+    /api route like any other — no exemptions.
+    """
     monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
 
-    resp = client.get("/api/jobs")
+    assert client.get("/api/jobs").status_code == 403
 
-    assert resp.status_code == 200
-    assert set(resp.json()) == {"ingest", "cycle"}
+    ok = client.get("/api/jobs", headers={"Authorization": "Bearer sekrit"})
+    assert ok.status_code == 200
+    assert set(ok.json()) == {"ingest", "cycle"}
 
 
 def test_finished_jobs_survive_a_restart_but_running_does_not(client, _job_env, tmp_path):
@@ -707,3 +729,127 @@ def test_cycle_job_command_still_goes_through_the_pipeline_entrypoint(client, _j
     command = server._JOB_COMMANDS["cycle"]["command"]
     assert "scripts.run_weekly_cycle" in command
     assert not any("broker" in part for part in command)
+
+
+# --------------------------------------------------------------------------
+# Where the server binds — the hosting contract
+# --------------------------------------------------------------------------
+
+
+def _captured_uvicorn_kwargs(monkeypatch) -> dict:
+    """Run main() with uvicorn stubbed out, and report how it was called."""
+    captured: dict = {}
+
+    class _FakeUvicorn:
+        @staticmethod
+        def run(app, **kwargs):
+            captured.update(app=app, **kwargs)
+
+    monkeypatch.setitem(__import__("sys").modules, "uvicorn", _FakeUvicorn)
+    server.main()
+    return captured
+
+
+def test_main_binds_the_configured_host_and_port(monkeypatch):
+    """
+    A platform host (Railway, and PaaS generally) picks the port itself and
+    injects it as $PORT, then routes the public domain there. Binding a
+    hardcoded port instead means the health check hits nothing and the
+    deploy is marked failed, so the port must come from settings.
+    """
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+    monkeypatch.setattr(server.settings, "dashboard_port", 3141)
+
+    captured = _captured_uvicorn_kwargs(monkeypatch)
+
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 3141
+
+
+def test_bind_defaults_stay_loopback_8501_when_nothing_is_injected(monkeypatch):
+    """
+    The unhosted default stays the deliberate loopback bind. Built from a
+    clean environment rather than the ambient `settings`, so a developer's
+    own .env cannot make this pass or fail.
+    """
+    for var in ("PORT", "DASHBOARD_HOST"):
+        monkeypatch.delenv(var, raising=False)
+
+    fresh = Settings(_env_file=None)
+
+    assert fresh.dashboard_host == "127.0.0.1"
+    assert fresh.dashboard_port == 8501
+
+
+# --------------------------------------------------------------------------
+# The gate covers reads, not just writes
+# --------------------------------------------------------------------------
+
+
+def _api_paths() -> list[str]:
+    """Every /api route the app declares, mounts excluded."""
+    return sorted(
+        route.path for route in server.app.routes
+        if getattr(route, "path", "").startswith("/api")
+    )
+
+
+def test_no_api_route_escapes_the_token_gate():
+    """
+    Declared once on the app so a route added later is private by default.
+    This asserts that arrangement holds: if someone moves the gate back to
+    per-route decorators and forgets one, this fails rather than quietly
+    publishing the new endpoint.
+    """
+    gated = {
+        route.path
+        for route in server.app.routes
+        if getattr(route, "path", "").startswith("/api")
+        and any(d.call is server._require_api_token for d in route.dependant.dependencies)
+    }
+
+    assert gated == set(_api_paths())
+    assert len(gated) > 10, "route introspection found almost nothing — the check has gone blind"
+
+
+def test_reads_are_refused_on_a_public_bind_without_a_token(client, monkeypatch):
+    """
+    What these return is the book: open positions, their size, the model's
+    reasoning, the equity curve. A public URL must not hand that to whoever
+    finds it.
+    """
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+
+    for path in ("/api/positions", "/api/decisions", "/api/equity_curve", "/api/trades/closed"):
+        assert client.get(path).status_code == 403, f"{path} leaked without a token"
+
+
+def test_reads_are_refused_on_a_public_bind_even_with_no_token_configured(client, monkeypatch):
+    """Fails closed: a blank DASHBOARD_API_TOKEN must not mean 'open to all'."""
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+
+    assert client.get("/api/positions").status_code == 403
+
+
+def test_reads_still_work_on_loopback_without_a_token(monkeypatch, client):
+    """Local development keeps its no-ceremony path."""
+    monkeypatch.setattr(server, "get_broker", lambda: _FakeBroker([]))
+
+    assert client.get("/api/positions").status_code == 200
+
+
+def test_the_static_page_itself_stays_reachable(client, monkeypatch):
+    """
+    The gate must not lock the door it hands you the key through: the page
+    has to load before anyone can type a token into it. It carries no data
+    of its own — every number arrives via a gated /api call.
+    """
+    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+
+    resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert "api-token-input" in resp.text

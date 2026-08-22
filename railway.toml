@@ -1,0 +1,19 @@
+# Railway build configuration, shared by every service deployed from this
+# repo (the dashboard web service and the two scheduled ones).
+#
+# Deliberately [build]-only. A railway.toml key OVERRIDES whatever the
+# service's dashboard settings say, so putting `startCommand` here would
+# silently force the cron services to run the web server instead of their
+# job. Build inputs are identical across all three services and belong in
+# version control; start command, cron schedule and restart policy differ
+# per service and are set in the Railway UI — see infra/railway/README.md.
+#
+# Why Dockerfile rather than Railway's automatic Nixpacks detection:
+# LightGBM needs a system library (libgomp1) that auto-detection does not
+# install, and requirements.txt is pinned against a specific Python. The
+# Dockerfile states both, so the build is the same here, on a laptop, and
+# in CI.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "monitoring/dashboard/Dockerfile"

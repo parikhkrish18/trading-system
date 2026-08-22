@@ -10,12 +10,31 @@
   <header class="topbar">
     <h1>Trading System Monitor</h1>
     <div class="topbar-right">
+      <!--
+        The operator token for the state-changing endpoints. Kept in this
+        browser only (localStorage) and sent as a bearer header; the server
+        is the thing that enforces it. Needed whenever the dashboard is
+        reachable off-localhost, because then DASHBOARD_API_TOKEN is set and
+        the buttons below are 403 without it.
+      -->
+      <input
+        id="api-token-input"
+        class="token-input"
+        type="password"
+        autocomplete="off"
+        placeholder="Operator token"
+        title="DASHBOARD_API_TOKEN — required to run jobs or tests on a hosted dashboard. Stored in this browser only."
+      />
       <span id="mode-badge" class="badge">…</span>
       <button id="refresh-btn" class="btn">Refresh</button>
     </div>
   </header>
 
   <main>
+    <!-- Shown only when the API refuses us: one explanation instead of a
+         dozen separately-broken panels. -->
+    <div id="auth-banner" class="auth-banner" hidden></div>
+
     <section id="controls-section">
       <h2>Manual Controls <span class="muted">(runs in the background — a cycle still needs Telegram approval before any order)</span></h2>
       <div class="summary-row">

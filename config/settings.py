@@ -7,6 +7,8 @@ config is loaded and validated.
 """
 from __future__ import annotations
 
+from urllib.parse import quote_plus
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -79,6 +81,12 @@ class Settings(BaseSettings):
     # from the network by accident; the Docker image sets 0.0.0.0 explicitly
     # (containers need it to publish the port).
     dashboard_host: str = Field(default="127.0.0.1", alias="DASHBOARD_HOST")
+    # Which port it binds. The alias is PORT, not DASHBOARD_PORT, because
+    # that is the variable every PaaS (Railway included) injects into the
+    # container and then routes the public domain to — binding anything else
+    # there means the platform health-checks a dead port and the deploy is
+    # marked failed. Unset locally, so 8501 stays the local default.
+    dashboard_port: int = Field(default=8501, alias="PORT")
 
     # --- Alerts ---
     slack_webhook_url: str = Field(default="", alias="SLACK_WEBHOOK_URL")
@@ -218,7 +226,15 @@ class Settings(BaseSettings):
 
     @property
     def db_url(self) -> str:
-        return f"postgresql+psycopg2://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        # User and password are percent-encoded because they are credentials,
+        # not URL syntax. A managed Postgres generates the password for you —
+        # Railway's can contain '@', '/', ':' or '#' — and interpolating one
+        # of those raw silently reshapes the URL, so the driver reports an
+        # unreachable host rather than a bad password. quote_plus with an
+        # empty safe set escapes every reserved character.
+        user = quote_plus(self.db_user)
+        password = quote_plus(self.db_password)
+        return f"postgresql+psycopg2://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
 
     @property
     def is_live(self) -> bool:
