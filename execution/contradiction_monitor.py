@@ -61,7 +61,9 @@ _MIN_NEWS_COUNT = 2
 _SENTIMENT_CONTRADICTION_THRESHOLD = 0.4  # mean sentiment must be this strongly opposite to trigger
 
 _MOMENTUM_WINDOW_DAYS = 5
-_MOMENTUM_CONTRADICTION_THRESHOLD = 0.04  # 4% move against the position over the window
+# The trigger size is config, not a constant — see
+# settings.contradiction_momentum_pct for why it is where it is (an
+# emergency brake, deliberately quiet) and what would justify moving it.
 
 # Don't bother re-screening for a sliver of freed capital too small to matter.
 _MIN_REACTIVATION_FRACTION = 0.05
@@ -119,7 +121,7 @@ def _check_position(engine, symbol: str, qty: float) -> ContradictionResult:
             )
 
     momentum = _recent_momentum(engine, symbol)
-    if momentum is not None and sign * momentum <= -_MOMENTUM_CONTRADICTION_THRESHOLD:
+    if momentum is not None and sign * momentum <= -settings.contradiction_momentum_pct:
         reasons.append(
             {
                 "signal": "price_momentum",

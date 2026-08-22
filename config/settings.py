@@ -186,6 +186,23 @@ class Settings(BaseSettings):
     # 3-10% move band the swing horizon targets.
     hold_take_profit_pct: float = Field(default=0.10, alias="HOLD_TAKE_PROFIT_PCT")
 
+    # --- Between-cycle emergency brake (execution/contradiction_monitor.py) ---
+    # How far a held position must move against itself, over the monitor's
+    # 5-day window, before it proposes closing mid-week.
+    #
+    # This is an emergency brake, not a second opinion. The weekly rules
+    # above decide when a position has run its course; this exists only so a
+    # collapse on a Tuesday isn't discovered the following Monday. It was
+    # 0.04, which is roughly one week's ordinary movement for a typical S&P
+    # 500 name — so it fired on noise, hourly, against a thesis that needs
+    # ~20 trading days to play out, reintroducing exactly the churn that
+    # HOLD_MAX_MISSED_CYCLES exists to prevent. 0.11 is about three standard
+    # deviations of weekly movement: rare enough to mean something broke.
+    #
+    # Lower it only with evidence that real failures are being missed, not
+    # because it has been quiet — quiet is the intended state.
+    contradiction_momentum_pct: float = Field(default=0.11, alias="CONTRADICTION_MOMENTUM_PCT")
+
     # --- Direction ---
     # Whether the screener may propose short candidates at all.
     #

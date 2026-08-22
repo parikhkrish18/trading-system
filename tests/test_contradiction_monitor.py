@@ -5,6 +5,16 @@ from execution import contradiction_monitor as cm
 from execution.approval_gate import ApprovalOutcome, number_proposals
 
 
+def _past_the_brake() -> float:
+    """
+    A move comfortably past the mid-week brake, whatever it is currently set
+    to. Derived rather than hardcoded: these tests are about what happens
+    once the brake trips, not about the size of the trip, and a literal here
+    silently stops testing anything the next time the threshold is retuned.
+    """
+    return cm.settings.contradiction_momentum_pct + 0.05
+
+
 def _approve_all(proposals, *, context, **kwargs):
     ordered = number_proposals(list(proposals))
     return ApprovalOutcome(
@@ -122,7 +132,7 @@ def test_reversed_momentum_closes_a_short_position(monkeypatch):
     monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
     monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
-    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.06)  # up 6%, contradicts a short
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: _past_the_brake())  # contradicts a short
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
@@ -320,7 +330,7 @@ def test_contradiction_closes_are_batched_into_one_gate_call(monkeypatch):
     monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
     monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5) if symbol == "AAPL" else (None, 0))
-    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.06 if symbol == "TSLA" else None)
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: _past_the_brake() if symbol == "TSLA" else None)
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
@@ -507,3 +517,62 @@ def test_reactivation_allocates_only_the_freed_fraction(monkeypatch):
     # 80% of $100k at $100/share = 800 shares.
     submitted = {s: broker._positions[s] for s in broker.closed}
     assert submitted["AAPL"] == pytest.approx(800.0)
+
+
+# --------------------------------------------------------------------------
+# The mid-week brake is a brake, not a second opinion
+# --------------------------------------------------------------------------
+
+
+def _momentum_triggers(monkeypatch, move: float) -> bool:
+    """Does a `move` against a long position trip the mid-week close?"""
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: move)
+    return cm._check_position(engine=object(), symbol="AAPL", qty=10).closed
+
+
+def test_ordinary_weekly_movement_does_not_trip_the_brake(monkeypatch):
+    """
+    A typical S&P 500 name moves ~4% in a week just existing. The brake used
+    to sit at exactly that, so it fired on noise — hourly — against a thesis
+    that needs ~20 trading days to play out, reintroducing the churn the
+    hold rules exist to prevent. Normal movement must now pass unremarked.
+    """
+    assert _momentum_triggers(monkeypatch, -0.04) is False
+    assert _momentum_triggers(monkeypatch, -0.06) is False
+
+
+def test_a_collapse_still_trips_the_brake(monkeypatch):
+    """
+    The brake's whole purpose: a position falling apart on a Tuesday must
+    not wait until Monday to be noticed.
+    """
+    assert _momentum_triggers(monkeypatch, -0.15) is True
+
+
+def test_the_brake_sits_well_clear_of_weekly_noise():
+    """
+    Pins the intent rather than the number. Weekly movement for a typical
+    name is ~4%; the brake must stay far enough above that to mean
+    something broke, not something wobbled. Retuning it below this is a
+    decision that should require changing this test deliberately.
+    """
+    assert cm.settings.contradiction_momentum_pct >= 0.09
+
+
+def test_the_brake_is_configurable_without_a_deploy(monkeypatch):
+    """Tuning it should be an environment change, not a code change."""
+    monkeypatch.setattr(cm.settings, "contradiction_momentum_pct", 0.20)
+
+    assert _momentum_triggers(monkeypatch, -0.15) is False
+    assert _momentum_triggers(monkeypatch, -0.25) is True
+
+
+def test_the_brake_is_direction_aware_for_shorts(monkeypatch):
+    """A short is hurt by a rise, so the sign that trips it is inverted."""
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.15)
+
+    assert cm._check_position(engine=object(), symbol="AAPL", qty=-10).closed is True
+    # The same rise helps a long — it must not propose closing it.
+    assert cm._check_position(engine=object(), symbol="AAPL", qty=10).closed is False
