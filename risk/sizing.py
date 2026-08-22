@@ -143,6 +143,99 @@ class FullDeploymentResult:
         return self.deployed_pct / self.target_pct if self.target_pct else 0.0
 
 
+def allocate_by_conviction(
+    convictions: Mapping[str, float],
+    max_position_pct: float,
+    max_short_position_pct: float | None = None,
+    max_correlated_exposure_pct: float | None = None,
+    correlation_matrix=None,
+    target_allocation: float = 1.0,
+) -> FullDeploymentResult:
+    """
+    Post-approval sizing: distribute `target_allocation` of the portfolio
+    across an already-approved set of picks, weighted by each pick's signed
+    conviction (positive = long, negative = short). This exists because the
+    approval gate now decides WHICH trades happen before anything decides
+    HOW BIG they are — sizing a book and then letting a human veto 7 of 10
+    picks leaves the vetoed picks' capital in cash (which is exactly what
+    happened on the first live paper run).
+
+    The proportional scaling and the per-position caps are
+    scale_to_full_deployment, reused unchanged. On top of that, the
+    correlated-exposure cap is enforced with correlation_adjusted_size:
+    walking the book from highest to lowest conviction, each position is
+    shrunk if the positions already accepted ahead of it (corr > 0.7) have
+    used up the correlated headroom. Any shortfall that clamp introduces is
+    reported, not silently redistributed — redistributing it back into the
+    very names that are correlated would defeat the cap.
+
+    Caps are hard, same contract as scale_to_full_deployment: if they bind
+    before the target is reached, the result says so in `reason` and the
+    book is NOT padded or scaled past a cap.
+
+    All-zero convictions (possible when every approved pick has conviction
+    exactly 0) fall back to an equal split so approved picks still deploy.
+    """
+    if not convictions:
+        return FullDeploymentResult(
+            sizes={},
+            deployed_pct=0.0,
+            target_pct=target_allocation,
+            capped_symbols=[],
+            reached_target=False,
+            reason="No approved picks to allocate capital to.",
+        )
+
+    weights = {symbol: float(c) for symbol, c in convictions.items()}
+    if all(abs(w) <= _TOLERANCE for w in weights.values()):
+        # copysign preserves direction even at zero conviction: callers pass
+        # -0.0 for a short, and IEEE -0.0 carries its sign into copysign.
+        weights = {symbol: math.copysign(1.0, w) for symbol, w in weights.items()}
+
+    result = scale_to_full_deployment(
+        weights,
+        max_position_pct=max_position_pct,
+        max_short_position_pct=max_short_position_pct,
+        target_allocation=target_allocation,
+    )
+
+    if max_correlated_exposure_pct is None or correlation_matrix is None or getattr(correlation_matrix, "empty", True):
+        return result
+
+    accepted: dict[str, float] = {}
+    clamped_symbols: list[str] = []
+    for symbol in sorted(result.sizes, key=lambda s: abs(convictions.get(s, 0.0)), reverse=True):
+        size = result.sizes[symbol]
+        adjusted = correlation_adjusted_size(
+            size, symbol, accepted, correlation_matrix, max_correlated_exposure_pct
+        )
+        if abs(adjusted) < abs(size) - _TOLERANCE:
+            clamped_symbols.append(symbol)
+        accepted[symbol] = adjusted
+
+    if not clamped_symbols:
+        return result
+
+    deployed = sum(abs(size) for size in accepted.values())
+    reason = (
+        f"Correlated-exposure cap bound: {', '.join(sorted(clamped_symbols))} shrunk because "
+        f"aggregate exposure to highly correlated names (corr > 0.7) is capped at "
+        f"{max_correlated_exposure_pct:.0%} of the portfolio. Deployed {deployed:.1%} of the "
+        f"{target_allocation:.1%} target; the shortfall stays in cash rather than being "
+        f"pushed back into correlated names."
+    )
+    if result.reason:
+        reason = f"{result.reason} {reason}"
+    return FullDeploymentResult(
+        sizes={symbol: accepted[symbol] for symbol in result.sizes},
+        deployed_pct=deployed,
+        target_pct=target_allocation,
+        capped_symbols=sorted(set(result.capped_symbols) | set(clamped_symbols)),
+        reached_target=deployed >= target_allocation - _TOLERANCE,
+        reason=reason,
+    )
+
+
 def scale_to_full_deployment(
     sizes: Mapping[str, float],
     max_position_pct: float,

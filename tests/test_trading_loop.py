@@ -96,6 +96,12 @@ def _gate_wide_open(monkeypatch):
     monkeypatch.setattr(trading_loop, "request_approval", _approve_all)
 
 
+@pytest.fixture(autouse=True)
+def _no_followups(monkeypatch):
+    """The post-approval size confirmation must never reach a real phone from a test."""
+    monkeypatch.setattr(trading_loop, "send_followup", lambda *a, **k: None)
+
+
 def test_log_decisions_builds_full_phase_reasoning_for_candidates_and_closures(monkeypatch):
     """
     Exercises the real _log_decisions (not the autouse no-op mock) to check
@@ -565,3 +571,120 @@ def test_run_cycle_fetches_prices_after_the_gate_not_before(monkeypatch):
     trading_loop.run_cycle("v3", ["AAPL"], request_fn=gate)
 
     assert order.index("gate") < order.index("prices")
+
+
+# --- approve first, then size ----------------------------------------------
+
+
+def _wire_basic_cycle(monkeypatch, broker, candidates, prices):
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen", lambda *a, **k: candidates)
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: prices)
+
+
+def test_open_proposals_go_out_without_sizes(monkeypatch):
+    """The human approves WHICH trades happen; sizes don't exist yet at that point."""
+    broker = _FakeBroker()
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("AAPL", "long", 0.1)], {"AAPL": 100.0})
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["AAPL"], request_fn=gate)
+
+    (open_p,) = seen["proposals"]
+    assert open_p.target_position_pct is None
+
+
+def test_partial_approval_deploys_full_capital_across_only_the_approved(monkeypatch):
+    """
+    The first-live-run bug: rejecting picks used to leave their capital in
+    cash. Now the approved subset absorbs the full deployable capital,
+    weighted by conviction (caps raised here so they don't bind).
+    """
+    broker = _FakeBroker(portfolio_value=100_000.0)
+    monkeypatch.setattr(trading_loop.settings, "max_single_position_pct", 0.80)
+    candidates = [
+        _candidate("BIG", "long", 0.1, pred_return=0.04),   # conviction 0.036
+        _candidate("SMALL", "long", 0.1, pred_return=0.02),  # conviction 0.018
+        _candidate("NOPE", "long", 0.1, pred_return=0.02),
+    ]
+    _wire_basic_cycle(monkeypatch, broker, candidates, {"BIG": 100.0, "SMALL": 100.0, "NOPE": 100.0})
+
+    trading_loop.run_cycle("v3", ["BIG", "SMALL", "NOPE"], request_fn=_gate_returning({"BIG", "SMALL"}))
+
+    shares = dict(broker.submitted)
+    assert "NOPE" not in shares  # rejected -> no allocation, no order
+    # 2:1 conviction ratio over 100% of the book -> ~66.7% and ~33.3%.
+    assert shares["BIG"] == pytest.approx(666.67, rel=1e-3)
+    assert shares["SMALL"] == pytest.approx(333.33, rel=1e-3)
+
+
+def test_caps_still_bind_after_approval_and_the_shortfall_is_reported(monkeypatch):
+    """2 approved longs x 25% cap = 50% deployed, said out loud — never silently exceeded."""
+    broker = _FakeBroker(portfolio_value=100_000.0)
+    monkeypatch.setattr(trading_loop.settings, "max_single_position_pct", 0.25)  # pinned: a dev .env can override the default
+    candidates = [_candidate("AAA", "long", 0.1), _candidate("BBB", "long", 0.1)]
+    _wire_basic_cycle(monkeypatch, broker, candidates, {"AAA": 100.0, "BBB": 100.0})
+
+    followups = []
+    monkeypatch.setattr(trading_loop, "send_followup", lambda msg, **k: followups.append(msg))
+
+    trading_loop.run_cycle("v3", ["AAA", "BBB"])
+
+    shares = dict(broker.submitted)
+    assert shares["AAA"] == pytest.approx(250.0)  # 25% cap at $100/share
+    assert shares["BBB"] == pytest.approx(250.0)
+    (msg,) = followups
+    assert "50.0%" in msg  # deployed
+    assert "not reached" in msg.lower() or "cap" in msg.lower()
+
+
+def test_followup_confirmation_lists_each_approved_size(monkeypatch):
+    broker = _FakeBroker(portfolio_value=100_000.0)
+    monkeypatch.setattr(trading_loop.settings, "max_single_position_pct", 1.0)
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("AAPL", "long", 0.1)], {"AAPL": 100.0})
+
+    followups = []
+    monkeypatch.setattr(trading_loop, "send_followup", lambda msg, **k: followups.append(msg))
+
+    trading_loop.run_cycle("v3", ["AAPL"])
+
+    (msg,) = followups
+    assert "AAPL (long): 100.0% of portfolio" in msg
+
+
+def test_kept_positions_shrink_what_the_approved_picks_can_deploy(monkeypatch):
+    """A rejected close stays open and its capital is NOT re-allocated on top."""
+    broker = _FakeBroker(positions={"KEEP": 100.0}, portfolio_value=100_000.0)  # 100 sh * $400 = 40% of book
+    monkeypatch.setattr(trading_loop.settings, "max_single_position_pct", 1.0)
+    _wire_basic_cycle(
+        monkeypatch, broker, [_candidate("AAPL", "long", 0.1)], {"AAPL": 100.0, "KEEP": 400.0}
+    )
+
+    trading_loop.run_cycle("v3", ["AAPL", "KEEP"], request_fn=_gate_returning({"AAPL"}))
+
+    shares = dict(broker.submitted)
+    # 60% deployable (40% stays in KEEP) -> 600 shares at $100.
+    assert shares["AAPL"] == pytest.approx(600.0)
+    assert "KEEP" not in shares
+
+
+def test_approved_sizes_land_in_the_decisions_log(monkeypatch):
+    """What gets logged is the post-approval allocation, not the pre-gate indication."""
+    captured = {}
+    broker = _FakeBroker(portfolio_value=100_000.0)
+    monkeypatch.setattr(trading_loop.settings, "max_single_position_pct", 1.0)
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("AAPL", "long", 0.03)], {"AAPL": 100.0})
+    monkeypatch.setattr(trading_loop, "_log_decisions", lambda *a, **k: captured.update(args=a, kwargs=k))
+
+    trading_loop.run_cycle("v3", ["AAPL"])
+
+    (logged_candidate,) = captured["args"][0]
+    assert logged_candidate.target_position_pct == pytest.approx(1.0)  # full book, one approved pick

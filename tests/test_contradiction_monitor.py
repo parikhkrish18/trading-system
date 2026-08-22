@@ -71,6 +71,12 @@ def _gate_wide_open(monkeypatch):
     monkeypatch.setattr(cm, "request_approval", _approve_all)
 
 
+@pytest.fixture(autouse=True)
+def _no_followups(monkeypatch):
+    """The post-approval size confirmation must never reach a real phone from a test."""
+    monkeypatch.setattr(cm, "send_followup", lambda *a, **k: None)
+
+
 def test_market_closed_is_a_clean_noop(monkeypatch):
     broker = _FakeBroker({"AAPL": 10}, is_open=False)
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
@@ -445,3 +451,59 @@ def test_news_refresh_failure_does_not_abort_the_check(monkeypatch):
     results = cm.run_contradiction_check()
 
     assert not results[0].closed
+
+
+def test_reactivation_proposals_carry_no_size_and_allocation_follows_approval(monkeypatch):
+    """
+    Approve-first on the reactivation path too: the proposal is size-less,
+    and the freed capital is distributed across the approved subset by
+    conviction after the human answers.
+    """
+    from models.screener import TradeCandidate
+
+    broker = _FakeBroker({}, portfolio_value=100_000.0)  # nothing held -> 100% freed
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL", "MSFT"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["AAPL", "MSFT"], "close": [50.0, 100.0]}))
+    monkeypatch.setattr(cm.settings, "max_single_position_pct", 0.80)
+
+    big = TradeCandidate(symbol="AAPL", side="long", predicted_return=0.04, direction_agreement=0.9,
+                         conviction_score=0.036, target_position_pct=0.5)
+    small = TradeCandidate(symbol="MSFT", side="long", predicted_return=0.02, direction_agreement=0.9,
+                           conviction_score=0.018, target_position_pct=0.5)
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: [big, small])
+    monkeypatch.setattr(cm, "_log_reactivation", lambda *a, **k: None)
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    cm._attempt_reactivation(broker, engine=object(), request_fn=gate)
+
+    assert all(p.target_position_pct is None for p in seen["proposals"])
+    # 2:1 conviction split of the full freed book: AAPL 66.7% (cap 80% doesn't bind), MSFT 33.3%.
+    assert big.target_position_pct == pytest.approx(2 / 3, rel=1e-3)
+    assert small.target_position_pct == pytest.approx(1 / 3, rel=1e-3)
+
+
+def test_reactivation_allocates_only_the_freed_fraction(monkeypatch):
+    """80% freed -> the approved pick gets 80% of the book (under a loose cap), not 100%."""
+    from models.screener import TradeCandidate
+
+    broker = _FakeBroker({"MSFT": 100}, portfolio_value=100_000.0)  # $20k held -> 80% freed
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL", "MSFT"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["MSFT", "AAPL"], "close": [200.0, 100.0]}))
+    monkeypatch.setattr(cm.settings, "max_single_position_pct", 1.0)
+
+    candidate = TradeCandidate(symbol="AAPL", side="long", predicted_return=0.03, direction_agreement=0.9,
+                               conviction_score=0.027, target_position_pct=0.6)
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: [candidate])
+    monkeypatch.setattr(cm, "_log_reactivation", lambda *a, **k: None)
+
+    cm._attempt_reactivation(broker, engine=object(), request_fn=_approve_all)
+
+    assert candidate.target_position_pct == pytest.approx(0.80)
+    # 80% of $100k at $100/share = 800 shares.
+    submitted = {s: broker._positions[s] for s in broker.closed}
+    assert submitted["AAPL"] == pytest.approx(800.0)

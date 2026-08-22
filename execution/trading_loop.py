@@ -28,7 +28,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
-from execution.approval_gate import ProposedTrade, request_approval
+from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.broker import get_broker
 from execution.reconciliation import reconcile_positions, summarize
 from features.quant.momentum import adx
@@ -38,6 +38,7 @@ from monitoring import reasoning
 from monitoring.alerts import alert_circuit_breaker, configure_file_logging, send_slack_alert
 from monitoring.breaker_state import check_and_record_breakers
 from monitoring.equity import load_equity_curve, record_equity_snapshot
+from risk.sizing import allocate_by_conviction
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,98 @@ def current_pnl_by_symbol(broker) -> dict[str, tuple[float | None, float | None]
     except Exception:
         logger.warning("Could not fetch position P&L for the approval message — proposing without it.")
         return {}
+
+
+def _deployable_fraction(
+    portfolio_value: float,
+    current_positions: dict[str, float],
+    prices: dict[str, float],
+    kept_symbols: list[str],
+) -> float:
+    """
+    Fraction of the portfolio NOT tied up in positions the human chose to
+    keep (rejected closes, rejected re-picks of held names). This is what
+    post-approval allocation gets to distribute — allocating 100% while a
+    kept position still occupies 10% would over-deploy the book.
+    """
+    if portfolio_value <= 0:
+        return 0.0
+    kept_value = 0.0
+    for symbol in kept_symbols:
+        qty = current_positions.get(symbol, 0.0)
+        if not qty:
+            continue
+        price = prices.get(symbol)
+        if price is None:
+            logger.warning(
+                "No price for kept position %s — its tied-up capital can't be valued and is "
+                "treated as 0 when sizing the approved picks (the broker will reject anything "
+                "that actually over-deploys).",
+                symbol,
+            )
+            continue
+        kept_value += abs(qty) * price
+    return max(0.0, 1.0 - kept_value / portfolio_value)
+
+
+def _correlation_matrix(engine, symbols: list[str]) -> pd.DataFrame:
+    """
+    Trailing correlation matrix for the approved picks, for the
+    correlated-exposure clamp in post-approval allocation. Best-effort: any
+    failure yields an empty matrix (no clamp) rather than a dead cycle —
+    the circuit breakers remain the hard backstop on correlated exposure.
+    """
+    if len(symbols) < 2:
+        return pd.DataFrame()
+    try:
+        price_history = pd.read_sql(
+            "SELECT symbol, ts, close FROM prices "  # noqa: S608 — symbols validated via symbol_in_clause
+            f"WHERE symbol IN ({symbol_in_clause(symbols)}) ORDER BY ts",
+            engine,
+        )
+        if price_history.empty:
+            return pd.DataFrame()
+        return build_correlation_matrix(price_history)
+    except Exception:
+        logger.warning(
+            "Could not build a correlation matrix for the approved picks — allocating without "
+            "the correlated-exposure clamp (circuit breakers still backstop it)."
+        )
+        return pd.DataFrame()
+
+
+def _apply_allocation(allocation, approved_candidates) -> None:
+    """
+    Write the post-approval sizes onto the candidates (what execution and
+    the decisions log read) and update each pick's phase-4 story so the
+    dashboard shows the size that was actually deployed, not the pre-gate
+    indication.
+    """
+    for c in approved_candidates:
+        c.target_position_pct = allocation.sizes.get(c.symbol, 0.0)
+        for phase in c.reasoning or []:
+            if phase.get("phase") == 4:
+                phase["summary"] = f"{c.symbol}: {c.side}, {abs(c.target_position_pct):.1%} of capital (sized after approval)."
+                phase.setdefault("lines", []).append(
+                    f"Final size set after human approval: {abs(c.target_position_pct):.1%} of the portfolio, "
+                    "from distributing the deployable capital across only the approved picks, weighted by conviction."
+                )
+
+
+def _allocation_confirmation(allocation, approved_candidates) -> str:
+    """The follow-up message that closes the loop on the phone: the sizes the approved picks actually got."""
+    lines = [
+        f"{c.symbol} ({c.side}): {abs(c.target_position_pct or 0.0):.1%} of portfolio"
+        for c in approved_candidates
+    ]
+    message = (
+        f"Sizing the {len(approved_candidates)} approved pick(s) — deploying "
+        f"{allocation.deployed_pct:.1%} of the portfolio (target {allocation.target_pct:.1%}):\n"
+        + "\n".join(lines)
+    )
+    if not allocation.reached_target and allocation.reason:
+        message += f"\n{allocation.reason}"
+    return message
 
 
 def _flatten_and_alert(broker, reason: str) -> None:
@@ -316,9 +409,11 @@ def run_cycle(
         )
         for s in closing_symbols
     ] + [
+        # Approve-first: no size on the proposal. The human picks WHICH
+        # trades happen; capital is allocated across the approved subset
+        # afterwards and confirmed in a follow-up message.
         ProposedTrade(
             index=0, symbol=c.symbol, action="open", side=c.side,
-            target_position_pct=c.target_position_pct,
             predicted_return=c.predicted_return, reason="screen",
             reasoning=c.reasoning,
         )
@@ -342,8 +437,37 @@ def run_cycle(
 
     # Prices fetched AFTER the gate, not before: a human reply can take up
     # to the full approval timeout, and shares must be sized off quotes
-    # from after that wait, not before it.
-    prices = _latest_prices([c.symbol for c in approved_candidates] + approved_close_symbols)
+    # from after that wait, not before it. Kept positions (rejected closes,
+    # rejected re-picks of held names) are included so their tied-up
+    # capital can be valued when computing what's deployable.
+    kept_symbols = rejected_close_symbols + [
+        c.symbol for c in rejected_candidates if current_positions.get(c.symbol)
+    ]
+    prices = _latest_prices(
+        [c.symbol for c in approved_candidates] + approved_close_symbols + kept_symbols
+    )
+
+    # --- Approve first, THEN size. The deployable capital (everything not
+    # tied up in positions the human chose to keep) is distributed across
+    # only the approved opens, weighted by conviction, under the same caps
+    # as always. Rejecting 7 of 10 picks concentrates the book into the 3
+    # approved ones instead of leaving 70% of the account in cash.
+    if approved_candidates:
+        deployable = _deployable_fraction(portfolio_value, current_positions, prices, kept_symbols)
+        allocation = allocate_by_conviction(
+            # -0.0 for a zero-conviction short keeps its sign through the
+            # equal-split fallback in allocate_by_conviction.
+            {c.symbol: (c.conviction_score if c.side == "long" else -c.conviction_score) for c in approved_candidates},
+            max_position_pct=settings.max_single_position_pct,
+            max_short_position_pct=settings.max_short_position_pct,
+            max_correlated_exposure_pct=settings.max_correlated_exposure_pct,
+            correlation_matrix=_correlation_matrix(engine, [c.symbol for c in approved_candidates]),
+            target_allocation=deployable,
+        )
+        _apply_allocation(allocation, approved_candidates)
+        if not allocation.reached_target and allocation.reason:
+            logger.warning("%s", allocation.reason)
+        send_followup(_allocation_confirmation(allocation, approved_candidates))
 
     intended_shares: dict[str, float] = {}
     orders_placed = 0
@@ -367,6 +491,9 @@ def run_cycle(
         price = prices.get(c.symbol)
         if not price:
             logger.warning("No price for %s — skipping this candidate.", c.symbol)
+            continue
+        if abs(c.target_position_pct or 0.0) < 1e-9:
+            logger.warning("%s was approved but the caps left it no allocation — no order.", c.symbol)
             continue
         target_shares = (c.target_position_pct * portfolio_value) / price
         intended_shares[c.symbol] = target_shares

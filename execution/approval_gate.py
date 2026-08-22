@@ -78,7 +78,11 @@ class ProposedTrade:
     symbol: str
     action: str  # "open" | "close"
     side: str  # "long" | "short"
-    target_position_pct: float  # 0.0 for closes
+    # Approve-first: opens are proposed WITHOUT a size (None) — the human
+    # decides which trades happen, then the caller allocates capital across
+    # the approved subset and confirms the final sizes in a follow-up
+    # message (send_followup). 0.0 for closes.
+    target_position_pct: float | None = None
     predicted_return: float | None = None
     reason: str = "screen"  # screen | out_of_book | contradiction | reactivation
     # The screener/monitor's plain-English reasoning phases (see
@@ -228,10 +232,11 @@ def format_proposal_line(p: ProposedTrade) -> str:
                 pnl += f" (${p.current_pnl_usd:+,.0f})"
             line += pnl
     else:
-        line = f"{p.index}. OPEN {p.side.upper()} {p.symbol} — {abs(p.target_position_pct):.1%} of portfolio"
+        # No size on purpose: sizing happens AFTER approval, across only the
+        # approved subset (the follow-up confirmation carries the numbers).
+        line = f"{p.index}. OPEN {p.side.upper()} {p.symbol} — {label}"
         if p.predicted_return is not None:
             line += f" | expected {p.predicted_return:+.1%}"
-        line += f" ({label})"
 
     why = short_why(p)
     if why:
@@ -251,6 +256,9 @@ def format_proposal_message(proposals: list[ProposedTrade], context: str, timeou
     minutes = max(1, round(timeout_s / 60))
     footer = (
         'Reply "approve 1", "reject 2 3", or "approve all" / "reject all".\n'
+        "Sizes are decided after you answer: the approved picks share the "
+        "deployable capital, weighted by conviction, and the final sizes are "
+        "confirmed in a follow-up message.\n"
         "Numbers refer to THIS message only.\n"
         f"Anything unanswered in {minutes} min is treated as rejected. "
         "Paper account — no real money moves."
@@ -468,3 +476,20 @@ def _try_send(send_fn, message: str, token: str, chat_id: str) -> None:
         send_fn(message, token=token, chat_id=chat_id)
     except telegram.TelegramError as exc:
         logger.warning("Could not send an acknowledgement to Telegram: %s", exc)
+
+
+def send_followup(message: str, *, send_fn: Callable[..., dict] = telegram.send_message) -> None:
+    """
+    The post-approval confirmation channel: proposals go out size-less
+    (approve-first), so once the caller has allocated capital across the
+    approved subset, the final sizes are sent to the same phone as a
+    follow-up. Best-effort by design — Telegram unconfigured (auto mode,
+    tests, dev machines) or unreachable logs the message instead of raising;
+    the allocation itself already happened and must not be rolled back by a
+    messaging failure.
+    """
+    token, chat_id = telegram.credentials()
+    if not token or not chat_id:
+        logger.info("Approval follow-up (Telegram not configured): %s", message)
+        return
+    _try_send(send_fn, message, token, chat_id)

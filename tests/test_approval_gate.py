@@ -24,10 +24,12 @@ from execution.approval_gate import (
 KNOWN = {1, 2, 3}
 
 
-def _open(symbol="NVDA", index=0, side="long", pct=0.12, pred=0.031, reason="screen"):
+def _open(symbol="NVDA", index=0, side="long", pred=0.031, reason="screen"):
+    # No target_position_pct: opens are proposed size-less (approve-first) —
+    # capital is allocated across the approved subset after the human answers.
     return ProposedTrade(
         index=index, symbol=symbol, action="open", side=side,
-        target_position_pct=pct, predicted_return=pred, reason=reason,
+        predicted_return=pred, reason=reason,
     )
 
 
@@ -124,10 +126,23 @@ def test_proposal_message_numbers_every_line_and_explains_the_rules():
 
     assert "weekly cycle" in message
     assert "1. CLOSE LONG TSLA" in message
-    assert "2. OPEN LONG NVDA — 12.0% of portfolio | expected +3.1%" in message
+    assert "2. OPEN LONG NVDA — weekly screen pick | expected +3.1%" in message
     assert "THIS message only" in message
     assert "15 min" in message
     assert "Paper account" in message
+
+
+def test_open_proposals_carry_no_size():
+    """
+    Approve-first: the human decides WHICH trades happen; sizes are computed
+    afterwards over the approved subset and confirmed in a follow-up. A size
+    in the proposal would be a promise the allocation step can't keep.
+    """
+    proposals = number_proposals([_open("NVDA"), _close("TSLA")])
+    message = format_proposal_message(proposals, "weekly cycle", timeout_s=900)
+
+    assert "of portfolio" not in message.split("Reply")[0]  # no size in any proposal line
+    assert "Sizes are decided after you answer" in message
 
 
 def test_proposal_message_is_plain_text_with_no_markdown():
@@ -152,7 +167,7 @@ def test_proposal_line_includes_the_why_when_reasoning_is_attached():
     )
     line = approval_gate.format_proposal_line(p)
     first, why = line.splitlines()
-    assert first.startswith("1. OPEN LONG NVDA — 12.0% of portfolio")
+    assert first.startswith("1. OPEN LONG NVDA — weekly screen pick")
     assert "Regime: trend" in why
     assert "100% model agreement" in why
 
@@ -532,3 +547,34 @@ def test_approved_opens_and_closes_helpers_split_by_action(configured):
 
     assert [p.symbol for p in outcome.approved_closes()] == ["TSLA"]
     assert [p.symbol for p in outcome.approved_opens()] == ["NVDA"]
+
+
+# --------------------------------------------------------------------------
+# The post-approval follow-up (final sizes)
+# --------------------------------------------------------------------------
+
+
+def test_send_followup_delivers_when_telegram_is_configured(configured):
+    sent = []
+    approval_gate.send_followup("Sizing the 2 approved pick(s)…", send_fn=lambda msg, *, token, chat_id: sent.append(msg))
+
+    assert sent == ["Sizing the 2 approved pick(s)…"]
+
+
+def test_send_followup_without_telegram_logs_instead_of_raising(monkeypatch):
+    monkeypatch.setattr(approval_gate.settings, "telegram_bot_token", "")
+    monkeypatch.setattr(approval_gate.settings, "telegram_chat_id", "")
+
+    def _never(*a, **k):
+        raise AssertionError("must not try to send without credentials")
+
+    approval_gate.send_followup("sizes…", send_fn=_never)  # no exception is the assertion
+
+
+def test_send_followup_swallows_transport_failures(configured):
+    from execution import telegram
+
+    def _boom(*a, **k):
+        raise telegram.TelegramError("telegram is down")
+
+    approval_gate.send_followup("sizes…", send_fn=_boom)  # the allocation already happened; messaging must not raise

@@ -29,17 +29,24 @@ import logging
 import pandas as pd
 from sqlalchemy.dialects.postgresql import JSONB
 
+from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.news import ingest_news
 from data.ingest.universe import load_active_universe
-from execution.approval_gate import ProposedTrade, request_approval
+from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.broker import get_broker
-from execution.trading_loop import current_pnl_by_symbol
+from execution.trading_loop import (
+    _allocation_confirmation,
+    _apply_allocation,
+    _correlation_matrix,
+    current_pnl_by_symbol,
+)
 from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
 from models.screener import run_screen
 from monitoring import reasoning
 from monitoring.alerts import configure_file_logging, send_slack_alert
+from risk.sizing import allocate_by_conviction
 
 logger = logging.getLogger(__name__)
 
@@ -315,10 +322,12 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
     # a separate message from the closes, since it is a separate question
     # ("re-deploy the freed capital into X?").
     gate = request_fn if request_fn is not None else request_approval
+    # Approve-first, same as the weekly cycle: proposals carry the "why"
+    # but no size — the freed capital is allocated across whatever subset
+    # the human approves, and the sizes are confirmed in a follow-up.
     proposals = [
         ProposedTrade(
             index=0, symbol=c.symbol, action="open", side=c.side,
-            target_position_pct=c.target_position_pct,
             predicted_return=c.predicted_return, reason="reactivation",
             reasoning=c.reasoning,
         )
@@ -341,6 +350,23 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
     if not candidates:
         return
 
+    # Approve first, THEN size: the freed capital goes to the approved
+    # subset only, weighted by conviction, under the same caps as the
+    # weekly cycle. A rejected pick's share is redistributed to the
+    # approved ones (up to the caps) instead of idling in cash.
+    allocation = allocate_by_conviction(
+        {c.symbol: (c.conviction_score if c.side == "long" else -c.conviction_score) for c in candidates},
+        max_position_pct=settings.max_single_position_pct,
+        max_short_position_pct=settings.max_short_position_pct,
+        max_correlated_exposure_pct=settings.max_correlated_exposure_pct,
+        correlation_matrix=_correlation_matrix(engine, [c.symbol for c in candidates]),
+        target_allocation=freed_fraction,
+    )
+    _apply_allocation(allocation, candidates)
+    if not allocation.reached_target and allocation.reason:
+        logger.warning("%s", allocation.reason)
+    send_followup(_allocation_confirmation(allocation, candidates))
+
     # Prices read after the gate, so shares are sized off post-wait quotes.
     portfolio_value = broker.get_portfolio_value()
     prices = _latest_prices(engine, [c.symbol for c in candidates])
@@ -349,6 +375,9 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
         price = prices.get(c.symbol)
         if not price:
             logger.warning("No price for reactivation candidate %s — skipping.", c.symbol)
+            continue
+        if abs(c.target_position_pct or 0.0) < 1e-9:
+            logger.warning("%s was approved but the caps left it no allocation — no order.", c.symbol)
             continue
         target_shares = (c.target_position_pct * portfolio_value) / price
         logger.warning("Reactivating freed capital: %s %s, %.1f%% of portfolio.", c.symbol, c.side, abs(c.target_position_pct) * 100)

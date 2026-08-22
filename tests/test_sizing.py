@@ -125,3 +125,89 @@ def test_target_position_size_without_short_cap_falls_back_to_long_cap():
         max_correlated_exposure_pct=0.50,
     )
     assert size == pytest.approx(-0.25)
+
+
+# --- allocate_by_conviction (post-approval sizing) --------------------------
+
+
+def test_allocate_by_conviction_splits_by_relative_conviction():
+    from risk.sizing import allocate_by_conviction
+
+    result = allocate_by_conviction(
+        {"BIG": 0.04, "SMALL": 0.02},
+        max_position_pct=1.0,
+        target_allocation=1.0,
+    )
+    assert result.sizes["BIG"] == pytest.approx(2 / 3)
+    assert result.sizes["SMALL"] == pytest.approx(1 / 3)
+    assert result.reached_target
+
+
+def test_allocate_by_conviction_respects_per_position_caps_and_reports_shortfall():
+    from risk.sizing import allocate_by_conviction
+
+    result = allocate_by_conviction(
+        {"AAA": 0.03, "BBB": 0.03},
+        max_position_pct=0.25,
+        target_allocation=1.0,
+    )
+    assert result.sizes["AAA"] == pytest.approx(0.25)
+    assert result.sizes["BBB"] == pytest.approx(0.25)
+    assert result.deployed_pct == pytest.approx(0.50)
+    assert not result.reached_target
+    assert "cap" in result.reason
+
+
+def test_allocate_by_conviction_keeps_shorts_short_and_uses_the_short_cap():
+    from risk.sizing import allocate_by_conviction
+
+    result = allocate_by_conviction(
+        {"LONG": 0.03, "SHRT": -0.03},
+        max_position_pct=0.25,
+        max_short_position_pct=0.15,
+        target_allocation=1.0,
+    )
+    assert result.sizes["LONG"] == pytest.approx(0.25)
+    assert result.sizes["SHRT"] == pytest.approx(-0.15)
+
+
+def test_allocate_by_conviction_zero_convictions_fall_back_to_equal_split():
+    from risk.sizing import allocate_by_conviction
+
+    result = allocate_by_conviction(
+        {"AAA": 0.0, "BBB": -0.0},
+        max_position_pct=1.0,
+        target_allocation=0.5,
+    )
+    assert result.sizes["AAA"] == pytest.approx(0.25)
+    assert result.sizes["BBB"] == pytest.approx(-0.25)  # -0.0 keeps the short side
+
+
+def test_allocate_by_conviction_clamps_correlated_exposure():
+    from risk.sizing import allocate_by_conviction
+
+    corr = pd.DataFrame(
+        [[1.0, 0.9], [0.9, 1.0]], index=["AAA", "BBB"], columns=["AAA", "BBB"]
+    )
+    result = allocate_by_conviction(
+        {"AAA": 0.04, "BBB": 0.02},
+        max_position_pct=1.0,
+        max_correlated_exposure_pct=0.50,
+        correlation_matrix=corr,
+        target_allocation=1.0,
+    )
+    # AAA (highest conviction) allocates first (2/3); BBB is clamped so the
+    # correlated pair stays inside the 50% cap: headroom is 0.5 - 2/3 < 0 -> 0.
+    assert result.sizes["AAA"] == pytest.approx(2 / 3)
+    assert result.sizes["BBB"] == pytest.approx(0.0)
+    assert not result.reached_target
+    assert "Correlated-exposure cap" in result.reason
+
+
+def test_allocate_by_conviction_empty_input_deploys_nothing():
+    from risk.sizing import allocate_by_conviction
+
+    result = allocate_by_conviction({}, max_position_pct=0.25)
+    assert result.sizes == {}
+    assert result.deployed_pct == 0.0
+    assert not result.reached_target
