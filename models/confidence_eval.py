@@ -43,6 +43,7 @@ from scipy import stats
 from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.universe import resolve_symbols
+from models.evaluation import trade_metrics
 from models.forecast.ensemble import EnsembleForecastModel, summarize_members
 from models.train import load_training_frame, make_expanding_folds, purged_train_cutoff
 
@@ -150,15 +151,24 @@ def summarize_variant(preds: pd.DataFrame, mask: pd.Series, cost: float) -> pd.D
     """
     Per-fold report card for one confidence definition: selectivity
     (pct_pass), directional accuracy on all rows vs on the rows the filter
-    keeps, and what trading only the kept rows would have paid gross/net of
-    the round-trip cost. NaN metrics where a fold keeps zero rows.
+    keeps, and what trading only the kept rows would have paid — beside what
+    equal-weight buy-and-hold of every row in that fold paid over the same
+    window. NaN metrics where a fold keeps zero rows.
+
+    excess_conf (net minus benchmark) is the column that matters. A filter
+    that lifts net_conf by keeping only the longs in a rising market has
+    improved nothing; excess_conf is what says so.
     """
     rows = []
     for fold_id, g in preds.groupby("fold_id"):
-        m = mask.loc[g.index]
+        kept = mask.loc[g.index].to_numpy()
         correct = np.sign(g["mean_prediction"]) == np.sign(g["fwd_return"])
-        traded = np.sign(g["mean_prediction"]) * g["fwd_return"]
-        kept = m.to_numpy()
+        metrics = trade_metrics(
+            g["mean_prediction"].to_numpy()[kept],
+            g["fwd_return"].to_numpy()[kept],
+            g["fwd_return"].to_numpy(),
+            cost,
+        )
         rows.append(
             {
                 "fold_id": fold_id,
@@ -166,19 +176,34 @@ def summarize_variant(preds: pd.DataFrame, mask: pd.Series, cost: float) -> pd.D
                 "pct_pass": float(kept.mean()),
                 "acc_all": float(correct.mean()),
                 "acc_conf": float(correct[kept].mean()) if kept.any() else float("nan"),
-                "gross_conf": float(traded[kept].mean()) if kept.any() else float("nan"),
-                "net_conf": float(traded[kept].mean() - cost) if kept.any() else float("nan"),
+                "benchmark": metrics["benchmark_return"],
+                "gross_conf": metrics["model_return_gross"],
+                "net_conf": metrics["model_return_net"],
+                "excess_conf": metrics["excess_return"],
+                "pct_long": metrics["pct_long"],
+                "long_net": metrics["long_return_net"],
+                "long_win": metrics["long_win_rate"],
+                "short_net": metrics["short_return_net"],
+                "short_win": metrics["short_win_rate"],
             }
         )
     return pd.DataFrame(rows)
 
 
-def paired_comparison(variant_folds: pd.DataFrame, baseline_folds: pd.DataFrame, col: str = "net_conf") -> dict:
+def paired_comparison(variant_folds: pd.DataFrame, baseline_folds: pd.DataFrame, col: str = "excess_conf") -> dict:
     """
     Paired difference (variant - baseline) on per-fold `col`, folds matched
     by fold_id, NaN folds dropped pairwise. Reports both the paired t-test
     and the Wilcoxon signed-rank test — with only ~10 folds the t-test
     alone is easy to fool with one outlier fold.
+
+    Defaults to excess_conf rather than net_conf: two filters can differ in
+    net return purely because one happens to hold more market exposure, and
+    that difference is not a difference in filter quality.
+
+    Fold-level, not row-level, on purpose — consecutive rows share almost
+    all of their forward-return window, so row-level p-values would treat
+    heavily overlapping observations as independent.
     """
     merged = variant_folds[["fold_id", col]].merge(
         baseline_folds[["fold_id", col]], on="fold_id", suffixes=("_v", "_b")
@@ -228,10 +253,18 @@ def evaluate(
                 "acc_all": table["acc_all"].mean(),
                 "acc_conf": table["acc_conf"].mean(),
                 "acc_edge": table["acc_conf"].mean() - table["acc_all"].mean(),
+                "benchmark": table["benchmark"].mean(),
                 "net_conf": table["net_conf"].mean(),
-                "net_conf_std": table["net_conf"].std(),
-                "net_conf_min": table["net_conf"].min(),
-                "net_conf_max": table["net_conf"].max(),
+                "excess_conf": table["excess_conf"].mean(),
+                "excess_conf_std": table["excess_conf"].std(),
+                "excess_conf_min": table["excess_conf"].min(),
+                "excess_conf_max": table["excess_conf"].max(),
+                "folds_positive_excess": int((table["excess_conf"] > 0).sum()),
+                "pct_long": table["pct_long"].mean(),
+                "long_net": table["long_net"].mean(),
+                "long_win": table["long_win"].mean(),
+                "short_net": table["short_net"].mean(),
+                "short_win": table["short_win"].mean(),
                 "n_folds_with_rows": int(table["net_conf"].notna().sum()),
                 **{f"vs_baseline_{k}": v for k, v in comparison.items() if k != "n_folds"},
             }
@@ -287,7 +320,7 @@ def main() -> None:
 
     pd.set_option("display.width", 250)
     pd.set_option("display.float_format", lambda v: f"{v:.6f}")
-    print("\n=== Aggregate (mean over folds; paired tests vs seed/agree80 on net_conf) ===")
+    print("\n=== Aggregate (mean over folds; paired tests vs seed/agree80 on excess_conf) ===")
     print(aggregate.to_string(index=False))
 
     aggregate.to_csv(out_dir / f"aggregate_{args.feature_set_id}.csv", index=False)
@@ -315,8 +348,10 @@ def main() -> None:
                     {
                         k: getattr(row, k)
                         for k in (
-                            "pct_pass", "acc_all", "acc_conf", "acc_edge", "net_conf",
-                            "net_conf_std", "vs_baseline_mean_diff", "vs_baseline_t_pvalue",
+                            "pct_pass", "acc_all", "acc_conf", "acc_edge",
+                            "benchmark", "net_conf", "excess_conf", "excess_conf_std",
+                            "pct_long", "long_net", "long_win", "short_net", "short_win",
+                            "vs_baseline_mean_diff", "vs_baseline_t_pvalue",
                             "vs_baseline_wilcoxon_pvalue",
                         )
                         if pd.notna(getattr(row, k))
@@ -325,8 +360,21 @@ def main() -> None:
     print(
         "\nRead acc_edge (accuracy-when-confident minus accuracy-overall) together "
         "with pct_pass: a filter only earns its keep if it is selective AND the "
-        "kept rows are more often right / more profitable, with a p-value small "
-        "enough to take seriously across this few folds."
+        "kept rows are more often right, with a p-value small enough to take "
+        "seriously across this few folds.\n"
+        "Judge profitability on excess_conf (net_conf minus benchmark), never on "
+        "net_conf alone. benchmark is what equal-weight buy-and-hold of every row "
+        "in the fold paid over the same window, gross of costs. A filter can raise "
+        "net_conf simply by keeping more longs while the market rises — pct_long, "
+        "long_net and short_net are printed so that is visible rather than hidden "
+        "inside an average.\n"
+        "p-values are paired across ~10 folds, NOT across rows: forward-return "
+        "windows overlap heavily between consecutive days, so row-level tests would "
+        "count the same information many times over and read far too significant. "
+        "The fold-level values here are still mildly optimistic, since adjacent "
+        "folds share market regimes.\n"
+        "The universe is today's S&P 500 membership — survivorship-biased, which "
+        "flatters both the benchmark and any long-heavy strategy."
     )
 
 

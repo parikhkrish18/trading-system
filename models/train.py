@@ -42,6 +42,7 @@ from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
+from models.evaluation import trade_metrics
 from models.forecast.ensemble import EnsembleForecastModel
 
 
@@ -223,6 +224,10 @@ def run_walk_forward(
             ensemble_out = model.predict(test_df[feature_cols])
             preds = ensemble_out["mean_prediction"].to_numpy()
             actual = test_df["fwd_return"].to_numpy()
+            # The absolute forward return, always — error and accuracy are
+            # measured against whatever the model was trained to predict,
+            # but money is measured in money.
+            market = test_df["fwd_return"].to_numpy()
 
             mae = mean_absolute_error(actual, preds)
             rmse = np.sqrt(mean_squared_error(actual, preds))
@@ -236,24 +241,24 @@ def run_walk_forward(
             # than the overall accuracy above, agreement isn't a useful filter.
             confident_mask = (ensemble_out["direction_agreement"] >= confident_agreement_threshold).to_numpy()
             pct_confident = float(confident_mask.mean())
-            if confident_mask.any():
-                directional_acc_confident = float(
-                    np.mean(np.sign(preds[confident_mask]) == np.sign(actual[confident_mask]))
-                )
-                # What trading the confident calls would actually have paid:
-                # go long/short per the prediction's sign, earn the realized
-                # forward return in that direction, then subtract the
-                # round-trip transaction cost. Directional accuracy can look
-                # fine while this number is negative — this is the one that
-                # decides whether the strategy is worth running.
-                traded_returns = np.sign(preds[confident_mask]) * actual[confident_mask]
-                mean_return_confident_gross = float(np.mean(traded_returns))
-                mean_return_confident_net = float(np.mean(traded_returns - round_trip_cost))
-            else:
-                directional_acc_confident = float("nan")
-                mean_return_confident_gross = float("nan")
-                mean_return_confident_net = float("nan")
+            directional_acc_confident = (
+                float(np.mean(np.sign(preds[confident_mask]) == np.sign(actual[confident_mask])))
+                if confident_mask.any()
+                else float("nan")
+            )
 
+            # What trading the confident calls would have paid, AND what
+            # doing nothing would have paid over the identical window.
+            # `market` is every candidate row in the test window — the
+            # equal-weight buy-and-hold baseline. Reporting the model's
+            # return without it is how this project spent months mistaking
+            # market drift for skill (see models/evaluation.py).
+            metrics = trade_metrics(
+                preds[confident_mask],
+                market[confident_mask],
+                market,
+                round_trip_cost,
+            )
             mlflow.log_metrics(
                 {
                     "mae": mae,
@@ -262,8 +267,14 @@ def run_walk_forward(
                     "directional_accuracy_when_confident": directional_acc_confident,
                     "pct_rows_confident": pct_confident,
                     "mean_ensemble_std": float(ensemble_out["std_prediction"].mean()),
-                    "mean_return_confident_gross": mean_return_confident_gross,
-                    "mean_return_confident_net": mean_return_confident_net,
+                    # Historical names, still logged so runs from before the
+                    # benchmark existed remain comparable in the MLflow UI.
+                    # Nothing in this repo PRINTS them any more — a bare
+                    # return figure with no benchmark beside it is the exact
+                    # mistake this change exists to stop.
+                    "mean_return_confident_gross": metrics["model_return_gross"],
+                    "mean_return_confident_net": metrics["model_return_net"],
+                    **{k: v for k, v in metrics.items() if pd.notna(v)},
                 }
             )
 
@@ -279,12 +290,27 @@ def run_walk_forward(
                     "directional_accuracy": directional_acc,
                     "directional_accuracy_when_confident": directional_acc_confident,
                     "pct_rows_confident": pct_confident,
-                    "mean_return_confident_gross": mean_return_confident_gross,
-                    "mean_return_confident_net": mean_return_confident_net,
+                    **metrics,
                 }
             )
 
     return pd.DataFrame(results)
+
+
+# Reported for every fold, in this order. excess_return sits directly under
+# the two numbers it is the difference of, so the comparison can't be read
+# past by accident.
+SPREAD_COLUMNS = (
+    "directional_accuracy",
+    "directional_accuracy_when_confident",
+    "benchmark_return",
+    "model_return_net",
+    "excess_return",
+    "long_return_net",
+    "long_win_rate",
+    "short_return_net",
+    "short_win_rate",
+)
 
 
 def spread_summary(results: pd.DataFrame) -> str:
@@ -292,9 +318,15 @@ def spread_summary(results: pd.DataFrame) -> str:
     The per-fold spread, because a mean over folds hides instability: a
     strategy that's right 60% in three folds and 40% in three others is not
     a 50% strategy anyone should size positions on.
+
+    Columns absent from `results` are skipped, so this still reads an older
+    results frame (or a hand-built one in a test) that predates the
+    benchmark metrics.
     """
     lines = []
-    for col in ("directional_accuracy", "directional_accuracy_when_confident", "mean_return_confident_net"):
+    for col in SPREAD_COLUMNS:
+        if col not in results.columns:
+            continue
         vals = results[col].dropna()
         if vals.empty:
             lines.append(f"{col}: no folds produced a value")
@@ -303,6 +335,42 @@ def spread_summary(results: pd.DataFrame) -> str:
             f"{col}: mean {vals.mean():.4f} | std {vals.std():.4f} | "
             f"min {vals.min():.4f} | max {vals.max():.4f} | n_folds {len(vals)}"
         )
+    return "\n".join(lines)
+
+
+def headline_verdict(results: pd.DataFrame) -> str:
+    """
+    The one paragraph a reader should not be able to skip: what the model
+    paid, what buying everything paid, and how many folds the model actually
+    won. Written so a positive-but-losing result — the historical case here —
+    reads as a failure rather than a success.
+    """
+    if "excess_return" not in results.columns:
+        return "No benchmark columns in these results — rerun the harness."
+    excess = results["excess_return"].dropna()
+    if excess.empty:
+        return "No fold produced a tradeable result, so there is nothing to compare."
+
+    model = results["model_return_net"].dropna()
+    bench = results["benchmark_return"].dropna()
+    wins = int((excess > 0).sum())
+    verdict = "BEATS" if excess.mean() > 0 else "LOSES TO"
+    long_share = results["pct_long"].dropna()
+
+    lines = [
+        "=== Verdict vs doing nothing ===",
+        f"model, net of costs : {model.mean():+.4%} per trade",
+        f"buy-and-hold        : {bench.mean():+.4%} per candidate row, same windows, gross",
+        f"EXCESS (the number) : {excess.mean():+.4%}  -> the model {verdict} buy-and-hold",
+        f"folds with positive excess: {wins}/{len(excess)}",
+    ]
+    if not long_share.empty:
+        lines.append(f"trades that were long: {long_share.mean():.1%}")
+    lines.append(
+        "A positive model return with a negative excess means the strategy made "
+        "money and would have made more doing nothing. Excess is the only one of "
+        "these three numbers that measures skill."
+    )
     return "\n".join(lines)
 
 
@@ -339,14 +407,13 @@ def main() -> None:
     print(results.to_string(index=False))
     print("\nPer-fold spread (the mean alone is not the story):")
     print(spread_summary(results))
+    print("\n" + headline_verdict(results))
     print(
         "\nPer the plan: do not touch position sizing or live logic until this is "
         "stable across multiple folds, not just one lucky split. Check the spread "
         "above, not just the mean. If directional_accuracy_when_confident isn't "
         "meaningfully better than directional_accuracy, ensemble agreement isn't a "
-        "useful confidence filter yet — and if mean_return_confident_net is "
-        "negative, the strategy loses money after costs no matter what the "
-        "accuracy says."
+        "useful confidence filter yet."
     )
 
 

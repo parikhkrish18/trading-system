@@ -17,12 +17,20 @@ proportionally less of a 5% expected 20-day move than of a 1% expected
 5-day move. Whether that survives contact with the data is what this
 script exists to answer.
 
+Every horizon is reported against the do-nothing baseline — the mean
+forward return of every candidate row in the same test windows. A longer
+horizon raises the model's per-trade return AND the benchmark's together,
+so the raw return is not comparable across horizons and excess_return is
+the headline instead.
+
 Honest-read caveats, printed with the results:
   - Longer-horizon returns overlap heavily inside a test window, so the
     effective number of independent observations is much smaller than the
-    row count — treat p-values as optimistic for 20/40 days.
+    row count — all tests here are therefore paired at the fold level, and
+    even those are optimistic for 20/40 days.
   - n_folds paired points is a small sample; a p-value above ~0.05 here
     means "not distinguishable from noise", not "worse".
+  - The universe is today's S&P 500 membership: survivorship-biased.
 
 Usage:
     python -m scripts.compare_horizons --feature-set-id v4 --universe
@@ -37,32 +45,72 @@ import pandas as pd
 from scipy import stats
 
 from data.ingest.universe import resolve_symbols
-from models.train import load_training_frame, run_walk_forward, spread_summary
+from models.train import headline_verdict, load_training_frame, run_walk_forward, spread_summary
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# The columns a horizon gets judged on. mean_return_confident_net is the
-# headline: what trading the confident calls would have paid per trade,
-# after costs — accuracy can look fine while this is negative.
+# The columns a horizon gets judged on. excess_return is the headline:
+# model_return_net minus benchmark_return, i.e. what the model added over
+# buying every candidate row and holding it for the same horizon. A longer
+# horizon mechanically raises model_return_net AND benchmark_return
+# together — comparing raw returns across horizons is how this project
+# previously concluded 40 days was ten times better than 5.
 SUMMARY_METRICS = (
     "directional_accuracy",
     "directional_accuracy_when_confident",
     "pct_rows_confident",
-    "mean_return_confident_net",
+    "benchmark_return",
+    "model_return_net",
+    "excess_return",
+    "pct_long",
+    "long_return_net",
+    "long_win_rate",
+    "short_return_net",
+    "short_win_rate",
 )
+
+# What the paired significance tests run on.
+HEADLINE_METRIC = "excess_return"
 
 
 def summarize_horizon(results: pd.DataFrame) -> dict:
     """One row of the comparison table from one horizon's per-fold results."""
     summary: dict = {"n_folds": len(results)}
     for metric in SUMMARY_METRICS:
+        if metric not in results.columns:
+            continue
         vals = results[metric].dropna()
         summary[metric] = float(vals.mean()) if len(vals) else float("nan")
         summary[f"{metric}_std"] = float(vals.std()) if len(vals) > 1 else float("nan")
-    net = results["mean_return_confident_net"].dropna()
-    summary["folds_profitable"] = int((net > 0).sum())
+    # "Profitable" now means beating the do-nothing baseline, not merely
+    # ending above zero — a fold that returned +1% while the market returned
+    # +2% is a losing fold.
+    excess = results[HEADLINE_METRIC].dropna()
+    summary["folds_positive_excess"] = int((excess > 0).sum())
     return summary
+
+
+def excess_vs_zero(results: pd.DataFrame, metric: str = HEADLINE_METRIC) -> dict:
+    """
+    Is this horizon's excess return distinguishable from zero at all?
+
+    Paired at the FOLD level (one observation per fold), not the row level.
+    Row-level tests on overlapping forward-return windows are badly
+    over-optimistic: consecutive days share almost their whole window, so
+    thousands of rows carry nowhere near thousands of independent
+    observations. Ten folds is a small, honest sample; a row-level p-value
+    would be a large, dishonest one.
+    """
+    vals = results[metric].dropna() if metric in results.columns else pd.Series(dtype=float)
+    out = {"n_folds": len(vals), "mean": float("nan"), "t_pvalue": float("nan"), "wilcoxon_pvalue": float("nan")}
+    if len(vals) < 2:
+        return out
+    out["mean"] = float(vals.mean())
+    out["t_pvalue"] = float(stats.ttest_1samp(vals, 0.0).pvalue)
+    if (vals != 0).any():
+        out["wilcoxon_pvalue"] = float(stats.wilcoxon(vals).pvalue)
+    return out
 
 
 def paired_test(
@@ -90,15 +138,24 @@ def paired_test(
 
 
 def comparison_table(results_by_horizon: dict[int, pd.DataFrame], baseline_horizon: int) -> pd.DataFrame:
-    """The headline table: one row per horizon, paired p-values vs the baseline."""
+    """
+    The headline table: one row per horizon with its benchmark beside its
+    model return, paired p-values vs the baseline horizon, and a test of
+    each horizon's excess return against zero (excess_p_vs_zero) — because
+    "better than the 5-day horizon" is worthless if neither beats doing
+    nothing.
+    """
     rows = []
     baseline = results_by_horizon.get(baseline_horizon)
     for horizon, results in sorted(results_by_horizon.items()):
         row = {"horizon_days": horizon, **summarize_horizon(results)}
+        vs_zero = excess_vs_zero(results)
+        row["excess_p_vs_zero"] = vs_zero["t_pvalue"]
+        row["excess_wilcoxon_p_vs_zero"] = vs_zero["wilcoxon_pvalue"]
         if baseline is not None and horizon != baseline_horizon:
-            for metric in ("directional_accuracy_when_confident", "mean_return_confident_net"):
+            for metric in ("directional_accuracy_when_confident", HEADLINE_METRIC):
                 test = paired_test(baseline, results, metric)
-                short = "acc" if metric.startswith("directional") else "net"
+                short = "acc" if metric.startswith("directional") else "excess"
                 row[f"{short}_diff_vs_{baseline_horizon}d"] = test["mean_diff"]
                 row[f"{short}_pvalue"] = test["t_pvalue"]
                 row[f"{short}_wilcoxon_p"] = test["wilcoxon_pvalue"]
@@ -151,14 +208,28 @@ def main() -> None:
           f"{args.baseline_horizon}d baseline) ===")
     print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
+    print("\n=== Excess over buy-and-hold, per horizon ===")
+    for horizon, results in sorted(results_by_horizon.items()):
+        print(f"\n--- {horizon}d ---")
+        print(headline_verdict(results))
+
     print(
-        "\nHow to read this: mean_return_confident_net is per trade, after the "
-        "round-trip cost floor — a longer horizon holds ~horizon/5 times longer per "
-        "trade, so compare per-trade numbers with that in mind. p-values are over "
-        f"{args.n_folds} paired folds; anything above ~0.05 is not distinguishable "
-        "from noise. Longer-horizon returns overlap within a test window, so their "
-        "p-values run optimistic. Do not pick the horizon with the prettiest mean — "
-        "pick one only if its improvement is statistically real."
+        "\nHow to read this: model_return_net is per trade after the round-trip cost "
+        "floor; benchmark_return is what equal-weight buy-and-hold of every candidate "
+        "row paid over the same windows, gross. excess_return is the difference and "
+        "the only column that measures skill — a longer horizon raises both raw "
+        "numbers together, so a bigger model_return_net across horizons means nothing "
+        "on its own.\n"
+        f"p-values are over {args.n_folds} paired FOLDS, not rows, which is "
+        "deliberate: forward-return windows overlap heavily across consecutive days, "
+        "so row-level observations are nowhere near independent and row-level "
+        "p-values would be far too optimistic. Even these fold-level p-values are "
+        "somewhat optimistic, since folds are adjacent in time and share market "
+        "regimes. Anything above ~0.05 is not distinguishable from noise.\n"
+        "The universe is TODAY's S&P 500 membership, so every result is "
+        "survivorship-biased: companies that fell out of the index (usually after "
+        "doing badly) are missing from the history entirely. That inflates the "
+        "benchmark and the model's longs alike."
     )
 
     if args.out_csv:

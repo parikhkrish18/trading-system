@@ -100,6 +100,49 @@ def test_summarize_variant_reports_per_fold_and_nan_on_empty_folds():
     assert np.isnan(fold1["acc_conf"]) and np.isnan(fold1["net_conf"])
     # Net is gross minus the round-trip cost, exactly.
     assert fold0["net_conf"] == pytest.approx(fold0["gross_conf"] - 0.0002)
+    # A fold that kept no rows still reports what the market did, so an
+    # empty variant can't read as "no information about this window".
+    assert not np.isnan(fold1["benchmark"])
+
+
+def test_summarize_variant_reports_the_benchmark_and_excess_for_every_fold():
+    """No return column without the do-nothing baseline beside it."""
+    frame = _prediction_frame()
+    table = summarize_variant(frame, pd.Series(True, index=frame.index), cost=0.0002)
+
+    for col in ("benchmark", "net_conf", "excess_conf", "pct_long", "long_net", "short_net"):
+        assert col in table.columns
+    np.testing.assert_allclose(
+        table["excess_conf"].to_numpy(),
+        (table["net_conf"] - table["benchmark"]).to_numpy(),
+        atol=1e-12,
+    )
+
+
+def test_a_variant_that_only_keeps_longs_in_a_rally_shows_no_excess():
+    """
+    The trap the benchmark exists to catch: keeping the long half of a
+    universe that is uniformly rising lifts net_conf while adding nothing.
+    Every stock returns +2%, so beating the market is impossible and
+    excess_conf must be negative by exactly the transaction cost.
+    """
+    frame = pd.DataFrame(
+        {
+            "fold_id": [0] * 4,
+            "fwd_return": [0.02] * 4,
+            "member_0": [0.01, 0.01, -0.01, -0.01],
+            "member_1": [0.01, 0.01, -0.01, -0.01],
+        }
+    )
+    frame = add_summary_columns(frame)
+    longs_only = frame["mean_prediction"] > 0
+
+    table = summarize_variant(frame, longs_only, cost=0.0002)
+
+    assert table.loc[0, "net_conf"] == pytest.approx(0.02 - 0.0002)  # looks great
+    assert table.loc[0, "benchmark"] == pytest.approx(0.02)
+    assert table.loc[0, "excess_conf"] == pytest.approx(-0.0002)  # adds nothing
+    assert table.loc[0, "pct_long"] == pytest.approx(1.0)
 
 
 def test_summarize_variant_accuracy_is_sign_match():
@@ -119,21 +162,45 @@ def test_summarize_variant_accuracy_is_sign_match():
 
 
 def test_paired_comparison_detects_identical_and_shifted():
-    folds = pd.DataFrame({"fold_id": range(6), "net_conf": [0.01, 0.02, 0.0, -0.01, 0.03, 0.01]})
+    folds = pd.DataFrame({"fold_id": range(6), "excess_conf": [0.01, 0.02, 0.0, -0.01, 0.03, 0.01]})
     same = paired_comparison(folds, folds)
     assert same["mean_diff"] == pytest.approx(0.0)
     assert same["wilcoxon_pvalue"] == pytest.approx(1.0)
 
     shifted = folds.copy()
-    shifted["net_conf"] += 0.005
+    shifted["excess_conf"] += 0.005
     better = paired_comparison(shifted, folds)
     assert better["mean_diff"] == pytest.approx(0.005)
     assert better["t_pvalue"] < 0.01  # constant shift → tiny paired p
 
 
+def test_paired_comparison_compares_excess_not_raw_return_by_default():
+    """
+    Two filters can differ in net_conf purely because one carries more
+    market exposure. Excess is what isolates filter quality, so it is what
+    the default comparison must use.
+    """
+    folds = pd.DataFrame(
+        {
+            "fold_id": range(4),
+            "net_conf": [0.01, 0.01, 0.01, 0.01],
+            "excess_conf": [-0.002, -0.002, -0.002, -0.002],
+        }
+    )
+    better_net_worse_excess = pd.DataFrame(
+        {
+            "fold_id": range(4),
+            "net_conf": [0.02, 0.02, 0.02, 0.02],  # twice the raw return...
+            "excess_conf": [-0.004, -0.004, -0.004, -0.004],  # ...and further behind
+        }
+    )
+    result = paired_comparison(better_net_worse_excess, folds)
+    assert result["mean_diff"] == pytest.approx(-0.002)
+
+
 def test_paired_comparison_drops_nan_folds_pairwise():
-    a = pd.DataFrame({"fold_id": [0, 1, 2], "net_conf": [0.01, np.nan, 0.03]})
-    b = pd.DataFrame({"fold_id": [0, 1, 2], "net_conf": [0.0, 0.0, 0.0]})
+    a = pd.DataFrame({"fold_id": [0, 1, 2], "excess_conf": [0.01, np.nan, 0.03]})
+    b = pd.DataFrame({"fold_id": [0, 1, 2], "excess_conf": [0.0, 0.0, 0.0]})
     result = paired_comparison(a, b)
     assert result["n_folds"] == 2
 

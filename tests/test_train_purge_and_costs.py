@@ -11,7 +11,7 @@ import pytest
 
 from backtest.cost_model import round_trip_cost_fraction
 from models.screener import DEFAULT_MIN_ABS_RETURN
-from models.train import make_expanding_folds, purged_train_cutoff, spread_summary
+from models.train import headline_verdict, make_expanding_folds, purged_train_cutoff, spread_summary
 
 
 def _dates(n: int) -> pd.DatetimeIndex:
@@ -118,15 +118,37 @@ def test_spread_summary_reports_variability_not_just_the_mean():
         {
             "directional_accuracy": [0.60, 0.40, 0.55],
             "directional_accuracy_when_confident": [0.7, float("nan"), 0.5],
-            "mean_return_confident_net": [0.001, -0.002, 0.0005],
+            "model_return_net": [0.001, -0.002, 0.0005],
+            "benchmark_return": [0.002, 0.001, 0.003],
+            "excess_return": [-0.001, -0.003, -0.0025],
         }
     )
     text = spread_summary(results)
     assert "std" in text and "min" in text and "max" in text
     assert "directional_accuracy" in text
-    assert "mean_return_confident_net" in text
+    assert "model_return_net" in text
     # NaN folds are dropped, not averaged in as zeros.
     assert "n_folds 2" in text
+
+
+def test_spread_summary_never_shows_a_return_without_its_benchmark():
+    """
+    The whole point of the benchmark work: a reader must not be able to see
+    what the model returned without seeing what doing nothing returned.
+    """
+    results = pd.DataFrame(
+        {
+            "directional_accuracy": [0.55, 0.52],
+            "directional_accuracy_when_confident": [0.55, 0.52],
+            "benchmark_return": [0.0032, 0.0028],
+            "model_return_net": [0.0012, 0.0009],
+            "excess_return": [-0.0020, -0.0019],
+        }
+    )
+    text = spread_summary(results)
+    assert "benchmark_return" in text
+    assert "excess_return" in text
+    assert text.index("benchmark_return") < text.index("model_return_net")
 
 
 def test_spread_summary_handles_all_nan_columns():
@@ -134,7 +156,52 @@ def test_spread_summary_handles_all_nan_columns():
         {
             "directional_accuracy": [0.5],
             "directional_accuracy_when_confident": [float("nan")],
-            "mean_return_confident_net": [float("nan")],
+            "model_return_net": [float("nan")],
+            "excess_return": [float("nan")],
         }
     )
     assert "no folds produced a value" in spread_summary(results)
+
+
+def test_spread_summary_skips_columns_an_older_results_frame_lacks():
+    results = pd.DataFrame({"directional_accuracy": [0.55, 0.51]})
+    text = spread_summary(results)
+    assert "directional_accuracy" in text
+    assert "excess_return" not in text
+
+
+# --------------------------------------------------------------------------
+# headline verdict
+# --------------------------------------------------------------------------
+
+
+def test_headline_verdict_calls_a_profitable_but_lagging_model_a_loss():
+    """
+    The exact failure this project shipped for months: every fold made money
+    and every fold trailed buy-and-hold. The verdict must say LOSES TO.
+    """
+    results = pd.DataFrame(
+        {
+            "model_return_net": [0.0012, 0.0009, 0.0015],
+            "benchmark_return": [0.0032, 0.0028, 0.0035],
+            "excess_return": [-0.0020, -0.0019, -0.0020],
+            "pct_long": [0.95, 0.94, 0.96],
+        }
+    )
+    text = headline_verdict(results)
+    assert "LOSES TO" in text
+    assert "folds with positive excess: 0/3" in text
+
+
+def test_headline_verdict_credits_a_model_that_actually_beats_the_baseline():
+    results = pd.DataFrame(
+        {
+            "model_return_net": [0.005, 0.004, 0.006],
+            "benchmark_return": [0.002, 0.002, 0.002],
+            "excess_return": [0.003, 0.002, 0.004],
+            "pct_long": [0.5, 0.5, 0.5],
+        }
+    )
+    text = headline_verdict(results)
+    assert "BEATS" in text
+    assert "folds with positive excess: 3/3" in text
