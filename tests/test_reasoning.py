@@ -206,3 +206,29 @@ def test_combine_phases_sorts_by_phase_number():
     p1 = {"phase": 1}
     p2 = {"phase": 2}
     assert reasoning.combine_phases(p3, p1, p2) == [p1, p2, p3]
+
+
+def test_phase_selection_summary_does_not_repeat_the_symbol():
+    """
+    Phase 4's summary used to start with the symbol, and its caller prefixed
+    the symbol too — producing "SNDK: SNDK: short". The summary is always
+    shown somewhere that already names the position, so it says the symbol
+    once, elsewhere.
+    """
+    diversified = reasoning.phase_selection_diversified(
+        "SNDK", "short", 0.052, n_confident=20, n_selected=10, top_k=10
+    )
+    concentrated = reasoning.phase_selection(
+        "SNDK", "short", 0.7, n_confident=2, n_selected=2, max_leg_pct=0.7, min_leg_pct=0.3
+    )
+
+    assert not diversified["summary"].startswith("SNDK")
+    assert not concentrated["summary"].startswith("SNDK")
+    assert "short" in diversified["summary"]
+
+
+def test_phase_execution_prints_share_counts_a_human_can_read():
+    phase = reasoning.phase_execution("AAPL", "opened", 32.063831455312794, "market")
+
+    assert "32.063831455312794" not in phase["summary"]
+    assert "32.06" in phase["summary"]

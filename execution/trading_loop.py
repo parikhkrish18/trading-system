@@ -333,7 +333,20 @@ def _cycle_outcome_message(
 
 
 def _order_type(broker) -> str:
-    if hasattr(broker, "client") and not broker.client.get_clock().is_open:
+    """
+    What kind of order the broker will actually have sent.
+
+    This has to match the branch submit_target_position takes, which needs
+    BOTH a closed market and ALLOW_EXTENDED_HOURS_TRADING on. Testing only
+    for a closed market reported "limit (extended hours)" for orders that
+    were in fact ordinary market orders queued for the next open — the
+    label described a setting nobody had switched on.
+    """
+    if (
+        hasattr(broker, "client")
+        and settings.allow_extended_hours_trading
+        and not broker.client.get_clock().is_open
+    ):
         return "limit (extended hours)"
     return "market"
 
@@ -648,7 +661,9 @@ def run_cycle(
 
     order_type = _order_type(broker)
     execution_summaries = [f"{s}: closed" for s in approved_close_symbols]
-    execution_summaries += [f"{c.symbol}: {intended_shares.get(c.symbol, 0.0):+.4g} sh via {order_type}" for c in approved_candidates]
+    execution_summaries += [
+        f"{c.symbol}: {intended_shares.get(c.symbol, 0.0):+,.2f} sh via {order_type}" for c in approved_candidates
+    ]
     execution_summaries += [
         f"{p.symbol}: {p.action} NOT executed ({approval_status_by_symbol.get(p.symbol) or 'rejected'})"
         for p in outcome.rejected

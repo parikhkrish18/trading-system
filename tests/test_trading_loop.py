@@ -1021,3 +1021,37 @@ def test_reconciliation_detail_appears_only_when_something_is_wrong():
 
     assert "need attention" not in clean
     assert "need attention" in broken
+
+
+# --------------------------------------------------------------------------
+# Labels have to describe what actually happened
+# --------------------------------------------------------------------------
+
+
+class _Clock:
+    def __init__(self, is_open):
+        self.is_open = is_open
+
+
+class _ClientBroker:
+    def __init__(self, is_open):
+        self.client = type("C", (), {"get_clock": lambda _self: _Clock(is_open)})()
+
+
+def test_order_type_says_market_when_extended_hours_is_off(monkeypatch):
+    """
+    Submitting only takes the extended-hours branch when the setting is ON
+    as well as the market being shut. Reporting "limit (extended hours)"
+    off a closed market alone described a setting nobody had switched on —
+    the orders were ordinary market orders queued for the next open.
+    """
+    monkeypatch.setattr(trading_loop.settings, "allow_extended_hours_trading", False)
+
+    assert trading_loop._order_type(_ClientBroker(is_open=False)) == "market"
+
+
+def test_order_type_says_extended_hours_only_when_both_are_true(monkeypatch):
+    monkeypatch.setattr(trading_loop.settings, "allow_extended_hours_trading", True)
+
+    assert trading_loop._order_type(_ClientBroker(is_open=False)) == "limit (extended hours)"
+    assert trading_loop._order_type(_ClientBroker(is_open=True)) == "market"

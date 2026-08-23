@@ -430,7 +430,7 @@ def phase_selection(
     return {
         "phase": 4,
         "title": "Candidate Selection & Sizing",
-        "summary": f"{symbol}: {side}, {abs(weight_pct):.1%} of capital.",
+        "summary": f"{side}, {abs(weight_pct):.1%} of capital.",
         "lines": lines,
     }
 
@@ -460,7 +460,7 @@ def phase_selection_diversified(
     return {
         "phase": 4,
         "title": "Candidate Selection & Sizing",
-        "summary": f"{symbol}: {side}, {abs(weight_pct):.1%} of capital (diversified book).",
+        "summary": f"{side}, {abs(weight_pct):.1%} of capital (diversified book).",
         "lines": lines,
     }
 
@@ -476,7 +476,7 @@ def phase_execution(
         lines = [f"{symbol} was closed out — the target position is 0 shares.", f"Order type: {order_type}."]
         summary = f"{symbol} closed."
     else:
-        share_str = f"{abs(shares):.4g} shares" if shares is not None else "an unknown number of shares"
+        share_str = f"{_shares(abs(shares))} shares" if shares is not None else "an unknown number of shares"
         lines = [f"Target: {share_str} of {symbol} ({'long' if (shares or 0) >= 0 else 'short'}).", f"Order type: {order_type}."]
         summary = f"{symbol}: {share_str} via {order_type}."
     return {"phase": 5, "title": "Execution", "summary": summary, "lines": lines}
