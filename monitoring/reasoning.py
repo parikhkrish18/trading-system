@@ -498,17 +498,43 @@ def phase_execution_rejected(symbol: str, status: str) -> dict:
     return {"phase": 5, "title": "Execution", "summary": summary, "lines": lines}
 
 
-def phase_reconciliation(symbol: str, intended_shares: float, actual_shares: float, flagged: bool) -> dict:
-    """Phase 6. Did the actual fill match what was intended."""
+def _shares(value: float) -> str:
+    """Share counts for humans — 32.063831455312794 is not a share count."""
+    return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+def phase_reconciliation(
+    symbol: str,
+    intended_shares: float,
+    actual_shares: float,
+    flagged: bool,
+    outcome: str = "filled",
+) -> dict:
+    """
+    Phase 6. What became of the order — which is not the same question as
+    whether the position matches yet. An order waiting for the next open
+    has a position of zero and nothing wrong with it, so `outcome` carries
+    the broker's verdict and decides the wording.
+    """
     diff = actual_shares - intended_shares
-    if flagged:
+    if outcome == "queued":
         lines = [
-            f"Intended {intended_shares:.4g} shares, actually filled {actual_shares:.4g} — a {diff:+.4g} share divergence beyond the normal 2% tolerance.",
-            "This was flagged and alerted — worth a manual look.",
+            f"Order for {_shares(intended_shares)} shares is live at the broker and waiting to fill.",
+            "The market was shut when it went in, so it queues until the next open — nothing is wrong.",
         ]
-        summary = f"{symbol}: reconciliation FLAGGED (diff {diff:+.4g})."
+        summary = f"{symbol}: queued, fills at the next open."
+    elif flagged:
+        problem = {
+            "rejected": "the broker refused the order",
+            "partial": "it filled short of what was asked",
+        }.get(outcome, "the position doesn't match and no order explains why")
+        lines = [
+            f"Intended {_shares(intended_shares)} shares, holding {_shares(actual_shares)} — off by {_shares(diff)}, past the 2% tolerance.",
+            f"Flagged because {problem}. Worth a manual look.",
+        ]
+        summary = f"{symbol}: {outcome} — off by {_shares(diff)} shares."
     else:
-        lines = [f"Intended {intended_shares:.4g} shares, filled {actual_shares:.4g} — within the normal 2% tolerance."]
+        lines = [f"Intended {_shares(intended_shares)} shares, holding {_shares(actual_shares)} — within the 2% tolerance."]
         summary = f"{symbol}: reconciled cleanly."
     return {"phase": 6, "title": "Reconciliation & Post-Trade Check", "summary": summary, "lines": lines}
 

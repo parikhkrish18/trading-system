@@ -264,6 +264,28 @@ def _order_type(broker) -> str:
     return "market"
 
 
+def _order_states(broker, submitted_orders: dict[str, dict]) -> dict[str, dict]:
+    """
+    Re-read each submitted order so reconciliation sees where it actually
+    got to, not the "accepted" every broker returns the instant you submit.
+
+    Falls back to the submit-time response when the broker can't be asked
+    (no get_order, or the read failed). That degrades to "pending", which
+    is the quiet answer — a status we couldn't check is not evidence that
+    anything went wrong.
+    """
+    get_order = getattr(broker, "get_order", None)
+    if get_order is None:
+        return dict(submitted_orders)
+
+    states: dict[str, dict] = {}
+    for symbol, order in submitted_orders.items():
+        order_id = order.get("id") if isinstance(order, dict) else None
+        latest = get_order(order_id) if order_id else None
+        states[symbol] = latest or order
+    return states
+
+
 def _log_decisions(
     candidates,
     closing_symbols: list[str],
@@ -521,6 +543,9 @@ def run_cycle(
         send_followup(_allocation_confirmation(allocation, approved_candidates))
 
     intended_shares: dict[str, float] = {}
+    # What the broker said about each symbol's order, so Phase 6 can tell a
+    # queue apart from a failure. Keyed by symbol, same as intended_shares.
+    submitted_orders: dict[str, dict] = {}
     orders_placed = 0
 
     for symbol in approved_close_symbols:
@@ -529,6 +554,7 @@ def run_cycle(
             order = broker.submit_target_position(symbol, 0.0)
             if order is not None:
                 orders_placed += 1
+                submitted_orders[symbol] = order
         except Exception:
             logger.exception("Failed to close out-of-book position %s — continuing with the rest of the cycle.", symbol)
 
@@ -552,6 +578,7 @@ def run_cycle(
             order = broker.submit_target_position(c.symbol, target_shares)
             if order is not None:
                 orders_placed += 1
+                submitted_orders[c.symbol] = order
         except Exception:
             logger.exception("Order failed for %s — continuing with the rest of the cycle.", c.symbol)
 
@@ -567,10 +594,11 @@ def run_cycle(
     time.sleep(5)  # let paper fills settle before reading positions back
     actual_positions = broker.get_positions()
 
-    reconciliation = reconcile_positions(intended_shares, actual_positions)
+    reconciliation = reconcile_positions(intended_shares, actual_positions, _order_states(broker, submitted_orders))
     reconciliation_summary = summarize(reconciliation)
     phase6_by_symbol = {
-        r.symbol: reasoning.phase_reconciliation(r.symbol, r.intended_shares, r.actual_shares, r.flagged) for r in reconciliation
+        r.symbol: reasoning.phase_reconciliation(r.symbol, r.intended_shares, r.actual_shares, r.flagged, r.outcome)
+        for r in reconciliation
     }
     phase6_summaries = [p["summary"] for p in phase6_by_symbol.values()]
     send_slack_alert(

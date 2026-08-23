@@ -144,9 +144,29 @@ def test_phase_execution_open_vs_close():
 
 def test_phase_reconciliation_flags_divergence():
     ok = reasoning.phase_reconciliation("AAPL", 10.0, 10.0, flagged=False)
-    bad = reasoning.phase_reconciliation("AAPL", 10.0, 5.0, flagged=True)
+    bad = reasoning.phase_reconciliation("AAPL", 10.0, 5.0, flagged=True, outcome="diverged")
     assert "reconciled cleanly" in ok["summary"]
-    assert "FLAGGED" in bad["summary"]
+    assert "diverged" in bad["summary"]
+    assert "off by" in bad["summary"]
+
+
+def test_phase_reconciliation_does_not_call_a_queued_order_a_problem():
+    """
+    An order waiting for the next open holds nothing yet and has nothing
+    wrong with it. Reporting that as a divergence is what trained everyone
+    to ignore this phase.
+    """
+    queued = reasoning.phase_reconciliation("AAPL", 10.0, 0.0, flagged=False, outcome="queued")
+
+    assert "queued" in queued["summary"]
+    assert "nothing is wrong" in " ".join(queued["lines"])
+
+
+def test_phase_reconciliation_prints_share_counts_a_human_can_read():
+    phase = reasoning.phase_reconciliation("AAPL", 32.063831455312794, 0.0, flagged=True, outcome="rejected")
+
+    assert "32.063831455312794" not in " ".join([phase["summary"], *phase["lines"]])
+    assert "32.06" in " ".join(phase["lines"])
 
 
 def test_phase_ongoing_monitoring_open_vs_closed():

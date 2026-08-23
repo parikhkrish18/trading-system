@@ -67,6 +67,26 @@ class AlpacaBroker:
         positions = self.client.get_all_positions()
         return {p.symbol: float(p.qty) for p in positions}
 
+    def get_order(self, order_id: str) -> dict | None:
+        """
+        Current state of a previously submitted order.
+
+        Reconciliation needs this to tell "waiting to fill" apart from
+        "went wrong" — without it, every order submitted while the market
+        is shut looks like a total failure. Re-read rather than trusting
+        the status returned at submit time, which is always some flavour of
+        "accepted" and says nothing about whether it filled.
+
+        Returns None rather than raising if the order can't be read: a
+        reconciliation that can't check a status should fall back to
+        treating it as pending, not take down the cycle's final phase.
+        """
+        try:
+            return self.client.get_order_by_id(order_id).model_dump()
+        except Exception:
+            logger.warning("Could not read back order %s — treating it as still pending.", order_id)
+            return None
+
     def get_positions_detailed(self) -> list[dict]:
         """
         Richer than get_positions() (which stays {symbol: qty} exactly as-is

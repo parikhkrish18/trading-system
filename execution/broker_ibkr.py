@@ -108,6 +108,24 @@ class IBKRBroker:
         self.ib.sleep(0.5)
         return {pos.contract.symbol: float(pos.position) for pos in self.ib.positions()}
 
+    def get_order(self, order_id: str) -> dict | None:
+        """
+        Current state of a previously submitted order, matching
+        AlpacaBroker.get_order so reconciliation can ask either broker the
+        same question.
+
+        ib_insync tracks orders as Trade objects on the session rather than
+        by a queryable id, so this looks through the open trades for a
+        matching order id and reports its status. Anything not found is
+        None, which reconciliation reads as "still pending" — the
+        deliberately quiet fallback, since a status we cannot read is not
+        evidence that something failed.
+        """
+        for trade in self.ib.trades():
+            if str(getattr(trade.order, "orderId", "")) == str(order_id):
+                return {"status": str(trade.orderStatus.status).lower(), "filled": float(trade.orderStatus.filled)}
+        return None
+
     def get_portfolio_value(self) -> float:
         for item in self.ib.accountSummary():
             if item.tag == "NetLiquidation" and item.currency == "USD":

@@ -868,3 +868,43 @@ def test_market_regime_data_gap_alerts_loudly_instead_of_failing_silent(monkeypa
     (msg, severity) = alerts[0]
     assert "SPY" in msg and "DATA GAP" in msg
     assert severity == "warning"
+
+
+# --------------------------------------------------------------------------
+# Order state reaches reconciliation
+# --------------------------------------------------------------------------
+
+
+def test_order_states_reads_each_order_back_from_the_broker():
+    """
+    The status a broker returns at submit time is always some flavour of
+    "accepted" and says nothing about whether it filled. Reconciliation
+    needs the current state, so the loop must re-read it.
+    """
+    class _Broker:
+        def get_order(self, order_id):
+            return {"id": order_id, "status": "filled"}
+
+    states = trading_loop._order_states(_Broker(), {"SPY": {"id": "o1", "status": "accepted"}})
+
+    assert states["SPY"]["status"] == "filled"
+
+
+def test_order_states_falls_back_quietly_when_the_broker_cannot_be_asked():
+    """
+    A status we couldn't check is not evidence anything went wrong — the
+    submit-time response is reused, which reconciliation reads as pending.
+    """
+    class _Broker:
+        def get_order(self, order_id):
+            return None
+
+    submitted = {"SPY": {"id": "o1", "status": "accepted"}}
+
+    assert trading_loop._order_states(_Broker(), submitted)["SPY"]["status"] == "accepted"
+
+
+def test_order_states_works_with_a_broker_that_has_no_get_order():
+    submitted = {"SPY": {"id": "o1", "status": "accepted"}}
+
+    assert trading_loop._order_states(object(), submitted) == submitted
