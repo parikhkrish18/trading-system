@@ -371,7 +371,9 @@ def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
 
     assert broker.closed == []  # nothing submitted
     assert logged == [("AAPL", "rejected")]
-    assert any("flagged" in m and "NOT closed" in m for m in alerts)
+    # Reported in the single end-of-check message rather than its own alert.
+    assert any("kept open" in m and "AAPL" in m for m in alerts)
+    assert len(alerts) == 1, f"one summary expected, got {len(alerts)}: {alerts}"
     assert not results[0].closed  # the record reflects what actually happened
     assert reactivations == []  # nothing closed -> no capital freed -> no re-screen
 

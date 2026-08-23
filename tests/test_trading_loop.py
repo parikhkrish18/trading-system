@@ -908,3 +908,116 @@ def test_order_states_works_with_a_broker_that_has_no_get_order():
     submitted = {"SPY": {"id": "o1", "status": "accepted"}}
 
     assert trading_loop._order_states(object(), submitted) == submitted
+
+
+# --------------------------------------------------------------------------
+# What a cycle says, and how often
+# --------------------------------------------------------------------------
+
+
+class _Recon:
+    """Minimal stand-in for a ReconciliationResult."""
+
+    def __init__(self, symbol, outcome="filled", flagged=False):
+        self.symbol = symbol
+        self.outcome = outcome
+        self.flagged = flagged
+
+
+class _Cand:
+    def __init__(self, symbol):
+        self.symbol = symbol
+
+
+class _Rejected:
+    def __init__(self, symbol):
+        self.symbol = symbol
+
+
+class _Held:
+    def __init__(self, symbol, missed_cycles):
+        self.symbol = symbol
+        self.missed_cycles = missed_cycles
+
+
+def _outcome(**overrides):
+    kwargs = {
+        "reconciliation": [_Recon("SPY")],
+        "reconciliation_summary": "1 position(s) reconciled.",
+        "approved_candidates": [_Cand("SPY")],
+        "approved_close_symbols": [],
+        "rejected": [],
+        "intended_shares": {"SPY": 10.0},
+        "held_decisions": [],
+        "actual_positions": {"SPY": 10.0},
+        "portfolio_value": 100_000.0,
+        "order_type": "market",
+    }
+    kwargs.update(overrides)
+    return trading_loop._cycle_outcome_message(**kwargs)
+
+
+def test_outcome_message_separates_filled_from_queued():
+    """
+    A queued order is not a failed one. It has to read differently, or the
+    reader learns nothing from either.
+    """
+    message = _outcome(
+        reconciliation=[_Recon("SPY", outcome="queued"), _Recon("QQQ", outcome="filled")],
+        approved_candidates=[_Cand("SPY"), _Cand("QQQ")],
+        intended_shares={"SPY": 10.0, "QQQ": 5.0},
+        actual_positions={"QQQ": 5.0},
+    )
+
+    assert "Queued" in message and "SPY" in message
+    assert "Filled" in message and "QQQ" in message
+
+
+def test_outcome_message_calls_out_only_genuine_problems():
+    message = _outcome(reconciliation=[_Recon("SPY", outcome="rejected", flagged=True)])
+
+    assert "Needs a look" in message
+    assert "rejected" in message
+
+
+def test_a_clean_run_never_says_anything_needs_a_look():
+    assert "Needs a look" not in _outcome()
+
+
+def test_outcome_message_reports_what_is_now_held():
+    message = _outcome(actual_positions={"SPY": 10.0, "QQQ": 3.0, "IWM": 0.0})
+
+    assert "Now holding 2" in message
+    assert "IWM" not in message  # a zero position is not held
+
+
+def test_outcome_message_names_positions_held_through_the_screen():
+    message = _outcome(held_decisions=[_Held("MSFT", 1)])
+
+    assert "MSFT" in message
+    assert "1 missed" in message
+
+
+def test_outcome_message_counts_what_the_human_declined():
+    message = _outcome(rejected=[_Rejected("TSLA"), _Rejected("NVDA")])
+
+    assert "Not executed (2)" in message
+    assert "TSLA" in message and "NVDA" in message
+
+
+def test_outcome_message_prints_share_counts_a_human_can_read():
+    message = _outcome(intended_shares={"SPY": 32.063831455312794})
+
+    assert "32.063831455312794" not in message
+    assert "32.06" in message
+
+
+def test_reconciliation_detail_appears_only_when_something_is_wrong():
+    clean = _outcome(reconciliation_summary="1 position(s) reconciled.")
+    broken = _outcome(
+        reconciliation=[_Recon("SPY", outcome="rejected", flagged=True)],
+        reconciliation_summary="1 of 1 position(s) need attention: SPY rejected",
+    )
+
+    assert "need attention" not in clean
+    assert "need attention" in broken

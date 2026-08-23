@@ -254,8 +254,82 @@ def _flatten_and_alert(broker, reason: str) -> None:
     record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
 
 
-def _send_phase_alert(phase: dict) -> None:
-    send_slack_alert(f"Phase {phase['phase']} — {phase['title']}: {phase['summary']}", severity="info")
+# --------------------------------------------------------------------------
+# What a cycle tells the human, and where.
+#
+# A cycle used to send about ten messages: a line per phase, each restating
+# the same symbols, and then the proposal message restating all of it again
+# in a better format. On a phone that buries the one message you have to
+# act on inside nine you don't.
+#
+# So a cycle now sends three: it started, here are the proposals, here is
+# what happened. Nothing is lost — every row in the decisions table already
+# carries the full 7-phase reasoning (see _log_decisions), which is where
+# that detail is actually readable, next to the position it explains.
+# --------------------------------------------------------------------------
+
+
+def _shares(value: float) -> str:
+    """Share counts for humans — 32.063831455312794 is not a share count."""
+    return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+def _cycle_outcome_message(
+    *,
+    reconciliation,
+    reconciliation_summary: str,
+    approved_candidates,
+    approved_close_symbols: list[str],
+    rejected,
+    intended_shares: dict[str, float],
+    held_decisions,
+    actual_positions: dict[str, float],
+    portfolio_value: float,
+    order_type: str,
+) -> str:
+    """
+    The single post-trade message: what filled, what is still queued, what
+    is now held, and anything that actually went wrong. Ordered so the
+    parts that need a human come first.
+    """
+    by_symbol = {r.symbol: r for r in reconciliation}
+    filled, queued, problems = [], [], []
+    for c in approved_candidates:
+        result = by_symbol.get(c.symbol)
+        shares = _shares(intended_shares.get(c.symbol, 0.0))
+        if result is None or result.outcome == "filled":
+            filled.append(f"{c.symbol} {shares}")
+        elif result.outcome == "queued":
+            queued.append(f"{c.symbol} {shares}")
+        else:
+            problems.append(f"{c.symbol} ({result.outcome})")
+
+    lines = []
+    if filled:
+        lines.append(f"✅ Filled: {', '.join(filled)}")
+    if queued:
+        lines.append(f"⏳ Queued for the next open ({order_type}): {', '.join(queued)}")
+    if approved_close_symbols:
+        lines.append(f"🔻 Closed: {', '.join(approved_close_symbols)}")
+    if problems:
+        lines.append(f"⚠️ Needs a look: {', '.join(problems)}")
+    if rejected:
+        lines.append(f"🚫 Not executed ({len(rejected)}): {', '.join(p.symbol for p in rejected)}")
+
+    still_open = sorted(s for s, qty in actual_positions.items() if qty != 0)
+    lines.append(f"📊 Now holding {len(still_open)}: {', '.join(still_open) if still_open else 'nothing'}")
+    if held_decisions:
+        lines.append(
+            "🤝 Held through the screen: "
+            + ", ".join(f"{d.symbol} ({d.missed_cycles} missed)" for d in held_decisions)
+        )
+    lines.append(f"💰 Portfolio ${portfolio_value:,.2f}")
+
+    if any(r.flagged for r in reconciliation):
+        lines.append("")
+        lines.append(reconciliation_summary)
+
+    return "Cycle complete.\n" + "\n".join(lines)
 
 
 def _order_type(broker) -> str:
@@ -382,8 +456,10 @@ def run_cycle(
     send_slack_alert(f"Trading cycle starting (mode={broker.mode}, {len(symbols)} symbols).", severity="info")
 
     pre_trade_triggers = _run_breaker_check(broker, engine)
+    # Not broadcast: an all-clear risk check is the expected state, and it
+    # is on every decision row anyway. A tripped breaker still shouts, via
+    # _flatten_and_alert just below.
     phase1 = reasoning.phase_pretrade_risk(pre_trade_triggers)
-    _send_phase_alert(phase1)
     if pre_trade_triggers:
         reasons = "; ".join(r.reason for r in pre_trade_triggers)
         _flatten_and_alert(broker, reasons)
@@ -394,22 +470,11 @@ def run_cycle(
     screen = run_screen_with_scores(feature_set_id, symbols, regime=regime, is_shortable_fn=is_shortable_fn)
     candidates = screen.candidates
 
-    # Phases 2-4 (signals, forecast, selection/sizing) were built per-candidate
-    # inside run_screen — surface a one-line summary per phase here so Slack
-    # gets the same 7-phase breakdown the dashboard shows per position.
-    for phase_num in (2, 3, 4):
-        # next(..., None): a candidate missing a phase must cost a summary
-        # line, not crash the whole trading cycle with StopIteration.
-        with_phase = [
-            (c.symbol, next((p for p in c.reasoning if p["phase"] == phase_num), None))
-            for c in candidates
-            if c.reasoning
-        ]
-        with_phase = [(symbol, p) for symbol, p in with_phase if p is not None]
-        if with_phase:
-            title = with_phase[0][1]["title"]
-            summaries = [f"{symbol}: {p['summary']}" for symbol, p in with_phase]
-            send_slack_alert(f"Phase {phase_num} — {title}: " + " | ".join(summaries), severity="info")
+    # Phases 2-4 (signals, forecast, selection/sizing) are built per-candidate
+    # inside run_screen and stored on every decision row by _log_decisions.
+    # They are deliberately NOT broadcast: three messages restating the same
+    # ten symbols, immediately before a proposal message that states them
+    # again and better, is how the one message worth reading got buried.
 
     if dry_run:
         logger.info("Dry run — %s candidate(s) screened, broker untouched.", len(candidates))
@@ -452,7 +517,6 @@ def run_cycle(
     if held_decisions:
         held_summary = ", ".join(f"{d.symbol} ({d.missed_cycles} missed cycle(s))" for d in held_decisions)
         logger.info("Holding despite missing the shortlist — no exit condition fired: %s", held_summary)
-        send_slack_alert(f"Held positions (no exit condition fired): {held_summary}", severity="info")
 
     if not candidates and not closing_symbols:
         logger.info("No candidates cleared the confidence bar, and no exit condition fired — holding the book as-is.")
@@ -589,7 +653,8 @@ def run_cycle(
         f"{p.symbol}: {p.action} NOT executed ({approval_status_by_symbol.get(p.symbol) or 'rejected'})"
         for p in outcome.rejected
     ]
-    send_slack_alert("Phase 5 — Execution: " + " | ".join(execution_summaries), severity="info")
+    # Not broadcast — folded into the single outcome message below.
+    logger.info("Execution: %s", " | ".join(execution_summaries))
 
     time.sleep(5)  # let paper fills settle before reading positions back
     actual_positions = broker.get_positions()
@@ -600,11 +665,9 @@ def run_cycle(
         r.symbol: reasoning.phase_reconciliation(r.symbol, r.intended_shares, r.actual_shares, r.flagged, r.outcome)
         for r in reconciliation
     }
-    phase6_summaries = [p["summary"] for p in phase6_by_symbol.values()]
-    send_slack_alert(
-        "Phase 6 — Reconciliation & Post-Trade Check: " + " | ".join(phase6_summaries),
-        severity="warning" if any(r.flagged for r in reconciliation) else "info",
-    )
+    # Not broadcast — the outcome message reports problems, and every
+    # decision row carries this phase in full for the dashboard.
+    logger.info("Reconciliation: %s", " | ".join(p["summary"] for p in phase6_by_symbol.values()))
 
     _log_decisions(
         approved_candidates, approved_close_symbols, actual_positions, intended_shares, feature_set_id, broker.mode, regime,
@@ -627,16 +690,12 @@ def run_cycle(
 
     phase7_open = len(approved_candidates)
     phase7_closed = len(approved_close_symbols)
-    send_slack_alert(
-        f"Phase 7 — Ongoing Monitoring: {phase7_open} position(s) now under hourly contradiction watch, "
-        f"{phase7_closed} closed position(s) need no further monitoring.",
-        severity="info",
+    logger.info(
+        "Ongoing monitoring: %s position(s) under hourly watch, %s closed.", phase7_open, phase7_closed
     )
 
     new_portfolio_value = broker.get_portfolio_value()
     record_equity_snapshot(new_portfolio_value, mode=broker.mode)
-
-    total_attempted = len(approved_candidates) + len(approved_close_symbols)
 
     post_trade_triggers = _run_breaker_check(broker, engine)
     if post_trade_triggers:
@@ -645,11 +704,19 @@ def run_cycle(
         return CycleResult("flattened_post_trade", len(candidates), orders_placed, reconciliation_summary, broker.get_portfolio_value())
 
     send_slack_alert(
-        f"Trading cycle complete: {orders_placed}/{total_attempted} order(s) placed "
-        f"({len(approved_candidates)} approved candidate(s), {len(approved_close_symbols)} position(s) closed, "
-        f"{len(outcome.rejected)} proposal(s) rejected at the gate). "
-        f"Portfolio value ${new_portfolio_value:,.2f}. {reconciliation_summary}",
-        severity="info",
+        _cycle_outcome_message(
+            reconciliation=reconciliation,
+            reconciliation_summary=reconciliation_summary,
+            approved_candidates=approved_candidates,
+            approved_close_symbols=approved_close_symbols,
+            rejected=outcome.rejected,
+            intended_shares=intended_shares,
+            held_decisions=held_decisions,
+            actual_positions=actual_positions,
+            portfolio_value=new_portfolio_value,
+            order_type=order_type,
+        ),
+        severity="warning" if any(r.flagged for r in reconciliation) else "info",
     )
     return CycleResult("traded", len(candidates), orders_placed, reconciliation_summary, new_portfolio_value)
 

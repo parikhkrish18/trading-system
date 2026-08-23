@@ -344,10 +344,6 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
             status = status_by_symbol.get(c.symbol) or "rejected"
             logger.warning("Reactivation of %s not approved (%s) — freed capital stays in cash.", c.symbol, status)
             _log_rejected_reactivation(c, broker.mode, status)
-            send_slack_alert(
-                f"Reactivation proposal for {c.symbol} was not approved ({status}) — capital stays in cash.",
-                severity="info",
-            )
     candidates = [c for c in candidates if c.symbol in approved_symbols]
     if not candidates:
         return
@@ -373,6 +369,7 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
     portfolio_value = broker.get_portfolio_value()
     prices = _latest_prices(engine, [c.symbol for c in candidates])
 
+    reopened: list[str] = []
     for c in candidates:
         price = prices.get(c.symbol)
         if not price:
@@ -383,11 +380,6 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
             continue
         target_shares = (c.target_position_pct * portfolio_value) / price
         logger.warning("Reactivating freed capital: %s %s, %.1f%% of portfolio.", c.symbol, c.side, abs(c.target_position_pct) * 100)
-        send_slack_alert(
-            f"Phase 4 — Candidate Selection & Sizing: Mid-week reactivation — {c.symbol} ({c.side}), "
-            f"{abs(c.target_position_pct):.1%} of capital.",
-            severity="info",
-        )
         try:
             broker.submit_target_position(c.symbol, target_shares)
         except Exception:
@@ -396,7 +388,10 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
 
         executed = broker.get_positions().get(c.symbol, 0.0)
         _log_reactivation(c, executed, broker.mode, target_shares, approval_status=status_by_symbol.get(c.symbol) or "approved")
-        send_slack_alert(f"Phase 5 — Execution: {c.symbol} opened mid-week (reactivation) — {target_shares:+.4g} shares.", severity="info")
+        reopened.append(f"{c.symbol} {target_shares:+,.2f} sh")
+
+    if reopened:
+        send_slack_alert(f"♻️ Freed capital redeployed: {', '.join(reopened)}", severity="info")
 
 
 def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
@@ -441,7 +436,6 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
             flagged.append(result)
             detail = "; ".join(r["detail"] for r in result.reasons)
             logger.warning("Contradiction detected for %s (%s). %s", symbol, result.side, detail)
-            send_slack_alert(f"Phase 2 — Market Regime & Signals: {symbol} ({result.side}) — {detail}", severity="warning")
 
     if not flagged:
         return results
@@ -465,6 +459,11 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     status_by_symbol = {p.symbol: outcome.statuses.get(p.index) for p in proposals}
     approved_symbols = {p.symbol for p in outcome.approved}
 
+    # Collected rather than announced one at a time: the human already saw
+    # the proposal message naming each of these, so what they need
+    # afterwards is one line saying how it ended.
+    closed: list[str] = []
+    kept: list[str] = []
     closed_any = False
     for result in flagged:
         status = status_by_symbol.get(result.symbol)
@@ -472,11 +471,7 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
             result.closed = False  # the record must not claim a close that didn't happen
             logger.warning("Close of %s not approved (%s) — position stays open.", result.symbol, status or "rejected")
             _log_rejected_closure(result, broker.mode, status or "rejected")
-            send_slack_alert(
-                f"{result.symbol} was flagged as contradicted but NOT closed ({status or 'rejected'}) — "
-                "position stays open on the human's call.",
-                severity="warning",
-            )
+            kept.append(result.symbol)
             continue
 
         try:
@@ -488,7 +483,15 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         closed_any = True
         executed = broker.get_positions().get(result.symbol, 0.0)
         _log_closure(result, broker.mode, executed, approval_status=status or "approved")
-        send_slack_alert(f"Phase 5 — Execution: {result.symbol} closed mid-week (contradiction).", severity="warning")
+        closed.append(result.symbol)
+
+    parts = []
+    if closed:
+        parts.append(f"🔻 Closed mid-week: {', '.join(closed)}")
+    if kept:
+        parts.append(f"🤝 Flagged but kept open on your call: {', '.join(kept)}")
+    if parts:
+        send_slack_alert("Contradiction check done.\n" + "\n".join(parts), severity="warning")
 
     if closed_any:
         _attempt_reactivation(broker, engine, request_fn=request_fn)
