@@ -30,7 +30,7 @@ from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
 from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.broker import get_broker
-from execution.hold_rules import evaluate_holds, load_missed_cycles, store_missed_cycles
+from execution.hold_rules import evaluate_holds, load_exit_levels, load_missed_cycles, store_missed_cycles
 from execution.reconciliation import reconcile_positions, summarize
 from features.quant.momentum import adx
 from models.regime.trend_chop_classifier import CHOP, RuleBasedRegime
@@ -239,10 +239,13 @@ def _allocation_confirmation(allocation, approved_candidates) -> str:
     return message
 
 
-def _store_hold_state(engine, counts: dict[str, int]) -> None:
-    """Persist the consecutive-miss counters; a state write must never kill a completed cycle."""
+def _store_hold_state(engine, counts: dict[str, int], levels: dict | None = None) -> None:
+    """
+    Persist the consecutive-miss counters and each position's exit levels; a
+    state write must never kill a completed cycle.
+    """
     try:
-        store_missed_cycles(engine, counts)
+        store_missed_cycles(engine, counts, levels)
     except Exception:
         logger.warning("Could not persist hold state — miss counters will restart from the last stored values.")
 
@@ -403,7 +406,7 @@ def _log_decisions(
     statuses = approval_status_by_symbol or {}
     rows = []
 
-    def _row(symbol, forecast, target_position, executed_position, agreement, full_reasoning):
+    def _row(symbol, forecast, target_position, executed_position, agreement, full_reasoning, levels=None):
         return {
             "ts": now,
             "symbol": symbol,
@@ -417,6 +420,11 @@ def _log_decisions(
             "reasoning": json.dumps(full_reasoning),
             "direction_agreement": agreement,
             "approval_status": statuses.get(symbol),
+            # The levels this pick was PROPOSED with, so the record shows
+            # what the human was actually agreeing to. Enforcement reads
+            # position_hold_state; this is the audit trail beside it.
+            "take_profit_pct": levels.take_profit_pct if levels else None,
+            "stop_loss_pct": levels.stop_loss_pct if levels else None,
         }
 
     for c in candidates:
@@ -425,7 +433,12 @@ def _log_decisions(
         phase6 = phase6_by_symbol.get(c.symbol) or reasoning.phase_reconciliation(c.symbol, shares, executed.get(c.symbol, 0.0), False)
         phase7 = reasoning.phase_ongoing_monitoring(closed=False)
         full_reasoning = reasoning.combine_phases(phase1, *(c.reasoning or []), phase5, phase6, phase7)
-        rows.append(_row(c.symbol, c.predicted_return, c.target_position_pct, executed.get(c.symbol), c.direction_agreement, full_reasoning))
+        rows.append(
+            _row(
+                c.symbol, c.predicted_return, c.target_position_pct, executed.get(c.symbol),
+                c.direction_agreement, full_reasoning, c.exit_levels,
+            )
+        )
 
     for symbol in closing_symbols:
         phase4 = (close_phase4_by_symbol or {}).get(symbol) or reasoning.phase_selection_closed(symbol)
@@ -440,7 +453,12 @@ def _log_decisions(
         phase5 = reasoning.phase_execution_rejected(c.symbol, status)
         phase7 = reasoning.phase_ongoing_monitoring(closed=True)
         full_reasoning = reasoning.combine_phases(phase1, *(c.reasoning or []), phase5, phase7)
-        rows.append(_row(c.symbol, c.predicted_return, c.target_position_pct, 0.0, c.direction_agreement, full_reasoning))
+        rows.append(
+            _row(
+                c.symbol, c.predicted_return, c.target_position_pct, 0.0,
+                c.direction_agreement, full_reasoning, c.exit_levels,
+            )
+        )
 
     for symbol in rejected_close_symbols:
         status = statuses.get(symbol, "rejected")
@@ -511,6 +529,11 @@ def run_cycle(
     except Exception:
         logger.warning("Could not load hold state — treating every held position as freshly out of the shortlist.")
         prior_missed = {}
+    try:
+        prior_levels = load_exit_levels(engine)
+    except Exception:
+        logger.warning("Could not load per-position exit levels — falling back to the global thresholds.")
+        prior_levels = {}
     hold_decisions = evaluate_holds(
         positions=current_positions,
         shortlist=candidate_symbols,
@@ -520,6 +543,7 @@ def run_cycle(
         max_missed_cycles=settings.hold_max_missed_cycles,
         stop_loss_pct=settings.hold_stop_loss_pct,
         take_profit_pct=settings.hold_take_profit_pct,
+        levels_by_symbol=prior_levels,
     )
     closing_decisions = [d for d in hold_decisions if d.close]
     held_decisions = [d for d in hold_decisions if not d.close and d.symbol not in candidate_symbols]
@@ -563,6 +587,7 @@ def run_cycle(
             index=0, symbol=c.symbol, action="open", side=c.side,
             predicted_return=c.predicted_return, reason="screen",
             reasoning=c.reasoning,
+            exit_levels=c.exit_levels,
         )
         for c in candidates
     ]
@@ -698,9 +723,14 @@ def run_cycle(
     # rejected close keeps counting (it will be re-proposed), a fresh open
     # starts at zero, anything gone drops out.
     missed_by_symbol = {d.symbol: d.missed_cycles for d in hold_decisions}
+    # A position keeps the levels it was approved with for as long as it is
+    # held. A fresh open takes the ones on its proposal; anything still open
+    # from an earlier cycle carries its own forward unchanged.
+    levels_by_symbol = {**prior_levels, **{c.symbol: c.exit_levels for c in approved_candidates if c.exit_levels}}
     _store_hold_state(
         engine,
         {s: missed_by_symbol.get(s, 0) for s, qty in actual_positions.items() if qty != 0},
+        {s: lv for s, lv in levels_by_symbol.items() if actual_positions.get(s, 0) != 0},
     )
 
     phase7_open = len(approved_candidates)

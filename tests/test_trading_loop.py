@@ -826,7 +826,9 @@ def test_position_already_closed_by_the_contradiction_monitor_is_not_double_clos
     monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"GONE": 1, "KEPT": 0})
 
     stored = {}
-    monkeypatch.setattr(trading_loop, "store_missed_cycles", lambda engine, counts: stored.update(counts=counts))
+    monkeypatch.setattr(
+        trading_loop, "store_missed_cycles", lambda engine, counts, levels=None: stored.update(counts=counts, levels=levels)
+    )
 
     seen = {}
 
@@ -848,7 +850,9 @@ def test_miss_counter_advances_and_persists_for_held_positions(monkeypatch):
     monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"HELD": 1})
 
     stored = {}
-    monkeypatch.setattr(trading_loop, "store_missed_cycles", lambda engine, counts: stored.update(counts=counts))
+    monkeypatch.setattr(
+        trading_loop, "store_missed_cycles", lambda engine, counts, levels=None: stored.update(counts=counts, levels=levels)
+    )
 
     trading_loop.run_cycle("v3", ["NEW", "HELD"])
 

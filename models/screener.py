@@ -32,6 +32,8 @@ from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine
 from data.ingest.universe import resolve_symbols
+from execution.exit_levels import ExitLevels, exit_levels_for
+from features.quant.volatility import realized_vol
 from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND
@@ -59,6 +61,10 @@ class TradeCandidate:
     direction_agreement: float
     conviction_score: float
     target_position_pct: float
+    # The take-profit/stop-loss pair this pick is proposed with, sized to
+    # this stock rather than shared with every other position. None only
+    # for candidates built outside run_screen; attach_exit_levels fills it.
+    exit_levels: ExitLevels | None = None
     # Plain-English phase 2-4 reasoning (see monitoring/reasoning.py), populated
     # by run_screen for both strategies (phase-4 wording follows the strategy).
     # trading_loop.py merges in phases 1/5/6/7 once execution facts exist.
@@ -387,6 +393,41 @@ def _attach_reasoning(
         ]
 
 
+def daily_volatility(prices: pd.DataFrame, window: int = 20) -> dict[str, float]:
+    """
+    symbol -> standard deviation of that stock's daily returns.
+
+    Not annualized: exit levels are expressed against the forecast horizon
+    in trading days, and converting to years and back would only add a
+    constant and a chance to get it wrong. Symbols without enough history
+    are absent rather than zero — a missing measurement has to stay
+    distinguishable from a genuinely motionless stock, because the two
+    call for opposite fallbacks.
+    """
+    if prices.empty:
+        return {}
+    out: dict[str, float] = {}
+    for symbol, group in prices.sort_values("ts").groupby("symbol"):
+        if len(group) <= window:
+            continue
+        vol = realized_vol(group["close"], window=window, annualize=False).iloc[-1]
+        if pd.notna(vol) and vol > 0:
+            out[str(symbol)] = float(vol)
+    return out
+
+
+def attach_exit_levels(candidates: list[TradeCandidate], vol_by_symbol: dict[str, float]) -> None:
+    """
+    Give every candidate the levels it will be proposed, approved and later
+    judged against. Mutates in place, like _attach_reasoning.
+    """
+    for candidate in candidates:
+        candidate.exit_levels = exit_levels_for(
+            predicted_return=candidate.predicted_return,
+            daily_volatility=vol_by_symbol.get(candidate.symbol),
+        )
+
+
 @dataclasses.dataclass
 class ScreenResult:
     """
@@ -544,6 +585,10 @@ def run_screen_with_scores(
         strategy=settings.strategy_mode,
         top_k=settings.screener_top_k,
     )
+    # Exit levels come from the same price history the model trained on, so
+    # a pick is proposed with levels sized to that stock rather than to the
+    # average of every stock.
+    attach_exit_levels(candidates, daily_volatility(train_df[["symbol", "ts", "close"]]))
     return ScreenResult(candidates=candidates, scored=scored)
 
 

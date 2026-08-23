@@ -186,6 +186,29 @@ class Settings(BaseSettings):
     # 3-10% move band the swing horizon targets.
     hold_take_profit_pct: float = Field(default=0.10, alias="HOLD_TAKE_PROFIT_PCT")
 
+    # --- Per-pick exit levels (execution/exit_levels.py) ---
+    # The two settings above are the fallback, used when a stock's
+    # volatility can't be measured. Normally each pick gets its own levels,
+    # derived from what the model predicted for it and how far that
+    # particular stock normally moves — one pair of numbers cannot be right
+    # for both a utility and a biotech.
+    #
+    # Take profit is the predicted move itself, bounded: never below what a
+    # round trip costs (closing into a guaranteed loss), never above this
+    # many horizon-sigmas (a target the stock has no history of reaching).
+    exit_take_profit_max_sigmas: float = Field(default=2.0, alias="EXIT_TAKE_PROFIT_MAX_SIGMAS")
+    exit_min_take_profit_pct: float = Field(default=0.03, alias="EXIT_MIN_TAKE_PROFIT_PCT")
+    # Stop loss in horizon-sigmas. 1.5 is deliberately wider than one
+    # sigma: at one sigma roughly a third of positions are stopped out by
+    # ordinary wandering before a multi-week thesis has had time to be
+    # right or wrong.
+    exit_stop_loss_sigmas: float = Field(default=1.5, alias="EXIT_STOP_LOSS_SIGMAS")
+    # Bounds, because volatility is estimated from a short window and can
+    # be badly wrong right after a gap. Without them one quiet month would
+    # set a 1% stop that closes on the first ordinary day.
+    exit_min_stop_loss_pct: float = Field(default=0.05, alias="EXIT_MIN_STOP_LOSS_PCT")
+    exit_max_stop_loss_pct: float = Field(default=0.20, alias="EXIT_MAX_STOP_LOSS_PCT")
+
     # --- Between-cycle emergency brake (execution/contradiction_monitor.py) ---
     # How far a held position must move against itself, over the monitor's
     # 5-day window, before it proposes closing mid-week.

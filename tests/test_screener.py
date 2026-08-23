@@ -4,8 +4,11 @@ import pytest
 
 from models.regime.trend_chop_classifier import TREND
 from models.screener import (
+    TradeCandidate,
     _attach_reasoning,
+    attach_exit_levels,
     build_correlation_matrix,
+    daily_volatility,
     score_universe,
     select_concentrated_trades,
     select_trades,
@@ -454,3 +457,59 @@ def test_build_correlation_matrix_from_prices():
     )
     corr = build_correlation_matrix(prices)
     assert corr.loc["A", "B"] == pytest.approx(1.0, abs=1e-6)  # identical return series
+
+
+# --------------------------------------------------------------------------
+# Per-pick exit levels
+# --------------------------------------------------------------------------
+
+
+def _price_history(symbol, daily_moves):
+    """A price series with the given daily returns, starting at 100."""
+    closes, price = [], 100.0
+    for move in daily_moves:
+        price *= 1 + move
+        closes.append(price)
+    return pd.DataFrame(
+        {
+            "symbol": symbol,
+            "ts": pd.bdate_range("2026-01-01", periods=len(closes)),
+            "close": closes,
+        }
+    )
+
+
+def test_daily_volatility_separates_a_calm_stock_from_a_jumpy_one():
+    calm = _price_history("KO", [0.001, -0.001] * 30)
+    jumpy = _price_history("MRNA", [0.05, -0.05] * 30)
+
+    vols = daily_volatility(pd.concat([calm, jumpy]))
+
+    assert vols["MRNA"] > vols["KO"]
+
+
+def test_daily_volatility_omits_symbols_without_enough_history():
+    """
+    Absent, not zero. A missing measurement has to stay distinguishable
+    from a genuinely motionless stock — they call for opposite fallbacks.
+    """
+    vols = daily_volatility(_price_history("NEW", [0.01] * 5), window=20)
+
+    assert vols == {}
+
+
+def test_attach_exit_levels_gives_each_candidate_its_own_pair():
+    calm = TradeCandidate("KO", "long", 0.04, 1.0, 0.04, 0.1)
+    jumpy = TradeCandidate("MRNA", "long", 0.04, 1.0, 0.04, 0.1)
+
+    attach_exit_levels([calm, jumpy], {"KO": 0.004, "MRNA": 0.04})
+
+    assert jumpy.exit_levels.stop_loss_pct > calm.exit_levels.stop_loss_pct
+
+
+def test_attach_exit_levels_falls_back_when_a_symbol_has_no_volatility():
+    candidate = TradeCandidate("NEW", "long", 0.04, 1.0, 0.04, 0.1)
+
+    attach_exit_levels([candidate], {})
+
+    assert candidate.exit_levels.derived is False

@@ -40,6 +40,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from backtest.cost_model import round_trip_cost_fraction
+from execution.exit_levels import ExitLevels
 
 # A prediction against the position smaller than the cost of a round trip
 # is not a reason to pay for a round trip.
@@ -66,6 +67,7 @@ def evaluate_holds(
     max_missed_cycles: int,
     stop_loss_pct: float,
     take_profit_pct: float,
+    levels_by_symbol: dict[str, ExitLevels] | None = None,
     min_flip_return: float = DEFAULT_MIN_FLIP_RETURN,
 ) -> list[HoldDecision]:
     """
@@ -75,7 +77,17 @@ def evaluate_holds(
     the full scored universe, so held names that didn't make the shortlist
     still have one); `pnl_pct` is unrealized P&L as a fraction (None when
     the broker can't report it — those conditions simply don't fire).
+
+    `levels_by_symbol` is the take-profit/stop-loss pair each position was
+    actually approved with. A position is judged against its own levels, not
+    against whatever the global settings happen to say now — otherwise
+    editing HOLD_STOP_LOSS_PCT on a Tuesday silently re-writes the terms of
+    every open position, including ones a human approved on different ones.
+    `stop_loss_pct` / `take_profit_pct` remain the fallback for positions
+    with no recorded levels (opened before they existed, or opened when
+    volatility couldn't be measured).
     """
+    levels_by_symbol = levels_by_symbol or {}
     decisions: list[HoldDecision] = []
     for symbol, qty in positions.items():
         if qty == 0:
@@ -101,10 +113,13 @@ def evaluate_holds(
 
         pnl = pnl_pct.get(symbol)
         if pnl is not None:
-            if pnl <= -stop_loss_pct:
-                reasons.append(f"stop loss: {pnl:+.1%} unrealized, limit -{stop_loss_pct:.0%}")
-            elif pnl >= take_profit_pct:
-                reasons.append(f"profit target reached: {pnl:+.1%} unrealized, target +{take_profit_pct:.0%}")
+            levels = levels_by_symbol.get(symbol)
+            stop = levels.stop_loss_pct if levels else stop_loss_pct
+            target = levels.take_profit_pct if levels else take_profit_pct
+            if pnl <= -stop:
+                reasons.append(f"stop loss: {pnl:+.1%} unrealized, limit -{stop:.1%}")
+            elif pnl >= target:
+                reasons.append(f"profit target reached: {pnl:+.1%} unrealized, target +{target:.1%}")
 
         decisions.append(
             HoldDecision(symbol=symbol, close=bool(reasons), missed_cycles=missed, reasons=reasons)
@@ -123,21 +138,54 @@ def load_missed_cycles(engine) -> dict[str, int]:
     return dict(zip(df["symbol"], df["missed_cycles"].astype(int), strict=False))
 
 
-def store_missed_cycles(engine, counts: dict[str, int]) -> None:
+def load_exit_levels(engine) -> dict[str, ExitLevels]:
+    """
+    symbol -> the levels each open position is being enforced against.
+
+    Positions with no recorded levels are simply absent, and the caller
+    falls back to the globals for them — a position opened before this
+    existed must still be evaluated, not skipped.
+    """
+    df = pd.read_sql("SELECT symbol, take_profit_pct, stop_loss_pct FROM position_hold_state", engine)
+    levels: dict[str, ExitLevels] = {}
+    for row in df.itertuples(index=False):
+        if pd.isna(row.take_profit_pct) or pd.isna(row.stop_loss_pct):
+            continue
+        levels[row.symbol] = ExitLevels(
+            take_profit_pct=float(row.take_profit_pct), stop_loss_pct=float(row.stop_loss_pct)
+        )
+    return levels
+
+
+def store_missed_cycles(
+    engine, counts: dict[str, int], levels_by_symbol: dict[str, ExitLevels] | None = None
+) -> None:
     """
     Rewrite the table to exactly `counts` (the currently-held set). A full
     rewrite, not an upsert, so a position closed by ANY path — weekly exit,
     contradiction monitor, breaker flatten — disappears without every one
     of those paths having to know this table exists.
+
+    The levels travel with the counter so a position keeps being judged
+    against the terms it was approved on, cycle after cycle.
     """
+    levels_by_symbol = levels_by_symbol or {}
     now = dt.datetime.now(tz=dt.UTC)
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM position_hold_state"))
         for symbol, missed in counts.items():
+            levels = levels_by_symbol.get(symbol)
             conn.execute(
                 text(
-                    "INSERT INTO position_hold_state (symbol, missed_cycles, updated_at) "
-                    "VALUES (:symbol, :missed, :now)"
+                    "INSERT INTO position_hold_state "
+                    "(symbol, missed_cycles, updated_at, take_profit_pct, stop_loss_pct) "
+                    "VALUES (:symbol, :missed, :now, :take_profit, :stop_loss)"
                 ),
-                {"symbol": symbol, "missed": int(missed), "now": now},
+                {
+                    "symbol": symbol,
+                    "missed": int(missed),
+                    "now": now,
+                    "take_profit": levels.take_profit_pct if levels else None,
+                    "stop_loss": levels.stop_loss_pct if levels else None,
+                },
             )

@@ -7,7 +7,14 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import create_engine, text
 
-from execution.hold_rules import HoldDecision, evaluate_holds, load_missed_cycles, store_missed_cycles
+from execution.exit_levels import ExitLevels
+from execution.hold_rules import (
+    HoldDecision,
+    evaluate_holds,
+    load_exit_levels,
+    load_missed_cycles,
+    store_missed_cycles,
+)
 
 _DEFAULTS = {"max_missed_cycles": 2, "stop_loss_pct": 0.08, "take_profit_pct": 0.10}
 
@@ -110,7 +117,11 @@ def engine():
     eng = create_engine("sqlite://")
     with eng.begin() as conn:
         conn.execute(
-            text("CREATE TABLE position_hold_state (symbol TEXT PRIMARY KEY, missed_cycles INTEGER NOT NULL, updated_at TIMESTAMP NOT NULL)")
+            text(
+                "CREATE TABLE position_hold_state ("
+                "symbol TEXT PRIMARY KEY, missed_cycles INTEGER NOT NULL, updated_at TIMESTAMP NOT NULL, "
+                "take_profit_pct REAL, stop_loss_pct REAL)"
+            )
         )
     return eng
 
@@ -127,3 +138,77 @@ def test_store_rewrites_the_whole_table(engine):
     store_missed_cycles(engine, {"AAPL": 2})
 
     assert load_missed_cycles(engine) == {"AAPL": 2}
+
+
+# --------------------------------------------------------------------------
+# A position is judged against the levels it was approved with
+# --------------------------------------------------------------------------
+
+
+def _held(pnl, levels=None):
+    return evaluate_holds(
+        positions={"AAPL": 10.0},
+        shortlist=set(),
+        predictions={},
+        pnl_pct={"AAPL": pnl},
+        prior_missed={},
+        max_missed_cycles=99,  # keep the miss rule out of the way
+        stop_loss_pct=0.08,
+        take_profit_pct=0.10,
+        levels_by_symbol=levels,
+    )[0]
+
+
+def test_a_positions_own_stop_is_used_instead_of_the_global_one():
+    """
+    Editing HOLD_STOP_LOSS_PCT must not silently rewrite the terms of a
+    position a human already approved on different ones.
+    """
+    own = {"AAPL": ExitLevels(take_profit_pct=0.20, stop_loss_pct=0.15)}
+
+    # -10% trips the global 8% stop but not this position's 15% one.
+    assert _held(-0.10).close is True
+    assert _held(-0.10, own).close is False
+    assert _held(-0.16, own).close is True
+
+
+def test_a_positions_own_target_is_used_instead_of_the_global_one():
+    own = {"AAPL": ExitLevels(take_profit_pct=0.25, stop_loss_pct=0.10)}
+
+    assert _held(0.12).close is True  # clears the global 10% target
+    assert _held(0.12, own).close is False
+    assert _held(0.26, own).close is True
+
+
+def test_the_globals_still_apply_to_a_position_with_no_recorded_levels():
+    """
+    Positions opened before per-pick levels existed must still be
+    evaluated, not skipped for want of a column.
+    """
+    decision = _held(-0.09, {"SOMETHING_ELSE": ExitLevels(0.2, 0.2)})
+
+    assert decision.close is True
+    assert "stop loss" in " ".join(decision.reasons)
+
+
+def test_the_reason_quotes_the_level_that_actually_fired():
+    """A reason naming the global limit when a per-pick one fired would be a lie."""
+    own = {"AAPL": ExitLevels(take_profit_pct=0.20, stop_loss_pct=0.15)}
+
+    reasons = " ".join(_held(-0.16, own).reasons)
+
+    assert "15.0%" in reasons
+    assert "8" not in reasons.replace("15.0%", "")
+
+
+def test_levels_round_trip_through_the_hold_state(engine):
+    levels = {"AAPL": ExitLevels(take_profit_pct=0.11, stop_loss_pct=0.07)}
+
+    store_missed_cycles(engine, {"AAPL": 1, "TSLA": 0}, levels)
+    loaded = load_exit_levels(engine)
+
+    assert loaded["AAPL"].take_profit_pct == pytest.approx(0.11)
+    assert loaded["AAPL"].stop_loss_pct == pytest.approx(0.07)
+    # A position stored without levels is absent, not zeroed — the caller
+    # has to be able to tell "no levels" from "a zero stop".
+    assert "TSLA" not in loaded

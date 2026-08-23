@@ -15,11 +15,13 @@ from execution.approval_gate import (
     ApprovalOutcome,
     ProposedTrade,
     format_ack_message,
+    format_proposal_line,
     format_proposal_message,
     number_proposals,
     parse_reply,
     request_approval,
 )
+from execution.exit_levels import ExitLevels
 
 KNOWN = {1, 2, 3}
 
@@ -578,3 +580,49 @@ def test_send_followup_swallows_transport_failures(configured):
         raise telegram.TelegramError("telegram is down")
 
     approval_gate.send_followup("sizes…", send_fn=_boom)  # the allocation already happened; messaging must not raise
+
+
+# --------------------------------------------------------------------------
+# Exit levels are visible at approval time
+# --------------------------------------------------------------------------
+
+
+def test_a_proposal_shows_the_levels_it_will_be_held_to():
+    """
+    Approving a trade without knowing where it exits is approving half a
+    decision — and since the levels are now per-pick, they are not
+    something the reader already knows from the settings.
+    """
+    proposal = ProposedTrade(
+        index=1, symbol="AAPL", action="open", side="long", predicted_return=0.06,
+        exit_levels=ExitLevels(take_profit_pct=0.06, stop_loss_pct=0.11),
+    )
+
+    line = format_proposal_line(proposal)
+
+    assert "+6.0%" in line
+    assert "-11.0%" in line
+
+
+def test_two_picks_can_show_different_levels_in_one_message():
+    """The whole point: they are per-pick, not one pair shared by the batch."""
+    calm = ProposedTrade(
+        index=1, symbol="KO", action="open", side="long",
+        exit_levels=ExitLevels(take_profit_pct=0.04, stop_loss_pct=0.05),
+    )
+    volatile = ProposedTrade(
+        index=2, symbol="MRNA", action="open", side="long",
+        exit_levels=ExitLevels(take_profit_pct=0.12, stop_loss_pct=0.19),
+    )
+
+    message = format_proposal_message([calm, volatile], context="weekly cycle", timeout_s=900)
+
+    assert "-5.0%" in message
+    assert "-19.0%" in message
+
+
+def test_a_proposal_without_levels_still_formats():
+    """Closes carry no levels, and neither do candidates built outside the screen."""
+    proposal = ProposedTrade(index=1, symbol="AAPL", action="open", side="long", predicted_return=0.06)
+
+    assert "Exits:" not in format_proposal_line(proposal)

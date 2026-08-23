@@ -48,6 +48,8 @@ from sqlalchemy import text
 from config.settings import settings
 from data.ingest.db import get_engine
 from execution import telegram
+from execution.exit_levels import ExitLevels
+from execution.exit_levels import describe as describe_levels
 from monitoring.alerts import send_slack_alert
 
 logger = logging.getLogger(__name__)
@@ -95,6 +97,11 @@ class ProposedTrade:
     # decision about a known P&L, not a mystery. None when unavailable.
     current_pnl_pct: float | None = None
     current_pnl_usd: float | None = None
+    # The take-profit/stop-loss pair this pick will be held to, shown at
+    # approval time. Approving a trade without knowing where it exits is
+    # approving half a decision, and these are per-pick rather than the one
+    # global pair, so they are not something a reader already knows.
+    exit_levels: ExitLevels | None = None
 
 
 @dataclasses.dataclass
@@ -238,6 +245,8 @@ def format_proposal_line(p: ProposedTrade) -> str:
         line = f"{p.index}. OPEN {p.side.upper()} {p.symbol} — {label}"
         if p.predicted_return is not None:
             line += f" | expected {p.predicted_return:+.1%}"
+        if p.exit_levels is not None:
+            line += f"\n   Exits: {describe_levels(p.exit_levels)}"
 
     why = short_why(p)
     if why:
