@@ -487,49 +487,51 @@ def test_report_card_endpoint_unavailable_when_no_runs(monkeypatch, client):
 # --- what-if thresholds -----------------------------------------------------
 
 
-def _whatif_batch(agreements):
+def _whatif_batch():
     ts = pd.Timestamp("2026-08-07T14:00:00Z")
     return pd.DataFrame(
         [
             {
                 "ts": ts, "symbol": sym, "forecast": fc, "regime": "trend",
                 "target_position": tp, "executed_position": None, "mode": "paper",
-                "direction_agreement": ag,
             }
-            for sym, fc, tp, ag in [
-                ("AAPL", 0.05, 0.10, agreements[0]),
-                ("TSLA", -0.02, -0.05, agreements[1]),
+            for sym, fc, tp in [
+                ("AAPL", 0.05, 0.10),
+                ("TSLA", -0.02, -0.05),
             ]
         ]
     )
 
 
-def test_whatif_endpoint_filters_by_slider_thresholds(monkeypatch, client):
+def test_whatif_endpoint_filters_by_the_move_slider(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _whatif_batch([1.0, 0.6]))
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _whatif_batch())
 
-    resp = client.get("/api/whatif?min_agreement=0.8&min_abs_move=0.0")
+    resp = client.get("/api/whatif?min_abs_move=0.03")
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["available"] is True
     assert body["n_before"] == 2
-    assert body["n_after"] == 1  # TSLA's 0.6 agreement fails the 0.8 bar
+    assert body["n_after"] == 1  # TSLA's 2% move fails a 3% bar
     assert [r["Symbol"] for r in body["rows"]] == ["AAPL"]
-    assert body["rows"][0]["Model agreement"] == 1.0
     assert "1 pick" in body["summary"]
 
 
-def test_whatif_endpoint_reports_no_scored_batch_for_pre_merge_rows(monkeypatch, client):
-    """Rows logged before direction_agreement existed must say so, not silently filter on nothing."""
+def test_whatif_endpoint_no_longer_takes_or_reports_agreement(monkeypatch, client):
+    """
+    The agreement slider went with the threshold it tuned. An unknown query
+    parameter must be ignored rather than filtering on a number that
+    predicts nothing.
+    """
     monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _whatif_batch([None, None]))
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _whatif_batch())
 
-    resp = client.get("/api/whatif")
+    body = client.get("/api/whatif?min_agreement=0.99").json()
 
-    body = resp.json()
-    assert body["available"] is False
-    assert "No scored batch" in body["message"]
+    assert body["n_after"] == 2  # nothing was filtered
+    assert "min_agreement" not in body
+    assert not any("agreement" in str(k).lower() for k in body["rows"][0])
 
 
 def test_whatif_endpoint_with_no_decisions_at_all(monkeypatch, client):

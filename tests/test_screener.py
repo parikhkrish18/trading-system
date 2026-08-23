@@ -35,18 +35,38 @@ class _FakeEnsemble:
         return self._contributions.loc[X.index]
 
 
-def test_score_universe_computes_conviction_and_confident_flag():
+def test_score_universe_confidence_is_only_the_cost_hurdle():
+    """
+    One bar: is the predicted move bigger than what trading it costs. The
+    agreement bar is gone — it admitted ~96% of predictions and the rows it
+    called confident were no more accurate than the rest.
+    """
     latest = pd.DataFrame({"symbol": ["AAPL", "TSLA", "MMM"], "f1": [0.1, 0.2, 0.3]})
     ensemble = _FakeEnsemble(mean_prediction=[0.05, -0.03, 0.01], direction_agreement=[1.0, 0.6, 0.9])
 
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_direction_agreement=0.8, min_abs_return=0.02)
+    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02)
 
     by_symbol = result.set_index("symbol")
-    assert by_symbol.loc["AAPL", "confident"]  # agreement 1.0 >= 0.8, |return| 0.05 >= 0.02
-    assert not by_symbol.loc["TSLA", "confident"]  # agreement 0.6 < 0.8
-    assert not by_symbol.loc["MMM", "confident"]  # |return| 0.01 < 0.02 even though agreement is fine
-    # ranked by conviction_score = agreement * |return|, descending
-    assert list(result["symbol"]) == sorted(result["symbol"], key=lambda s: -by_symbol.loc[s, "conviction_score"])
+    assert by_symbol.loc["AAPL", "confident"]  # |return| 0.05 >= 0.02
+    assert by_symbol.loc["TSLA", "confident"]  # 0.6 agreement no longer disqualifies a 3% move
+    assert not by_symbol.loc["MMM", "confident"]  # |return| 0.01 < 0.02
+
+
+def test_conviction_score_is_the_size_of_the_move_alone():
+    """
+    Ranking used to be agreement x |move|, which mixed a noise term into
+    who got the most capital.
+    """
+    latest = pd.DataFrame({"symbol": ["BIG", "SMALL"], "f1": [0.1, 0.2]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05, 0.01], direction_agreement=[0.6, 1.0])
+
+    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.0)
+
+    by_symbol = result.set_index("symbol")
+    assert by_symbol.loc["BIG", "conviction_score"] == pytest.approx(0.05)
+    assert by_symbol.loc["SMALL", "conviction_score"] == pytest.approx(0.01)
+    # The bigger move ranks first despite the weaker agreement.
+    assert list(result["symbol"]) == ["BIG", "SMALL"]
 
 
 def test_score_universe_empty_input_returns_empty_with_columns():
@@ -266,7 +286,7 @@ def test_attach_reasoning_picks_top_features_by_absolute_contribution():
 
     _attach_reasoning(
         candidates, ensemble, latest, feature_cols=["f1", "f2", "f3"], scored=scored, regime=TREND,
-        max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8, top_n=2,
+        max_leg_pct=0.70, min_leg_pct=0.30, top_n=2,
     )
 
     phases = {p["phase"]: p for p in candidates[0].reasoning}
@@ -280,8 +300,7 @@ def test_attach_reasoning_empty_candidates_is_noop():
     ensemble = _FakeEnsemble(mean_prediction=[], direction_agreement=[])
     _attach_reasoning(
         [], ensemble, pd.DataFrame(), feature_cols=[], scored=pd.DataFrame({"confident": []}),
-        regime=TREND, max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8,
-    )  # should not raise
+        regime=TREND, max_leg_pct=0.70, min_leg_pct=0.30,    )  # should not raise
 
 
 # --- strategy dispatch ----------------------------------------------------
@@ -412,8 +431,7 @@ def test_attach_reasoning_diversified_wording_tells_the_topk_story():
 
     _attach_reasoning(
         candidates, ensemble, latest, feature_cols=["f1"], scored=scored, regime=TREND,
-        max_leg_pct=0.70, min_leg_pct=0.30, min_direction_agreement=0.8,
-        strategy="diversified", top_k=10,
+        max_leg_pct=0.70, min_leg_pct=0.30,        strategy="diversified", top_k=10,
     )
 
     phase4 = next(p for p in candidates[0].reasoning if p["phase"] == 4)

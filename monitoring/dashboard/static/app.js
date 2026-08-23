@@ -181,12 +181,10 @@ async function loadReportCard() {
 
 // ---------- What-if thresholds ----------
 async function loadWhatif() {
-  const minAgreement = document.getElementById("whatif-agreement").value;
   const minMove = document.getElementById("whatif-move").value;
-  document.getElementById("whatif-agreement-value").textContent = `${Math.round(minAgreement * 100)}%`;
   document.getElementById("whatif-move-value").textContent = `${(minMove * 100).toFixed(1)}%`;
 
-  const result = await fetchJSON(`/api/whatif?min_agreement=${minAgreement}&min_abs_move=${minMove}`);
+  const result = await fetchJSON(`/api/whatif?min_abs_move=${minMove}`);
   const summary = document.getElementById("whatif-summary");
   const tbody = document.querySelector("#whatif-table tbody");
   if (!result.available) {
@@ -196,7 +194,7 @@ async function loadWhatif() {
   }
   summary.innerHTML = `<div class="stat-card"><div class="value">${result.n_after}/${result.n_before}</div><div class="label">${result.summary}</div></div>`;
   if (result.rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Nothing clears these thresholds.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Nothing clears this threshold.</td></tr>';
     return;
   }
   tbody.innerHTML = result.rows
@@ -208,7 +206,6 @@ async function loadWhatif() {
         <td>${r["Market regime"]}</td>
         <td>${fmt.pct(r["Predicted move"], 2)}</td>
         <td>${fmt.pct(r["Target size"], 1)}</td>
-        <td>${fmt.pct(r["Model agreement"], 0)}</td>
         <td>${r["Placed?"]}</td>
       </tr>`
     )
@@ -751,7 +748,6 @@ document.getElementById("decision-symbol-filter").addEventListener("keydown", (e
 });
 // The sliders re-hit the endpoint on every input tick — the endpoint is a
 // read-only re-filter of one already-logged batch, so that's cheap.
-document.getElementById("whatif-agreement").addEventListener("input", loadWhatif);
 document.getElementById("whatif-move").addEventListener("input", loadWhatif);
 
 loadAll();

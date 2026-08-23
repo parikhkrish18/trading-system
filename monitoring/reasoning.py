@@ -21,6 +21,9 @@ meant for the dashboard). Pure formatting only — no DB/API calls here.
 """
 from __future__ import annotations
 
+from backtest.cost_model import round_trip_cost_fraction
+from config.settings import settings
+
 FEATURE_LABELS = {
     "mom_ret_5d": "5-day price momentum",
     "mom_ret_20d": "20-day price momentum",
@@ -335,32 +338,34 @@ def phase_signals(regime: str | None, top_features: list[dict]) -> dict:
     }
 
 
-def phase_forecast(
-    predicted_return: float,
-    direction_agreement: float,
-    conviction_score: float,
-    min_direction_agreement: float = 0.8,
-) -> dict:
-    """Phase 3. What the 5-model ensemble predicted and how confident it was."""
+def phase_forecast(predicted_return: float, conviction_score: float) -> dict:
+    """
+    Phase 3. What the ensemble predicted, and how big that is next to what
+    trading it costs.
+
+    Model agreement used to be the headline here — "100% of the 5 models
+    agree" — and it was removed because it was measured to mean nothing.
+    The members are near-clones, so almost every prediction scored near
+    100%, and rows it called confident were no more accurate than the rest.
+    Printing it next to a trade proposal invited exactly the confidence it
+    could not support.
+    """
     pct = f"{predicted_return:+.2%}"
-    agree_pct = f"{direction_agreement:.0%}"
     side = "rise" if predicted_return >= 0 else "fall"
-    agreement_colour = (
-        "every model independently reached the same conclusion, which is a much stronger signal than one model alone"
-        if direction_agreement >= 0.999
-        else "most, but not all, of the models agree — a real signal, but with some internal disagreement about direction"
-    )
+    horizon = settings.target_horizon_days
+    cost = round_trip_cost_fraction()
+    margin = abs(predicted_return) - cost
     lines = [
-        f"The 5-model ensemble expects this stock to {side} about {pct} over the next 5 trading days.",
-        f"{agree_pct} of the 5 independently-trained models agree on that direction "
-        f"(needed at least {min_direction_agreement:.0%} to qualify for a trade) — {agreement_colour}.",
-        f"Conviction score (agreement × size of the move): {conviction_score:.4f} — the higher this is, the more capital "
-        "this pick gets relative to the other one selected this cycle.",
+        f"The ensemble expects this stock to {side} about {pct} over the next {horizon} trading days.",
+        f"Getting in and out costs roughly {cost:.2%}, so the predicted move clears the cost of trading it "
+        f"by {margin:+.2%}. That margin is the only bar a pick has to pass.",
+        f"Conviction score (the size of the predicted move): {conviction_score:.4f} — the higher this is, the "
+        "more capital this pick gets relative to the others selected this cycle.",
     ]
     return {
         "phase": 3,
         "title": "Forecast & Confidence",
-        "summary": f"{pct} forecast, {agree_pct} model agreement.",
+        "summary": f"{pct} forecast, {margin:+.2%} clear of costs.",
         "lines": lines,
     }
 

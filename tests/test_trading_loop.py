@@ -138,7 +138,7 @@ def test_log_decisions_builds_full_phase_reasoning_for_candidates_and_closures(m
         conviction_score=0.027, target_position_pct=0.6,
         reasoning=[
             reasoning.phase_signals("trend", [{"feature_name": "mom_ret_5d", "value": 0.05, "contribution": 0.02}]),
-            reasoning.phase_forecast(0.03, 0.9, 0.027),
+            reasoning.phase_forecast(0.03, 0.027),
             reasoning.phase_selection("AAPL", "long", 0.6, n_confident=2, n_selected=2, max_leg_pct=0.7, min_leg_pct=0.3),
         ],
     )
@@ -258,7 +258,7 @@ def test_run_cycle_proposals_carry_reasoning_and_close_pnl(monkeypatch):
     candidate = _candidate("TSLA", "long", 0.5)
     candidate.reasoning = [
         reasoning.phase_signals("trend", [{"feature_name": "mom_ret_5d", "value": 0.05, "contribution": 0.02}]),
-        reasoning.phase_forecast(0.02, 0.9, 0.018),
+        reasoning.phase_forecast(0.02, 0.018),
     ]
     monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([candidate]))
     monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"TSLA": 100.0})

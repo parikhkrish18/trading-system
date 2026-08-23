@@ -280,18 +280,22 @@ def get_report_card() -> dict:
 
 
 @app.get("/api/whatif")
-def get_whatif(min_agreement: float = 0.8, min_abs_move: float = 0.0) -> dict:
+def get_whatif(min_abs_move: float = 0.0) -> dict:
     """
     The what-if threshold playground: re-filter the latest logged screener
-    batch at whatever bar the sliders ask for. Read-only — nothing is
+    batch at whatever bar the slider asks for. Read-only — nothing is
     retrained or rescored; the question is only "which of these picks would
     still have made the cut".
+
+    There was a second slider over model agreement. It went with the
+    agreement threshold itself — the number was measured to predict
+    nothing, and a control that appears to tune rigour over a meaningless
+    number is worse than no control.
     """
     engine = get_engine()
     batch = pd.read_sql(
         text(
-            """SELECT ts, symbol, forecast, regime, target_position, executed_position,
-                      mode, direction_agreement
+            """SELECT ts, symbol, forecast, regime, target_position, executed_position, mode
                FROM decisions
                WHERE mode = 'paper' AND forecast IS NOT NULL
                  AND ts = (
@@ -302,21 +306,10 @@ def get_whatif(min_agreement: float = 0.8, min_abs_move: float = 0.0) -> dict:
     )
     if batch.empty:
         return {"available": False, "message": "No scored screener batch logged yet.", "rows": [], "summary": ""}
-    if batch["direction_agreement"].isna().all():
-        # Rows logged before the unified loop recorded agreement — the
-        # sliders would filter on a number that was never written.
-        return {
-            "available": False,
-            "message": "No scored batch yet — the latest picks were logged before model agreement was recorded. "
-                       "The playground activates after the next screener run.",
-            "rows": [],
-            "summary": "",
-        }
 
-    filtered = whatif.filter_by_thresholds(batch, min_agreement=min_agreement, min_abs_move=min_abs_move)
+    filtered = whatif.filter_by_thresholds(batch, min_abs_move=min_abs_move)
     return {
         "available": True,
-        "min_agreement": min_agreement,
         "min_abs_move": min_abs_move,
         "n_before": len(batch),
         "n_after": len(filtered),

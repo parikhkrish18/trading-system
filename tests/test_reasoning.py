@@ -112,11 +112,26 @@ def test_phase_signals_includes_regime_and_features():
     assert any("climbed steadily" in line for line in phase["lines"])
 
 
-def test_phase_forecast_reports_agreement_against_threshold():
-    phase = reasoning.phase_forecast(0.03, 0.9, 0.027, min_direction_agreement=0.8)
+def test_phase_forecast_reports_the_move_against_what_trading_it_costs():
+    """
+    The bar a pick has to clear is the round-trip cost, so that is what the
+    forecast has to be reported against.
+    """
+    phase = reasoning.phase_forecast(0.03, 0.03)
+
     assert phase["phase"] == 3
-    assert "90%" in phase["summary"]
-    assert "80%" in " ".join(phase["lines"])
+    assert "+3.00%" in phase["summary"]
+    assert "cost" in " ".join(phase["lines"]).lower()
+
+
+def test_phase_forecast_never_mentions_model_agreement():
+    """
+    Agreement was measured to predict nothing. Printing it beside a trade
+    proposal invited exactly the confidence it could not support.
+    """
+    text = " ".join([reasoning.phase_forecast(0.03, 0.03)["summary"], *reasoning.phase_forecast(0.03, 0.03)["lines"]])
+
+    assert "agree" not in text.lower()
 
 
 def test_phase_selection_single_candidate_notes_fallback():

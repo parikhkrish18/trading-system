@@ -110,7 +110,6 @@ def score_universe(
     ensemble: EnsembleForecastModel,
     latest_features: pd.DataFrame,
     feature_cols: list[str],
-    min_direction_agreement: float = 0.8,
     min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
 ) -> pd.DataFrame:
     """
@@ -119,8 +118,22 @@ def score_universe(
     LightGBM handles NaN features natively).
     Returns: symbol, predicted_return, direction_agreement, conviction_score, confident.
 
-    min_abs_return defaults to the estimated round-trip transaction cost:
-    a prediction smaller than the cost of trading it is not "confident".
+    One bar decides "confident": the predicted move must be bigger than
+    what the round trip costs. A prediction smaller than the cost of acting
+    on it is a guaranteed loser even when its direction is right.
+
+    There used to be a second bar — at least 80% of the ensemble agreeing
+    on direction — and it was measured to carry no information. The members
+    are near-clones, so ~96% of predictions passed it, accuracy on the rows
+    it called "confident" matched accuracy overall, and making the members
+    structurally diverse did not change that. A filter that admits almost
+    everything and predicts nothing is not a safeguard; it is a number that
+    makes a system look more careful than it is.
+
+    direction_agreement is still computed and recorded, because it is
+    evidence about the ensemble worth keeping. It just no longer selects or
+    ranks anything, and it is not shown anywhere that would invite reading
+    confidence into it.
     """
     empty = pd.DataFrame(
         columns=["symbol", "predicted_return", "direction_agreement", "conviction_score", "confident"]
@@ -138,10 +151,11 @@ def score_universe(
             "direction_agreement": preds["direction_agreement"].to_numpy(),
         }
     )
-    result["conviction_score"] = result["direction_agreement"] * result["predicted_return"].abs()
-    result["confident"] = (result["direction_agreement"] >= min_direction_agreement) & (
-        result["predicted_return"].abs() >= min_abs_return
-    )
+    # Rank on the size of the predicted move alone. Multiplying by
+    # agreement mixed a noise term into the ordering, so which pick got the
+    # most capital was partly decided by a number that means nothing.
+    result["conviction_score"] = result["predicted_return"].abs()
+    result["confident"] = result["predicted_return"].abs() >= min_abs_return
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
 
@@ -254,7 +268,7 @@ def select_concentrated_trades(
     track the market with a diversified book.
 
     The split between the two legs is weighted by each pick's relative
-    conviction_score (direction_agreement * |predicted_return|), bounded to
+    conviction_score (the size of the predicted move), bounded to
     [min_leg_pct, max_leg_pct] of the *dominant* leg so one pick can't
     swallow the whole deployment even at an extreme confidence ratio.
     min_leg_pct should be 1 - max_leg_pct so both bounds are satisfiable
@@ -313,7 +327,6 @@ def _attach_reasoning(
     regime: str,
     max_leg_pct: float,
     min_leg_pct: float,
-    min_direction_agreement: float,
     top_n: int = 5,
     strategy: str = "concentrated",
     top_k: int | None = None,
@@ -369,9 +382,7 @@ def _attach_reasoning(
             )
         candidate.reasoning = [
             reasoning.phase_signals(regime, top_features),
-            reasoning.phase_forecast(
-                candidate.predicted_return, candidate.direction_agreement, candidate.conviction_score, min_direction_agreement
-            ),
+            reasoning.phase_forecast(candidate.predicted_return, candidate.conviction_score),
             phase4,
         ]
 
@@ -400,7 +411,6 @@ def run_screen(
     symbols: list[str],
     target_horizon_days: int | None = None,
     n_ensemble_models: int = 5,
-    min_direction_agreement: float = 0.8,
     min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
@@ -412,7 +422,6 @@ def run_screen(
         symbols,
         target_horizon_days=target_horizon_days,
         n_ensemble_models=n_ensemble_models,
-        min_direction_agreement=min_direction_agreement,
         min_abs_return=min_abs_return,
         regime=regime,
         is_shortable_fn=is_shortable_fn,
@@ -425,7 +434,6 @@ def run_screen_with_scores(
     symbols: list[str],
     target_horizon_days: int | None = None,
     n_ensemble_models: int = 5,
-    min_direction_agreement: float = 0.8,
     min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
@@ -466,7 +474,7 @@ def run_screen_with_scores(
     ensemble.fit(train_df[feature_cols], train_df["target"])
 
     latest = load_latest_features(feature_set_id, symbols)
-    scored = score_universe(ensemble, latest, feature_cols, min_direction_agreement, min_abs_return)
+    scored = score_universe(ensemble, latest, feature_cols, min_abs_return)
 
     if not settings.allow_shorts and not scored.empty:
         # Logged rather than silent: the shortlist can look thin for a
@@ -533,7 +541,6 @@ def run_screen_with_scores(
         regime,
         settings.max_concentrated_position_pct,
         settings.min_concentrated_position_pct,
-        min_direction_agreement,
         strategy=settings.strategy_mode,
         top_k=settings.screener_top_k,
     )
@@ -614,7 +621,6 @@ def main() -> None:
         help=f"Forward-return horizon in trading days (default: TARGET_HORIZON_DAYS = {settings.target_horizon_days}).",
     )
     parser.add_argument("--n-ensemble-models", type=int, default=5)
-    parser.add_argument("--min-direction-agreement", type=float, default=0.8)
     parser.add_argument(
         "--min-abs-return", type=float, default=DEFAULT_MIN_ABS_RETURN,
         help="Minimum |predicted return| to shortlist. Defaults to the estimated round-trip "
@@ -629,7 +635,6 @@ def main() -> None:
         symbols,
         target_horizon_days=args.target_horizon_days,
         n_ensemble_models=args.n_ensemble_models,
-        min_direction_agreement=args.min_direction_agreement,
         min_abs_return=args.min_abs_return,
     )
 
