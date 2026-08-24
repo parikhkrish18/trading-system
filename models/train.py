@@ -50,8 +50,15 @@ from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
-from models.evaluation import cross_sectional_excess, cross_sectional_zscore, trade_metrics
+from models.evaluation import (
+    cross_sectional_excess,
+    cross_sectional_zscore,
+    describe_book,
+    production_book_mask,
+    trade_metrics,
+)
 from models.forecast.ensemble import EnsembleForecastModel
+from monitoring.alerts import configure_console_encoding
 
 
 @dataclasses.dataclass
@@ -213,6 +220,7 @@ def run_walk_forward(
     purge_days: int | None = None,
     fold_dates: pd.DatetimeIndex | None = None,
     target_mode: str | None = None,
+    respect_production_config: bool = True,
 ) -> pd.DataFrame:
     """
     n_folds defaults to 10 (was 6, and long before that 3): a mean over a
@@ -231,6 +239,15 @@ def run_walk_forward(
     window so no training label overlaps the test period (see module
     docstring). None = target_horizon_days (the correct value); 0 disables
     purging, which exists only to measure what the leakage was worth.
+
+    respect_production_config: measure the book that would actually trade —
+    ALLOW_SHORTS, STRATEGY_MODE and SCREENER_TOP_K applied exactly as
+    models/screener.py applies them. This is the default because the
+    alternative was reporting a long-short result for a long-only system:
+    with ALLOW_SHORTS=false, ~65% of the rows the old harness scored were
+    trades that could never have been placed. Set False to measure the full
+    long-short book deliberately, which is a different system and should be
+    read as one.
 
     fold_dates: when given, fold boundaries are built from THIS date index
     instead of the frame's own dates. A longer horizon loses its last
@@ -255,6 +272,11 @@ def run_walk_forward(
     # No per-symbol ADV here, so this is the spread-only floor — see
     # backtest/cost_model.py.
     round_trip_cost = round_trip_cost_fraction()
+
+    # The concentrated strategy holds exactly two names; the diversified one
+    # holds up to SCREENER_TOP_K. Resolved once so every fold measures the
+    # same book.
+    book_top_k = 2 if settings.strategy_mode == "concentrated" else settings.screener_top_k
 
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     mlflow.set_experiment(model_name)
@@ -327,9 +349,25 @@ def run_walk_forward(
             # equal-weight buy-and-hold baseline. Reporting the model's
             # return without it is how this project spent months mistaking
             # market drift for skill (see models/evaluation.py).
+            # Which rows the live system would have traded. The agreement
+            # mask above stays as a diagnostic — it answers "does agreement
+            # predict accuracy" — but it is NOT what the screener selects
+            # on, so it must not be what the money metrics are computed
+            # from. See models/evaluation.production_book_mask.
+            if respect_production_config:
+                traded_mask = production_book_mask(
+                    preds,
+                    test_df["ts"].to_numpy(),
+                    cost=round_trip_cost,
+                    allow_shorts=settings.allow_shorts,
+                    top_k=book_top_k,
+                )
+            else:
+                traded_mask = confident_mask
+
             metrics = trade_metrics(
-                preds[confident_mask],
-                market[confident_mask],
+                preds[traded_mask],
+                market[traded_mask],
                 market,
                 round_trip_cost,
             )
@@ -366,11 +404,26 @@ def run_walk_forward(
                     "directional_accuracy_absolute": directional_acc_absolute,
                     "directional_accuracy_when_confident": directional_acc_confident,
                     "pct_rows_confident": pct_confident,
+                    "pct_rows_traded": float(traded_mask.mean()),
                     **metrics,
                 }
             )
 
-    return pd.DataFrame(results)
+    frame = pd.DataFrame(results)
+    # Provenance travels with the numbers: two runs of this harness can
+    # disagree purely by measuring different systems, and nothing in the
+    # metrics themselves would tell a reader which.
+    frame.attrs["book"] = (
+        describe_book(
+            allow_shorts=settings.allow_shorts,
+            strategy_mode=settings.strategy_mode,
+            top_k=book_top_k,
+            cost=round_trip_cost,
+        )
+        if respect_production_config
+        else "full long-short book, every confident row, production config IGNORED"
+    )
+    return frame
 
 
 # Reported for every fold, in this order. excess_return sits directly under
@@ -436,6 +489,7 @@ def headline_verdict(results: pd.DataFrame) -> str:
 
     lines = [
         "=== Verdict vs doing nothing ===",
+        f"measured configuration: {results.attrs.get('book', 'unknown — results predate provenance tracking')}",
         f"model, net of costs : {model.mean():+.4%} per trade",
         f"buy-and-hold        : {bench.mean():+.4%} per candidate row, same windows, gross",
         f"EXCESS (the number) : {excess.mean():+.4%}  -> the model {verdict} buy-and-hold",
@@ -443,6 +497,11 @@ def headline_verdict(results: pd.DataFrame) -> str:
     ]
     if not long_share.empty:
         lines.append(f"trades that were long: {long_share.mean():.1%}")
+    for label, column in (("long side", "long_return_net"), ("short side", "short_return_net")):
+        if column in results.columns:
+            side = results[column].dropna()
+            if not side.empty:
+                lines.append(f"{label}, net of costs : {side.mean():+.4%} per trade ({len(side)} fold(s))")
     lines.append(
         "A positive model return with a negative excess means the strategy made "
         "money and would have made more doing nothing. Excess is the only one of "
@@ -470,11 +529,21 @@ def main() -> None:
     parser.add_argument("--n-ensemble-models", type=int, default=5)
     parser.add_argument("--confident-agreement-threshold", type=float, default=0.8)
     parser.add_argument(
+        "--full-long-short", action="store_true",
+        help="Measure the full long-short book instead of the one production would trade. "
+             "By default the harness applies ALLOW_SHORTS, STRATEGY_MODE and SCREENER_TOP_K "
+             "exactly as the screener does, so the folds describe the live system. This flag "
+             "measures a DIFFERENT system and its numbers should be read as such.",
+    )
+    parser.add_argument(
         "--purge-days", type=int, default=None,
         help="Trading days purged from the end of each training window (default: the target horizon). "
              "0 disables purging — only useful to measure what the leakage was worth.",
     )
     args = parser.parse_args()
+    # MLflow prints characters cp1252 can't encode; without this a Windows
+    # run dies mid-fold with a UnicodeEncodeError from a print statement.
+    configure_console_encoding()
 
     symbols = resolve_symbols(args.symbols, args.universe)
     results = run_walk_forward(
@@ -486,6 +555,7 @@ def main() -> None:
         confident_agreement_threshold=args.confident_agreement_threshold,
         purge_days=args.purge_days,
         target_mode=args.target_mode,
+        respect_production_config=not args.full_long_short,
     )
 
     print(results.to_string(index=False))

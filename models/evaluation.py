@@ -174,3 +174,74 @@ def cross_sectional_zscore(
     z = (df[feature_cols] - mean) / std.where(std > 0)
     out[feature_cols] = z.fillna(0.0)
     return out
+
+
+# --------------------------------------------------------------------------
+# Measuring the book that actually trades
+# --------------------------------------------------------------------------
+#
+# The walk-forward used to score every confident row, long and short alike,
+# and report the result as though it described the live system. It did not:
+# production runs with ALLOW_SHORTS=false, so roughly two thirds of the
+# scored picks were trades that would never have been placed. The headline
+# excess described a long-short book nobody runs.
+#
+# That is the same failure as reporting a return with no benchmark beside
+# it — not a wrong number, a number measuring something other than the
+# question. So selection here mirrors models/screener.py: the cost floor,
+# then the shorts filter, then top-k by conviction, per date.
+
+
+def production_book_mask(
+    predictions: np.ndarray | pd.Series,
+    dates: np.ndarray | pd.Series,
+    *,
+    cost: float,
+    allow_shorts: bool,
+    top_k: int,
+) -> np.ndarray:
+    """
+    Which rows the live screener would actually have traded.
+
+    `predictions`  model output for every candidate row in the window.
+    `dates`        each row's date. Top-k is applied PER DATE, because the
+                   screener picks a fresh book each time it runs — ranking
+                   the whole test window at once would let a great pick in
+                   March crowd out every pick in April.
+    `cost`         round-trip cost floor; a predicted move smaller than what
+                   the trade costs is not tradeable (score_universe).
+    `allow_shorts` when False, negative predictions are dropped outright,
+                   the same way select_trades skips a short candidate.
+    `top_k`        how many names the book holds at most on any one date.
+
+    Returns a boolean mask over the input rows.
+    """
+    preds = np.asarray(predictions, dtype=float)
+    if preds.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    eligible = np.abs(preds) >= cost
+    if not allow_shorts:
+        # sign(0) is treated as long everywhere else in this module; keep
+        # that consistent so a zero prediction isn't silently dropped here
+        # and traded there.
+        eligible &= preds >= 0
+
+    frame = pd.DataFrame({"pred": preds, "date": np.asarray(dates), "eligible": eligible})
+    frame["rank"] = (
+        frame["pred"].abs().where(frame["eligible"]).groupby(frame["date"]).rank(ascending=False, method="first")
+    )
+    return (frame["eligible"] & (frame["rank"] <= top_k)).to_numpy()
+
+
+def describe_book(*, allow_shorts: bool, strategy_mode: str, top_k: int, cost: float) -> str:
+    """
+    What configuration a set of results measured. Printed with the verdict,
+    because two runs of this harness can disagree simply by measuring
+    different systems, and a reader has no way to tell from the numbers.
+    """
+    sides = "long and short" if allow_shorts else "long only"
+    return (
+        f"{strategy_mode} book, {sides}, top {top_k} per date, "
+        f"minimum move {cost:.2%} (the round-trip cost)"
+    )

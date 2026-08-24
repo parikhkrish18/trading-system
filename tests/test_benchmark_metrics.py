@@ -15,6 +15,8 @@ from models.evaluation import (
     benchmark_return,
     cross_sectional_excess,
     cross_sectional_zscore,
+    describe_book,
+    production_book_mask,
     trade_metrics,
 )
 
@@ -205,3 +207,102 @@ def test_zscore_leaves_non_feature_columns_untouched():
     out = cross_sectional_zscore(df, ["rsi"])
     assert list(out["close"]) == [100.0, 200.0]
     assert list(out["symbol"]) == ["AAPL", "MSFT"]
+
+
+# --------------------------------------------------------------------------
+# The harness must measure the book that actually trades
+# --------------------------------------------------------------------------
+
+
+def _mask(preds, dates=None, cost=0.0, allow_shorts=True, top_k=100):
+    dates = dates if dates is not None else ["2026-01-01"] * len(preds)
+    return production_book_mask(
+        np.array(preds, dtype=float), np.array(dates), cost=cost, allow_shorts=allow_shorts, top_k=top_k
+    )
+
+
+def test_shorts_are_dropped_when_production_forbids_them():
+    """
+    The reason this exists. Production runs ALLOW_SHORTS=false, but the
+    harness scored both sides, so ~65% of its picks were trades that could
+    never have been placed and the headline described a book nobody runs.
+    """
+    kept = _mask([0.05, -0.05, 0.03, -0.03], allow_shorts=False)
+
+    assert list(kept) == [True, False, True, False]
+
+
+def test_shorts_are_kept_when_production_allows_them():
+    kept = _mask([0.05, -0.05], allow_shorts=True)
+
+    assert list(kept) == [True, True]
+
+
+def test_a_zero_prediction_counts_as_long_not_as_a_dropped_short():
+    """
+    sign(0) is treated as long everywhere else. If it were dropped here and
+    traded there, the measurement would drift from the system again.
+    """
+    assert list(_mask([0.0], allow_shorts=False)) == [True]
+
+
+def test_moves_smaller_than_the_round_trip_cost_are_not_tradeable():
+    """A predicted move that doesn't cover the cost is a guaranteed loser."""
+    kept = _mask([0.05, 0.001], cost=0.01)
+
+    assert list(kept) == [True, False]
+
+
+def test_only_the_top_k_are_traded_on_any_given_date():
+    kept = _mask([0.09, 0.07, 0.05, 0.03], top_k=2)
+
+    assert list(kept) == [True, True, False, False]
+
+
+def test_top_k_is_applied_per_date_not_across_the_whole_window():
+    """
+    The screener picks a fresh book each run. Ranking the whole test window
+    at once would let a strong March pick crowd out every April pick, which
+    is not a book anyone could have held.
+    """
+    preds = [0.09, 0.08, 0.02, 0.01]
+    dates = ["2026-01-01", "2026-01-01", "2026-02-01", "2026-02-01"]
+
+    kept = _mask(preds, dates=dates, top_k=1)
+
+    assert list(kept) == [True, False, True, False]
+
+
+def test_ranking_uses_the_size_of_the_move_regardless_of_direction():
+    """A -6% forecast is a stronger call than a +2% one."""
+    kept = _mask([0.02, -0.06], top_k=1, allow_shorts=True)
+
+    assert list(kept) == [False, True]
+
+
+def test_the_cost_floor_applies_before_top_k_not_after():
+    """
+    Otherwise a thin day fills the book with picks that cannot pay for
+    themselves, purely because nothing better was available.
+    """
+    kept = _mask([0.05, 0.001, 0.0005], cost=0.01, top_k=3)
+
+    assert list(kept) == [True, False, False]
+
+
+def test_an_empty_window_produces_an_empty_mask():
+    assert len(_mask([])) == 0
+
+
+def test_describe_book_states_which_system_was_measured():
+    """
+    Two runs of this harness can disagree purely by measuring different
+    systems, and nothing in the numbers themselves would say which.
+    """
+    long_only = describe_book(allow_shorts=False, strategy_mode="diversified", top_k=10, cost=0.004)
+    both = describe_book(allow_shorts=True, strategy_mode="concentrated", top_k=2, cost=0.004)
+
+    assert "long only" in long_only
+    assert "top 10" in long_only
+    assert "long and short" in both
+    assert "concentrated" in both

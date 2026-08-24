@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import sys
 from pathlib import Path
 
 import requests
@@ -30,6 +31,37 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_FILE = _REPO_ROOT / "logs" / "trading-system.log"
 
 
+def configure_console_encoding() -> None:
+    """
+    Make stdout/stderr UTF-8 capable.
+
+    On Windows the console defaults to cp1252, which cannot encode the emoji
+    and box-drawing characters this project prints — in alerts, in MLflow's
+    own progress output, in the cycle summary. The failure is a
+    UnicodeEncodeError raised from a print, so a training run dies partway
+    through for no reason connected to training, and the traceback points at
+    logging rather than at the cause.
+
+    PYTHONIOENCODING=utf-8 fixes it from outside, but every local developer
+    would have to know that, and forgetting it looks like a broken pipeline.
+    Doing it in-process means nobody has to know.
+
+    Errors are replaced rather than raised: a character that still cannot be
+    rendered should cost a mangled glyph in a log line, never a dead run.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # already-wrapped or captured streams
+            continue
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if encoding in ("utf8", "utf8mb4"):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass  # a stream that refuses is not worth failing a run over
+
+
 def configure_file_logging(
     log_file: Path | str = DEFAULT_LOG_FILE,
     max_bytes: int = 5_000_000,
@@ -40,6 +72,10 @@ def configure_file_logging(
     Idempotent: calling twice for the same file reuses the existing handler
     rather than double-logging every line.
     """
+    # Every CLI entrypoint already calls this before doing anything, which
+    # makes it the one place that fixes the console for all of them.
+    configure_console_encoding()
+
     log_file = Path(log_file)
     root = logging.getLogger()
     for handler in root.handlers:
