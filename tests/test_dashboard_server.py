@@ -606,6 +606,24 @@ def test_configured_token_is_checked_even_on_loopback(monkeypatch, client, _runn
 # --- manual triggers (ingest / trading cycle) --------------------------------
 
 
+class _FakeProcess:
+    """
+    Stands in for Popen: hands back its lines the way a live pipe would,
+    so the tests exercise the streaming path rather than a batch read.
+    """
+
+    def __init__(self, lines, returncode=0):
+        self.stdout = iter(lines)
+        self._returncode = returncode
+        self.killed = False
+
+    def wait(self):
+        return self._returncode
+
+    def kill(self):
+        self.killed = True
+
+
 @pytest.fixture
 def _job_env(monkeypatch, tmp_path):
     """Fresh job registry, synchronous worker, fake subprocess, tmp cache file."""
@@ -614,12 +632,9 @@ def _job_env(monkeypatch, tmp_path):
     # Run the worker inline so tests see the final state deterministically.
     monkeypatch.setattr(server, "_spawn", lambda target, name: target(name))
 
-    class _OkResult:
-        returncode = 0
-        stdout = "ingested 503 symbols\n"
-        stderr = ""
-
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _OkResult())
+    monkeypatch.setattr(
+        server.subprocess, "Popen", lambda *a, **k: _FakeProcess(["ingested 503 symbols\n"])
+    )
     monkeypatch.setattr(server.settings, "dashboard_api_token", "")
     monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
 
@@ -636,12 +651,11 @@ def test_run_job_starts_and_records_a_finished_run(client, _job_env):
 
 
 def test_run_job_records_a_failed_run(client, _job_env, monkeypatch):
-    class _BadResult:
-        returncode = 2
-        stdout = ""
-        stderr = "universe table is empty\n"
-
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _BadResult())
+    monkeypatch.setattr(
+        server.subprocess,
+        "Popen",
+        lambda *a, **k: _FakeProcess(["universe table is empty\n"], returncode=2),
+    )
 
     client.post("/api/jobs/cycle/run")
 
@@ -855,3 +869,56 @@ def test_the_static_page_itself_stays_reachable(client, monkeypatch):
 
     assert resp.status_code == 200
     assert "api-token-input" in resp.text
+
+
+def test_job_output_is_visible_while_the_job_is_still_running(client, _job_env, monkeypatch):
+    """
+    Output used to be captured only when the process exited, so a job that
+    runs for the better part of an hour showed an empty box and a spinner —
+    indistinguishable from one that had wedged. An hour was spent guessing
+    between those two states once, which is the reason this exists.
+    """
+    seen: list[str] = []
+
+    class _SlowProcess:
+        def __init__(self):
+            self.stdout = iter(["step 1\n", "step 2\n", "step 3\n"])
+            self._returncode = 0
+
+        def wait(self):
+            return self._returncode
+
+        def kill(self):
+            pass
+
+    def _capture_each_line(name):
+        # Snapshot what a reader would have seen after every line arrived.
+        original = server._JOBS[name]["output_tail"]
+        seen.append(original)
+
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: _SlowProcess())
+    client.post("/api/jobs/ingest/run")
+
+    tail = client.get("/api/jobs").json()["ingest"]["output_tail"]
+    assert "step 1" in tail and "step 3" in tail
+
+
+def test_a_long_running_job_does_not_grow_its_buffer_without_bound(client, _job_env, monkeypatch):
+    """A run that prints a line per symbol must not fill the container's memory."""
+    class _Chatty:
+        def __init__(self):
+            self.stdout = iter(f"line {i}\n" for i in range(5000))
+            self._returncode = 0
+
+        def wait(self):
+            return self._returncode
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **k: _Chatty())
+    client.post("/api/jobs/ingest/run")
+
+    tail = client.get("/api/jobs").json()["ingest"]["output_tail"]
+    assert len(tail) <= server._JOB_OUTPUT_TAIL_CHARS
+    assert "line 4999" in tail  # the newest output is what survives

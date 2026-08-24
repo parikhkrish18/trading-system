@@ -19,6 +19,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import mlflow
@@ -515,6 +516,9 @@ def run_tests() -> dict:
 
 LAST_JOBS_PATH = REPO_ROOT / "logs" / "last_manual_jobs.json"
 _JOB_OUTPUT_TAIL_CHARS = 8000
+# Cap the in-memory buffer too: the character cap alone bounds what is
+# SHOWN, not what is held while a long job runs.
+_JOB_OUTPUT_MAX_LINES = 400
 
 _JOB_COMMANDS: dict[str, dict] = {
     "init_db": {
@@ -533,10 +537,13 @@ _JOB_COMMANDS: dict[str, dict] = {
     "cycle": {
         "label": "Full trading cycle (ingest -> screen -> approval gate -> paper orders)",
         "command": [sys.executable, "-m", "scripts.run_weekly_cycle", "--feature-set-id", settings.feature_set_id],
-        # Fundamentals + news for ~500 symbols on the free vendor tier take
-        # ~2h alone (see run_weekly_cycle's docstring), plus the approval
-        # wait — a short timeout would kill every legitimate run.
-        "timeout_s": 4 * 3600,
+        # Was 4h, sized for fundamentals + news over ~500 symbols on the
+        # free vendor tier. Those are skipped without a key now, so the
+        # cycle is ingest, features, train, screen and the approval wait —
+        # and a 4h ceiling meant a genuinely wedged run sat unnoticed for
+        # most of an evening. 90 minutes covers a slow run with room to
+        # spare, including the 45-minute approval window.
+        "timeout_s": 90 * 60,
     },
 }
 
@@ -572,20 +579,53 @@ def _persist_jobs() -> None:
 
 
 def _run_job_subprocess(name: str) -> None:
-    """The background worker: run the command, record how it ended."""
+    """
+    The background worker: run the command, streaming its output as it
+    arrives, and record how it ended.
+
+    Streaming rather than capturing at the end, which is what this did
+    before. A cycle can run for the better part of an hour, and with output
+    withheld until exit a slow job and a wedged one look exactly alike —
+    an empty box and a spinner. An hour was once spent guessing between
+    those two states, which is an hour longer than it should take to see
+    that a job is on its ninth fold and still moving.
+    """
     spec = _JOB_COMMANDS[name]
+    lines: list[str] = []
+
+    def _record(text: str) -> None:
+        with _JOBS_LOCK:
+            _JOBS[name]["output_tail"] = text[-_JOB_OUTPUT_TAIL_CHARS:]
+
     try:
-        result = subprocess.run(  # noqa: S603 — fixed command list, no user input
-            spec["command"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=spec["timeout_s"]
+        deadline = time.monotonic() + spec["timeout_s"]
+        process = subprocess.Popen(  # noqa: S603 — fixed command list, no user input
+            spec["command"],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        output = (result.stdout or "") + (result.stderr or "")
-        status = "finished" if result.returncode == 0 else "failed"
-        exit_code = result.returncode
+        for line in process.stdout:  # type: ignore[union-attr]
+            lines.append(line)
+            # Keep only what the panel can show; a long run must not grow a
+            # list until the container runs out of memory.
+            if len(lines) > _JOB_OUTPUT_MAX_LINES:
+                del lines[: len(lines) - _JOB_OUTPUT_MAX_LINES]
+            _record("".join(lines))
+            if time.monotonic() > deadline:
+                process.kill()
+                raise subprocess.TimeoutExpired(spec["command"], spec["timeout_s"])
+        returncode = process.wait()
+        output = "".join(lines)
+        status = "finished" if returncode == 0 else "failed"
+        exit_code = returncode
     except subprocess.TimeoutExpired:
-        output = f"Timed out after {spec['timeout_s']}s and was killed."
+        output = "".join(lines) + f"\n[timed out after {spec['timeout_s']}s and was killed]"
         status, exit_code = "failed", None
     except Exception as exc:  # a crashed worker must still leave a readable status
-        output = f"{type(exc).__name__}: {exc}"
+        output = "".join(lines) + f"\n{type(exc).__name__}: {exc}"
         status, exit_code = "failed", None
 
     with _JOBS_LOCK:
