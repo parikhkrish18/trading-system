@@ -25,7 +25,7 @@ import requests
 
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
-from data.ingest.http import DEFAULT_SLEEP_SECONDS, polygon_get
+from data.ingest.http import DEFAULT_SLEEP_SECONDS, polygon_configured, polygon_get
 from data.ingest.universe import resolve_symbols
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,16 @@ def fetch_news(symbols: list[str], since_hours: int, sleep_seconds: float = DEFA
     is scanning hundreds of names against a rate-limited free-tier key; a
     single-digit --symbols list can pass sleep_seconds=0.
     """
+    if not polygon_configured():
+        # See fetch_fundamentals: an unset key otherwise costs ~109 minutes
+        # of sleeping between requests that all 401.
+        logger.warning(
+            "POLYGON_API_KEY is not set — skipping news for %s symbol(s). "
+            "Sentiment features will be absent, which the model tolerates.",
+            len(symbols),
+        )
+        return pd.DataFrame(columns=["id", "symbol", "ts", "headline", "source"])
+
     since = dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=since_hours)
     rows: list[dict] = []
 

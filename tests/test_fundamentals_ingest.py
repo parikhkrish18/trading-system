@@ -1,6 +1,6 @@
 import pandas as pd
 
-from data.ingest import fundamentals
+from data.ingest import fundamentals, http
 
 
 class _FakeResponse:
@@ -171,3 +171,46 @@ def test_ingest_fundamentals_upserts_with_correct_conflict_cols(monkeypatch):
     assert n == 1
     assert captured["table"] == "fundamentals"
     assert captured["conflict_cols"] == ["symbol", "ts", "metric"]
+
+
+# --------------------------------------------------------------------------
+# An unset key must fail once, not 503 times slowly
+# --------------------------------------------------------------------------
+
+
+def test_no_polygon_key_skips_immediately_instead_of_sleeping_through_the_universe(monkeypatch):
+    """
+    Without a key every request 401s — but the pacing sleep between symbols
+    ran anyway, so a universe pull spent ~109 minutes failing. The weekly
+    cycle does two of these, which is where three and a half hours went
+    before the screener even started.
+    """
+    monkeypatch.setattr(http.settings, "polygon_api_key", "")
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("no request should be made without a key")
+
+    monkeypatch.setattr(fundamentals, "polygon_get", _must_not_be_called)
+    monkeypatch.setattr(fundamentals.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("must not sleep")))
+
+    df = fundamentals.fetch_fundamentals(["AAPL", "MSFT", "TSLA"])
+
+    assert df.empty
+    assert list(df.columns) == ["symbol", "ts", "metric", "value", "source"]
+
+
+def test_a_configured_key_still_fetches_normally(monkeypatch):
+    """The guard must not disable ingestion for anyone who has a key."""
+    monkeypatch.setattr(http.settings, "polygon_api_key", "a-real-key")
+    calls = []
+
+    class _Resp:
+        def json(self):
+            return {"results": []}
+
+    monkeypatch.setattr(fundamentals, "polygon_get", lambda *a, **k: calls.append(1) or _Resp())
+    monkeypatch.setattr(fundamentals.time, "sleep", lambda s: None)
+
+    fundamentals.fetch_fundamentals(["AAPL", "MSFT"])
+
+    assert len(calls) == 2

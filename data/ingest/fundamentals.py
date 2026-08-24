@@ -24,7 +24,7 @@ import requests
 
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
-from data.ingest.http import DEFAULT_SLEEP_SECONDS, polygon_get
+from data.ingest.http import DEFAULT_SLEEP_SECONDS, polygon_configured, polygon_get
 from data.ingest.universe import resolve_symbols
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,19 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
     is scanning hundreds of names against a rate-limited free-tier key; a
     single-digit --symbols list can pass sleep_seconds=0.
     """
+    if not polygon_configured():
+        # One line instead of 503 slow ones: without a key every request
+        # 401s, but the pacing sleep between symbols runs anyway, so a
+        # universe pull spends ~109 minutes failing. The model handles
+        # missing fundamentals natively (the columns are simply absent),
+        # so returning empty is the same outcome, reached immediately.
+        logger.warning(
+            "POLYGON_API_KEY is not set — skipping fundamentals for %s symbol(s). "
+            "Features that depend on fundamentals will be absent, which the model tolerates.",
+            len(symbols),
+        )
+        return pd.DataFrame(columns=["symbol", "ts", "metric", "value", "source"])
+
     rows: list[dict] = []
     for i, symbol in enumerate(symbols):
         if i > 0 and sleep_seconds > 0:
