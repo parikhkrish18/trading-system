@@ -13,11 +13,14 @@ import pytest
 
 from models.evaluation import (
     benchmark_return,
+    beta_adjusted_excess,
     cross_sectional_excess,
     cross_sectional_zscore,
     describe_book,
     production_book_mask,
     trade_metrics,
+    trailing_risk_profile,
+    volatility_matched_benchmark,
 )
 
 # --------------------------------------------------------------------------
@@ -306,3 +309,89 @@ def test_describe_book_states_which_system_was_measured():
     assert "top 10" in long_only
     assert "long and short" in both
     assert "concentrated" in both
+
+
+# --------------------------------------------------------------------------
+# Skill, or beta one level down?
+# --------------------------------------------------------------------------
+
+
+def _panel(spec, n_days=150, seed=0):
+    """A price panel from {symbol: (drift, daily_vol)}."""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2026-01-01", periods=n_days)
+    rows = []
+    for symbol, (drift, vol) in spec.items():
+        price = 100.0
+        for day in dates:
+            price *= 1 + rng.normal(drift, vol)
+            rows.append({"symbol": symbol, "ts": day, "close": price})
+    return pd.DataFrame(rows)
+
+
+def test_risk_profile_separates_calm_from_volatile_names():
+    profile = trailing_risk_profile(_panel({"CALM": (0.0005, 0.004), "WILD": (0.0005, 0.035)}))
+
+    by_symbol = profile.groupby("symbol")[["realized_vol", "beta"]].mean()
+    assert by_symbol.loc["WILD", "realized_vol"] > by_symbol.loc["CALM", "realized_vol"] * 3
+    assert by_symbol.loc["WILD", "beta"] > by_symbol.loc["CALM", "beta"]
+
+
+def test_risk_profile_uses_only_past_returns():
+    """
+    A risk figure that peeked at the future would make the fair benchmark
+    unfair in the other direction.
+    """
+    profile = trailing_risk_profile(_panel({"A": (0.0, 0.01), "B": (0.0, 0.02)}), vol_window=20)
+
+    earliest = profile.sort_values("ts").groupby("symbol").head(1)
+    assert earliest["realized_vol"].isna().all()  # nothing behind it yet
+
+
+def test_volatility_matched_benchmark_prices_the_risk_the_picks_took():
+    """
+    Two buckets: calm names returned 1%, volatile ones 5%. A book made
+    entirely of volatile names must be benchmarked at 5%, not at the 3%
+    average of everything — otherwise taking more risk reads as skill.
+    """
+    returns = np.array([0.01] * 10 + [0.05] * 10)
+    vol = np.array([0.005] * 10 + [0.04] * 10)
+    traded = np.array([False] * 10 + [True] * 10)
+
+    matched = volatility_matched_benchmark(returns, vol, traded, n_buckets=2)
+
+    assert matched == pytest.approx(0.05)
+    assert matched > returns.mean()  # the equal-weight benchmark would flatter the book
+
+
+def test_volatility_matched_benchmark_equals_the_plain_one_for_an_untilted_book():
+    """No tilt, no correction — the two benchmarks should agree."""
+    returns = np.array([0.01] * 10 + [0.05] * 10)
+    vol = np.array([0.005] * 10 + [0.04] * 10)
+    traded = np.array([True] * 20)
+
+    assert volatility_matched_benchmark(returns, vol, traded, n_buckets=2) == pytest.approx(returns.mean())
+
+
+def test_volatility_matched_benchmark_is_nan_without_usable_volatility():
+    returns = np.array([0.01, 0.02, 0.03])
+    vol = np.array([np.nan, np.nan, np.nan])
+
+    assert np.isnan(volatility_matched_benchmark(returns, vol, np.array([True, True, True])))
+
+
+def test_beta_adjusted_excess_charges_the_book_for_its_market_exposure():
+    """
+    A beta-1.5 book in a market that rose 2% is expected to make 3% with no
+    skill at all. Making exactly 3% is worth zero.
+    """
+    assert beta_adjusted_excess(0.03, 0.02, 1.5) == pytest.approx(0.0)
+    assert beta_adjusted_excess(0.045, 0.02, 1.5) == pytest.approx(0.015)
+
+
+def test_beta_adjusted_excess_refuses_to_guess_an_unknown_beta():
+    """
+    Falling back to beta 1 would flatter exactly the high-beta book this
+    check exists to catch.
+    """
+    assert np.isnan(beta_adjusted_excess(0.03, 0.02, float("nan")))

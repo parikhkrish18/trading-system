@@ -245,3 +245,111 @@ def describe_book(*, allow_shorts: bool, strategy_mode: str, top_k: int, cost: f
         f"{strategy_mode} book, {sides}, top {top_k} per date, "
         f"minimum move {cost:.2%} (the round-trip cost)"
     )
+
+
+# --------------------------------------------------------------------------
+# Is the edge skill, or is it beta one level down?
+# --------------------------------------------------------------------------
+#
+# Ranking by the size of the predicted move selects, mechanically, for
+# stocks that move a lot. In a rising market a basket of high-volatility
+# names beats an equal-weight average of everything without anybody having
+# predicted anything — the same mistake as reporting a return with no
+# benchmark, except the unfair comparison is now hidden inside the choice
+# of benchmark rather than absent altogether.
+#
+# So the equal-weight universe is the wrong yardstick for a book that is
+# systematically more volatile than the universe. These build a fair one.
+
+
+def trailing_risk_profile(
+    frame: pd.DataFrame, vol_window: int = 20, beta_window: int = 60
+) -> pd.DataFrame:
+    """
+    Per (symbol, ts): trailing realised volatility and beta against the
+    equal-weight universe, both computed from past returns only.
+
+    `frame` needs symbol, ts and close. Returns a frame of
+    [symbol, ts, realized_vol, beta] suitable for merging back on.
+
+    Both windows look strictly backwards — rolling() over a date-sorted
+    price panel — so a row's risk profile is knowable at the moment the
+    screener would have picked it, not after the fact.
+    """
+    prices = frame.pivot_table(index="ts", columns="symbol", values="close").sort_index()
+    # fill_method=None: pandas' default pads a missing price forward, which
+    # would invent a 0% return on a day a symbol did not trade and quietly
+    # understate its volatility — exactly the number being measured here.
+    returns = prices.pct_change(fill_method=None)
+    market = returns.mean(axis=1)
+
+    vol = returns.rolling(vol_window, min_periods=vol_window // 2).std()
+    covariance = returns.rolling(beta_window, min_periods=beta_window // 2).cov(market)
+    market_var = market.rolling(beta_window, min_periods=beta_window // 2).var()
+    beta = covariance.div(market_var, axis=0)
+
+    out = (
+        vol.stack(future_stack=True).rename("realized_vol").to_frame()
+        .join(beta.stack(future_stack=True).rename("beta"))
+        .reset_index()
+    )
+    return out
+
+
+def volatility_matched_benchmark(
+    universe_returns: np.ndarray | pd.Series,
+    universe_vol: np.ndarray | pd.Series,
+    traded_mask: np.ndarray,
+    n_buckets: int = 10,
+) -> float:
+    """
+    What an unskilled basket of the SAME riskiness would have paid.
+
+    Every candidate row in the window is sorted into volatility buckets.
+    The benchmark is then the average forward return of those buckets,
+    weighted by how many of the actual picks came from each — i.e. "hold a
+    random selection with the picks' own volatility mix, and predict
+    nothing". Beating the equal-weight universe by taking more risk shows
+    up as a gap between this and the plain benchmark; beating THIS is the
+    part that would need explaining.
+
+    NaN when volatility is unknown for too much of the window to bucket.
+    """
+    returns = np.asarray(universe_returns, dtype=float)
+    vol = np.asarray(universe_vol, dtype=float)
+    traded = np.asarray(traded_mask, dtype=bool)
+    usable = np.isfinite(vol) & np.isfinite(returns)
+    if usable.sum() < n_buckets or not (traded & usable).any():
+        return float("nan")
+
+    buckets = pd.qcut(pd.Series(vol[usable]), n_buckets, labels=False, duplicates="drop")
+    frame = pd.DataFrame(
+        {"ret": returns[usable], "bucket": buckets.to_numpy(), "traded": traded[usable]}
+    )
+    bucket_return = frame.groupby("bucket")["ret"].mean()
+    picks_per_bucket = frame[frame["traded"]].groupby("bucket").size()
+    if picks_per_bucket.empty:
+        return float("nan")
+
+    weights = picks_per_bucket.reindex(bucket_return.index).fillna(0.0)
+    if weights.sum() == 0:
+        return float("nan")
+    return float((bucket_return * weights).sum() / weights.sum())
+
+
+def beta_adjusted_excess(
+    model_return_net: float, benchmark_return: float, picks_beta: float
+) -> float:
+    """
+    The return left after paying for the market exposure the book carried.
+
+    A book of beta 1.5 in a market that rose 1% is *expected* to make 1.5%
+    with no skill whatsoever. Subtracting beta x market leaves what the
+    picks did beyond being a leveraged bet on direction.
+
+    NaN beta (too little history) gives NaN rather than silently falling
+    back to beta 1, which would flatter a high-beta book.
+    """
+    if not np.isfinite(picks_beta) or not np.isfinite(model_return_net) or not np.isfinite(benchmark_return):
+        return float("nan")
+    return float(model_return_net - picks_beta * benchmark_return)

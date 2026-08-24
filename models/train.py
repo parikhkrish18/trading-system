@@ -51,11 +51,14 @@ from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
 from models.evaluation import (
+    beta_adjusted_excess,
     cross_sectional_excess,
     cross_sectional_zscore,
     describe_book,
     production_book_mask,
     trade_metrics,
+    trailing_risk_profile,
+    volatility_matched_benchmark,
 )
 from models.forecast.ensemble import EnsembleForecastModel
 from monitoring.alerts import configure_console_encoding
@@ -278,6 +281,13 @@ def run_walk_forward(
     # same book.
     book_top_k = 2 if settings.strategy_mode == "concentrated" else settings.screener_top_k
 
+    # Risk profile per (symbol, ts), for judging whether the book simply
+    # took more risk than the universe. Deliberately kept in its OWN frame
+    # and merged per fold rather than joined onto df: feature_columns()
+    # treats every unrecognised column as a model input, so joining these
+    # in would feed realised volatility and beta to the model as features.
+    risk_profile = trailing_risk_profile(df[["symbol", "ts", "close"]])
+
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     mlflow.set_experiment(model_name)
 
@@ -371,6 +381,30 @@ def run_walk_forward(
                 market,
                 round_trip_cost,
             )
+
+            # Ranking by size of predicted move selects, mechanically, for
+            # stocks that move a lot — so an equal-weight benchmark may be
+            # flattering a book that is simply more volatile than the
+            # universe. Measure the tilt, and price it.
+            fold_risk = test_df[["symbol", "ts"]].merge(risk_profile, on=["symbol", "ts"], how="left")
+            row_vol = fold_risk["realized_vol"].to_numpy()
+            row_beta = fold_risk["beta"].to_numpy()
+            picks_vol = float(np.nanmean(row_vol[traded_mask])) if traded_mask.any() else float("nan")
+            picks_beta = float(np.nanmean(row_beta[traded_mask])) if traded_mask.any() else float("nan")
+            risk_metrics = {
+                "picks_realized_vol": picks_vol,
+                "universe_realized_vol": float(np.nanmean(row_vol)),
+                "picks_beta": picks_beta,
+                "universe_beta": float(np.nanmean(row_beta)),
+                "vol_matched_benchmark": volatility_matched_benchmark(market, row_vol, traded_mask),
+                "beta_adjusted_excess": beta_adjusted_excess(
+                    metrics["model_return_net"], metrics["benchmark_return"], picks_beta
+                ),
+            }
+            risk_metrics["vol_matched_excess"] = float(
+                metrics["model_return_net"] - risk_metrics["vol_matched_benchmark"]
+            )
+            metrics = {**metrics, **risk_metrics}
             mlflow.log_metrics(
                 {
                     "mae": mae,
@@ -430,6 +464,13 @@ def run_walk_forward(
 # the two numbers it is the difference of, so the comparison can't be read
 # past by accident.
 SPREAD_COLUMNS = (
+    "picks_realized_vol",
+    "universe_realized_vol",
+    "picks_beta",
+    "universe_beta",
+    "vol_matched_benchmark",
+    "vol_matched_excess",
+    "beta_adjusted_excess",
     "directional_accuracy",
     "directional_accuracy_absolute",
     "directional_accuracy_when_confident",
@@ -507,6 +548,46 @@ def headline_verdict(results: pd.DataFrame) -> str:
         "money and would have made more doing nothing. Excess is the only one of "
         "these three numbers that measures skill."
     )
+
+    # Ranking by size of predicted move selects for volatile stocks, and in a
+    # rising market those beat an equal-weight average without anyone having
+    # predicted anything. If the book carries more risk than the universe,
+    # the number above is measuring that risk rather than skill.
+    if "picks_beta" in results.columns:
+        picks_beta = results["picks_beta"].dropna()
+        universe_beta = results["universe_beta"].dropna()
+        picks_vol = results["picks_realized_vol"].dropna()
+        universe_vol = results["universe_realized_vol"].dropna()
+        vol_excess = results.get("vol_matched_excess", pd.Series(dtype=float)).dropna()
+        beta_excess = results.get("beta_adjusted_excess", pd.Series(dtype=float)).dropna()
+
+        lines.append("")
+        lines.append("=== Is it skill, or is it risk? ===")
+        if not picks_vol.empty and not universe_vol.empty and universe_vol.mean():
+            lines.append(
+                f"daily volatility  : picks {picks_vol.mean():.4%} vs universe {universe_vol.mean():.4%} "
+                f"({picks_vol.mean() / universe_vol.mean():.2f}x)"
+            )
+        if not picks_beta.empty and not universe_beta.empty:
+            lines.append(f"beta vs universe  : picks {picks_beta.mean():.2f} vs universe {universe_beta.mean():.2f}")
+        if not vol_excess.empty:
+            wins = int((vol_excess > 0).sum())
+            lines.append(
+                f"EXCESS vs a same-volatility basket : {vol_excess.mean():+.4%} "
+                f"({wins}/{len(vol_excess)} folds positive)"
+            )
+        if not beta_excess.empty:
+            wins = int((beta_excess > 0).sum())
+            lines.append(
+                f"EXCESS after paying for beta       : {beta_excess.mean():+.4%} "
+                f"({wins}/{len(beta_excess)} folds positive)"
+            )
+        lines.append(
+            "The equal-weight excess above is only meaningful if the picks carry the "
+            "universe's risk. Where they don't, these two are the honest numbers: "
+            "holding a random basket of equally volatile names, and paying for the "
+            "market exposure the book actually carried."
+        )
     return "\n".join(lines)
 
 
