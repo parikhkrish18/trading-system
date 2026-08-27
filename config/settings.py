@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     # --- MLflow ---
     mlflow_tracking_uri: str = Field(default="http://localhost:5000", alias="MLFLOW_TRACKING_URI")
 
+    # --- Dashboard (HTTP Basic Auth; see monitoring/dashboard/server.py) ---
+    dashboard_user: str = Field(default="admin", alias="DASHBOARD_USER")
+    # No default on purpose: with this empty the dashboard only serves on loopback.
+    dashboard_password: str = Field(default="", alias="DASHBOARD_PASSWORD")
+
     # --- Alerts ---
     slack_webhook_url: str = Field(default="", alias="SLACK_WEBHOOK_URL")
 

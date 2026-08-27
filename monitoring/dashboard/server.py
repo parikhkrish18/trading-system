@@ -13,7 +13,9 @@ Usage:
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import hmac
 import json
 import subprocess
 import sys
@@ -21,7 +23,8 @@ from pathlib import Path
 
 import mlflow
 import pandas as pd
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
@@ -39,6 +42,45 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 LAST_TEST_RUN_PATH = REPO_ROOT / "logs" / "last_test_run.json"
 
 app = FastAPI(title="Trading System Monitor")
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _check_basic_auth(request: Request) -> PlainTextResponse | None:
+    """HTTP Basic Auth for every request (API and static page alike).
+
+    Returns a response to short-circuit with, or None to let the request
+    through. With DASHBOARD_PASSWORD unset, only requests arriving on a
+    loopback interface are served — any other interface fails closed instead of
+    exposing positions and the test runner to the public internet.
+    """
+    password = settings.dashboard_password
+    server_host = (request.scope.get("server") or ("", 0))[0]
+    if not password:
+        if server_host in _LOOPBACK_HOSTS:
+            return None
+        return PlainTextResponse(
+            "DASHBOARD_PASSWORD is not set; refusing to serve on a non-loopback interface.",
+            status_code=503,
+        )
+    scheme, _, encoded = request.headers.get("authorization", "").partition(" ")
+    ok = False
+    if scheme.lower() == "basic":
+        try:
+            user, _, supplied = base64.b64decode(encoded).decode().partition(":")
+        except (ValueError, UnicodeDecodeError):
+            user = supplied = ""
+        ok = hmac.compare_digest(user, settings.dashboard_user) & hmac.compare_digest(supplied, password)
+    if ok:
+        return None
+    return PlainTextResponse(
+        "Unauthorized", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Trading System Monitor"'}
+    )
+
+
+@app.middleware("http")
+async def _basic_auth_middleware(request: Request, call_next):
+    return _check_basic_auth(request) or await call_next(request)
 
 
 def _clean_records(df: pd.DataFrame) -> list[dict]:
