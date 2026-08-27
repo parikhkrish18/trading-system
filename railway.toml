@@ -1,0 +1,6 @@
+# Build config for every Railway service deployed from this repo. Build-only
+# on purpose: a startCommand here would override the per-service start
+# commands (the two cron services run different modules than the dashboard).
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "monitoring/dashboard/Dockerfile"
