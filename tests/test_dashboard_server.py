@@ -72,6 +72,64 @@ def test_positions_joins_latest_decision_and_parses_reasoning(monkeypatch, clien
     assert body[0]["decision"]["reasoning"] == [{"feature_name": "sentiment_mean_10d", "value": 0.4, "contribution": 0.01}]
 
 
+def test_positions_include_exit_levels_when_recorded(monkeypatch, client):
+    from execution.exit_levels import ExitLevels
+
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeBroker([{"symbol": "TSLA", "qty": 68.7, "side": "long", "avg_entry_price": 300.0,
+                               "current_price": 310.0, "market_value": 21000.0, "cost_basis": 20600.0,
+                               "unrealized_pl": 400.0, "unrealized_plpc": 0.019}]),
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "reasoning"]))
+    monkeypatch.setattr(
+        server, "load_exit_levels",
+        lambda engine: {"TSLA": ExitLevels(take_profit_pct=0.07, stop_loss_pct=0.05, derived=True)},
+    )
+
+    resp = client.get("/api/positions")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body[0]["exit_levels"] == {"take_profit_pct": 0.07, "stop_loss_pct": 0.05, "derived": True}
+
+
+def test_positions_exit_levels_null_when_not_recorded(monkeypatch, client):
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeBroker([{"symbol": "ORPHAN", "qty": 1.0, "side": "long", "avg_entry_price": 10.0,
+                               "current_price": 10.0, "market_value": 10.0, "cost_basis": 10.0,
+                               "unrealized_pl": 0.0, "unrealized_plpc": 0.0}]),
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "reasoning"]))
+    monkeypatch.setattr(server, "load_exit_levels", lambda engine: {})
+
+    resp = client.get("/api/positions")
+    assert resp.json()[0]["exit_levels"] is None
+
+
+def test_positions_exit_levels_load_failure_degrades_gracefully(monkeypatch, client):
+    """A broken exit-levels lookup must not take down the whole positions panel."""
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeBroker([{"symbol": "TSLA", "qty": 1.0, "side": "long", "avg_entry_price": 10.0,
+                               "current_price": 10.0, "market_value": 10.0, "cost_basis": 10.0,
+                               "unrealized_pl": 0.0, "unrealized_plpc": 0.0}]),
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "reasoning"]))
+
+    def _boom(engine):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(server, "load_exit_levels", _boom)
+
+    resp = client.get("/api/positions")
+    assert resp.status_code == 200
+    assert resp.json()[0]["exit_levels"] is None
+
+
 def test_positions_no_matching_decision_is_null(monkeypatch, client):
     monkeypatch.setattr(
         server, "get_broker",
@@ -256,6 +314,85 @@ def test_live_accuracy_with_only_backfill_rows_reports_no_live_number(monkeypatc
     assert body["hit_rate"] is None  # nothing real has matured — say so, don't borrow history
     assert body["n_matured"] == 0
     assert body["backfill"]["n_matured"] == 1
+
+
+def test_drift_no_decisions_returns_unavailable(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "forecast", "reasoning"]))
+
+    body = client.get("/api/analysis/drift").json()
+    assert body["available"] is False
+    assert body["weekly"] == []
+    assert body["feature_drag"] == []
+
+
+def test_drift_no_matured_decisions_says_so(monkeypatch, client):
+    decisions = pd.DataFrame(
+        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "reasoning": [None]}
+    )
+    prices = pd.DataFrame(columns=["symbol", "ts", "close"])  # nothing to grade against yet
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    body = client.get("/api/analysis/drift").json()
+    assert body["available"] is False
+    assert "matured" in body["message"].lower()
+
+
+def test_drift_flags_when_recent_weeks_undercut_the_walkforward_baseline(monkeypatch, client):
+    """3 straight weeks of real misses against a strong baseline should flag."""
+    phase2 = json.dumps([{"phase": 2, "title": "x", "summary": "x", "lines": [], "top_features": [{"feature_name": "mom_ret_5d", "value": 0.1, "contribution": 0.01}]}])
+    weeks = [pd.Timestamp("2026-08-03"), pd.Timestamp("2026-08-10"), pd.Timestamp("2026-08-17")]
+    rows, price_rows = [], []
+    for w in weeks:
+        for i in range(5):
+            ts = w + pd.Timedelta(days=i)
+            rows.append({"symbol": f"S{i}", "ts": ts.tz_localize("UTC"), "forecast": 0.5, "reasoning": phase2})
+            # forecast is up; price goes DOWN the next day -> a miss every time
+            price_rows.append({"symbol": f"S{i}", "ts": ts.tz_localize("UTC"), "close": 100.0})
+            price_rows.append({"symbol": f"S{i}", "ts": (ts + pd.Timedelta(days=1)).tz_localize("UTC"), "close": 90.0})
+    decisions = pd.DataFrame(rows)
+    prices = pd.DataFrame(price_rows)
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+    monkeypatch.setattr(
+        server.report_card, "fetch_fold_runs",
+        lambda tracking_uri: [{"run_name": "f0", "fold_id": "0", "metrics": {"directional_accuracy": 0.55}}],
+    )
+
+    body = client.get("/api/analysis/drift").json()
+    assert body["available"] is True
+    assert body["baseline_accuracy"] == pytest.approx(0.55)
+    assert body["accuracy_flag"]["flagged"] is True
+    assert len(body["weekly"]) == 3
+    # every decision cited mom_ret_5d and every one missed -> hit_rate 0.0
+    drag = {r["feature_name"]: r for r in body["feature_drag"]}
+    assert drag["mom_ret_5d"]["hit_rate"] == pytest.approx(0.0)
+    assert drag["mom_ret_5d"]["n"] == 15
+
+
+def test_drift_baseline_unavailable_when_mlflow_is_down(monkeypatch, client):
+    decisions = pd.DataFrame(
+        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "reasoning": [None]}
+    )
+    prices = pd.DataFrame(
+        {"symbol": ["AAPL", "AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z", "2026-07-28T00:00:00Z"]), "close": [100.0, 105.0]}
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    def _boom(tracking_uri):
+        raise RuntimeError("mlflow unreachable")
+
+    monkeypatch.setattr(server.report_card, "fetch_fold_runs", _boom)
+
+    body = client.get("/api/analysis/drift").json()
+    assert body["available"] is True  # live data is still shown even without a baseline to compare against
+    assert body["baseline_accuracy"] is None
+    assert body["accuracy_flag"]["flagged"] is False
 
 
 def test_closed_trades_reconstructs_a_round_trip(monkeypatch, client):

@@ -6,6 +6,7 @@ from models.regime.trend_chop_classifier import TREND
 from models.screener import (
     TradeCandidate,
     _attach_reasoning,
+    apply_short_preference,
     attach_exit_levels,
     build_correlation_matrix,
     daily_volatility,
@@ -181,6 +182,126 @@ def test_select_trades_shortable_check_does_not_affect_longs():
     )
 
     assert len(candidates) == 1
+
+
+class TestApplyShortPreference:
+    """
+    apply_short_preference adds a `rank_score` column used only to decide
+    WHICH candidates get selected — the long/short preference the user asked
+    for (slight edge to longs, waived for a confident short with contained
+    downside). It must never touch conviction_score itself, which sizing
+    still reads unmodified.
+    """
+
+    def test_no_op_when_penalty_is_zero(self):
+        scored = _scored_df(
+            [
+                {"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True},
+                {"symbol": "TSLA", "predicted_return": -0.05, "direction_agreement": 1.0, "confident": True},
+            ]
+        )
+        out = apply_short_preference(scored, vol_by_symbol={}, horizon_days=20, penalty=0.0, low_risk_stop_loss_pct=0.06)
+        assert (out["rank_score"] == out["conviction_score"]).all()
+        # conviction_score itself is untouched
+        assert out["conviction_score"].tolist() == scored["conviction_score"].tolist()
+
+    def test_longs_are_never_handicapped(self):
+        scored = _scored_df(
+            [{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+        )
+        out = apply_short_preference(scored, vol_by_symbol={}, horizon_days=20, penalty=0.15, low_risk_stop_loss_pct=0.06)
+        assert out.loc[0, "rank_score"] == pytest.approx(out.loc[0, "conviction_score"])
+
+    def test_risky_short_is_handicapped(self):
+        """High volatility -> wide derived stop-loss -> above the low-risk bar -> full penalty applies."""
+        scored = _scored_df(
+            [{"symbol": "TSLA", "predicted_return": -0.05, "direction_agreement": 1.0, "confident": True}]
+        )
+        out = apply_short_preference(
+            scored, vol_by_symbol={"TSLA": 0.08}, horizon_days=20, penalty=0.15, low_risk_stop_loss_pct=0.06,
+        )
+        assert out.loc[0, "rank_score"] == pytest.approx(out.loc[0, "conviction_score"] * 0.85)
+        # conviction_score itself is untouched — sizing later reads this, not rank_score
+        assert out.loc[0, "conviction_score"] == pytest.approx(0.05)
+
+    def test_low_risk_confident_short_is_exempted(self):
+        """Low volatility -> tight derived stop-loss -> at/below the low-risk bar -> no handicap."""
+        scored = _scored_df(
+            [{"symbol": "KO", "predicted_return": -0.05, "direction_agreement": 1.0, "confident": True}]
+        )
+        # A calm stock: small daily vol -> small horizon-sigma -> stop-loss lands under the 0.06 bar.
+        out = apply_short_preference(
+            scored, vol_by_symbol={"KO": 0.003}, horizon_days=20, penalty=0.15, low_risk_stop_loss_pct=0.06,
+        )
+        assert out.loc[0, "rank_score"] == pytest.approx(out.loc[0, "conviction_score"])
+
+    def test_unmeasurable_volatility_does_not_qualify_for_the_exemption(self):
+        """No vol data -> exit_levels_for falls back to the global default stop-loss (wider than 0.06) -> handicapped."""
+        scored = _scored_df(
+            [{"symbol": "NEWCO", "predicted_return": -0.05, "direction_agreement": 1.0, "confident": True}]
+        )
+        out = apply_short_preference(
+            scored, vol_by_symbol={}, horizon_days=20, penalty=0.15, low_risk_stop_loss_pct=0.06,
+        )
+        assert out.loc[0, "rank_score"] == pytest.approx(out.loc[0, "conviction_score"] * 0.85)
+
+    def test_empty_input(self):
+        out = apply_short_preference(pd.DataFrame(), vol_by_symbol={}, horizon_days=20, penalty=0.15, low_risk_stop_loss_pct=0.06)
+        assert out.empty
+
+
+class TestSelectionRespectsRankScoreCol:
+    def test_select_trades_uses_rank_score_when_given(self):
+        """
+        Without a preference, TSLA (conviction 0.06) would outrank AAPL
+        (0.05). A rank_score that reverses that ordering must change who
+        gets the single top_k=1 slot — proving the ranking column, not
+        conviction_score, decides selection order when provided.
+        """
+        scored = _scored_df(
+            [
+                {"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True},
+                {"symbol": "TSLA", "predicted_return": -0.06, "direction_agreement": 1.0, "confident": True},
+            ]
+        )
+        scored["rank_score"] = [0.05, 0.03]  # TSLA's short handicapped below AAPL's long
+        corr = pd.DataFrame({"AAPL": [1.0, 0.0], "TSLA": [0.0, 1.0]}, index=["AAPL", "TSLA"])
+
+        candidates = select_trades(
+            scored, regime=TREND, forecast_scale=0.05, max_position_pct=0.25,
+            max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr,
+            top_k=1, rank_score_col="rank_score",
+        )
+        assert [c.symbol for c in candidates] == ["AAPL"]
+
+    def test_select_trades_falls_back_to_conviction_score_when_column_missing(self):
+        scored = _scored_df(
+            [{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+        )
+        corr = pd.DataFrame({"AAPL": [1.0]}, index=["AAPL"])
+        candidates = select_trades(
+            scored, regime=TREND, forecast_scale=0.05, max_position_pct=0.25,
+            max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr,
+            rank_score_col="rank_score",  # not present on `scored` -> must not raise, falls back
+        )
+        assert len(candidates) == 1
+
+    def test_select_concentrated_trades_uses_rank_score_when_given(self):
+        scored = _scored_df(
+            [
+                {"symbol": "AAPL", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
+                {"symbol": "TSLA", "predicted_return": -0.06, "direction_agreement": 1.0, "confident": True},
+                {"symbol": "MMM", "predicted_return": 0.015, "direction_agreement": 1.0, "confident": True},
+            ]
+        )
+        # Raw conviction order would be TSLA(0.06) > AAPL(0.02) > MMM(0.015) -> top 2 = TSLA, AAPL.
+        # Handicap TSLA below MMM so the top 2 becomes AAPL, MMM instead.
+        scored["rank_score"] = [0.02, 0.01, 0.015]
+        candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30, rank_score_col="rank_score")
+        assert {c.symbol for c in candidates} == {"AAPL", "MMM"}
+        # sizing weight still uses the real conviction_score (0.02 vs 0.015), not rank_score
+        by_symbol = {c.symbol: c for c in candidates}
+        assert by_symbol["AAPL"].target_position_pct > by_symbol["MMM"].target_position_pct
 
 
 def test_select_concentrated_trades_splits_by_relative_conviction():

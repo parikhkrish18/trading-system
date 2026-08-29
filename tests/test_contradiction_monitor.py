@@ -3,6 +3,7 @@ import pytest
 
 from execution import contradiction_monitor as cm
 from execution.approval_gate import ApprovalOutcome, number_proposals
+from execution.exit_levels import ExitLevels
 
 
 def _past_the_brake() -> float:
@@ -190,6 +191,115 @@ def test_agreeing_signals_leave_the_position_open(monkeypatch):
 
     assert broker.closed == []
     assert not results[0].closed
+
+
+def test_stop_loss_hit_closes_a_position_with_no_news_or_momentum_contradiction(monkeypatch):
+    """
+    The point of the swing-trade fix: a position's OWN stop/target can close
+    it on this hourly check, even when news sentiment and price momentum
+    both agree with the held side — it doesn't have to wait for the weekly
+    cycle just because nothing else tripped.
+    """
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
+    monkeypatch.setattr(
+        cm, "current_pnl_by_symbol", lambda broker: {"AAPL": (-0.09, -900.0)}
+    )
+    monkeypatch.setattr(
+        cm.hold_rules, "load_exit_levels",
+        lambda engine: {"AAPL": ExitLevels(take_profit_pct=0.15, stop_loss_pct=0.07)},
+    )
+    monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+
+    results = cm.run_contradiction_check()
+
+    assert broker.closed == ["AAPL"]
+    assert results[0].closed
+    assert results[0].reasons[0]["signal"] == "stop_loss"
+
+
+def test_take_profit_hit_closes_a_position_and_is_worded_as_a_target_not_a_contradiction(monkeypatch):
+    """
+    Hitting a take-profit is the trade working as intended, not a
+    contradiction — the human-facing reasoning (monitoring/reasoning.py's
+    phase_contradiction) must not describe a good outcome the same way it
+    describes news/momentum actually turning against the position.
+    """
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    monkeypatch.setattr(
+        cm, "current_pnl_by_symbol", lambda broker: {"AAPL": (0.16, 1600.0)}
+    )
+    monkeypatch.setattr(
+        cm.hold_rules, "load_exit_levels",
+        lambda engine: {"AAPL": ExitLevels(take_profit_pct=0.15, stop_loss_pct=0.07)},
+    )
+    monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+    captured = {}
+
+    def _capture_and_approve(proposals, **k):
+        proposals = list(proposals)
+        captured["proposals"] = proposals
+        return _approve_all(proposals, **k)
+
+    monkeypatch.setattr(cm, "request_approval", _capture_and_approve)
+
+    results = cm.run_contradiction_check()
+
+    assert broker.closed == ["AAPL"]
+    assert results[0].reasons[0]["signal"] == "take_profit"
+    proposal = captured["proposals"][0]
+    summary = proposal.reasoning[0]["summary"]
+    # Not literally "not a contradiction" as a string match — the wording is
+    # free to change — but it must not open with the old blanket phrasing
+    # that would describe a target hit the same way as news/momentum
+    # actually turning against the position.
+    assert not summary.lower().startswith("contradiction detected via")
+    assert "target" in summary.lower()
+
+
+def test_exit_levels_lookup_failure_falls_back_to_global_settings(monkeypatch):
+    """
+    A read failure on position_hold_state must not skip the stop/target
+    check for every held position — it should just fall back to the global
+    HOLD_STOP_LOSS_PCT/HOLD_TAKE_PROFIT_PCT, the same degrade-gracefully
+    posture the dashboard's positions endpoint uses for the same table.
+    """
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    monkeypatch.setattr(
+        cm, "current_pnl_by_symbol",
+        lambda broker: {"AAPL": (-(cm.settings.hold_stop_loss_pct + 0.01), -100.0)},
+    )
+
+    def _boom(engine):
+        raise RuntimeError("position_hold_state is missing")
+
+    monkeypatch.setattr(cm.hold_rules, "load_exit_levels", _boom)
+    monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+
+    results = cm.run_contradiction_check()
+
+    assert broker.closed == ["AAPL"]
+    assert results[0].reasons[0]["signal"] == "stop_loss"
 
 
 def test_sparse_news_does_not_trigger_even_with_strong_sentiment(monkeypatch):

@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 from execution.exit_levels import ExitLevels
 from execution.hold_rules import (
     HoldDecision,
+    check_stop_or_target,
     evaluate_holds,
     load_exit_levels,
     load_missed_cycles,
@@ -32,6 +33,39 @@ def _decide(positions, shortlist=(), predictions=None, pnl=None, prior=None, **o
 
 def _one(decisions, symbol) -> HoldDecision:
     return next(d for d in decisions if d.symbol == symbol)
+
+
+class TestCheckStopOrTarget:
+    """
+    The shared building block behind both evaluate_holds' stop/target check
+    (weekly cycle) and contradiction_monitor's hourly one — a swing trade
+    should close when ITS OWN target/stop is hit, not wait on whichever
+    clock happens to run next.
+    """
+
+    def test_no_pnl_is_no_verdict(self):
+        assert check_stop_or_target(None, None, fallback_stop_loss_pct=0.08, fallback_take_profit_pct=0.10) is None
+
+    def test_within_band_is_no_verdict(self):
+        assert check_stop_or_target(0.02, None, fallback_stop_loss_pct=0.08, fallback_take_profit_pct=0.10) is None
+
+    def test_uses_recorded_levels_over_fallback(self):
+        levels = ExitLevels(take_profit_pct=0.05, stop_loss_pct=0.03)
+        # -4% breaches the recorded 3% stop but not the 8% fallback -- recorded levels must win.
+        hit = check_stop_or_target(-0.04, levels, fallback_stop_loss_pct=0.08, fallback_take_profit_pct=0.10)
+        assert hit is not None
+        assert hit.kind == "stop_loss"
+        assert "3.0%" in hit.message
+
+    def test_falls_back_when_no_levels_recorded(self):
+        hit = check_stop_or_target(-0.09, None, fallback_stop_loss_pct=0.08, fallback_take_profit_pct=0.10)
+        assert hit.kind == "stop_loss"
+
+    def test_take_profit_hit(self):
+        levels = ExitLevels(take_profit_pct=0.05, stop_loss_pct=0.03)
+        hit = check_stop_or_target(0.06, levels, fallback_stop_loss_pct=0.08, fallback_take_profit_pct=0.10)
+        assert hit.kind == "take_profit"
+        assert "5.0%" in hit.message
 
 
 def test_first_missed_cycle_is_a_hold():
