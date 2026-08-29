@@ -685,7 +685,6 @@ function currentNewsFilter() {
 }
 
 // ---------- Tabs ----------
-let newsTabLoadedOnce = false;
 let activeTab = "overview";
 
 function switchTab(name) {
@@ -696,8 +695,15 @@ function switchTab(name) {
   document.querySelectorAll(".tab-btn").forEach((el) => {
     el.classList.toggle("active", el.dataset.tab === name);
   });
-  if (name === "news" && !newsTabLoadedOnce) {
-    newsTabLoadedOnce = true;
+  // Refetch every time the News tab is switched to, not just the first time.
+  // This used to be gated behind a "loaded once" flag so later switches were
+  // a no-op -- meaning anyone who opened this tab while the stream was
+  // quiet or (until the news-stream crash-loop fix) actually down got stuck
+  // looking at a stale/empty snapshot forever, with no way back to fresh
+  // data short of the manual Refresh button. Given the whole point of this
+  // tab is "real news, right now," switching to it should always show
+  // what's actually in the database at that moment.
+  if (name === "news") {
     loadLiveNews(currentNewsFilter());
   }
 }
@@ -735,10 +741,14 @@ document.getElementById("news-symbol-filter").addEventListener("keydown", (e) =>
 // The status strip re-polls on its own, lightweight timer — a full loadAll()
 // only runs on page load or the Refresh button, but "last headline Xm ago"
 // visibly going stale while the tab sits open would undercut the entire
-// point of a liveness indicator.
+// point of a liveness indicator. Same reasoning now covers the news list
+// itself: if someone leaves the News tab open to watch headlines arrive,
+// it should actually update on its own rather than freezing at whatever
+// was on screen when they switched to it.
 setInterval(() => {
   loadNewsStatus();
   loadMarketStatus();
+  if (activeTab === "news") loadLiveNews(currentNewsFilter());
 }, 60_000);
 
 loadAll();
