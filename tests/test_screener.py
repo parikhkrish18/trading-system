@@ -297,7 +297,7 @@ class TestSelectionRespectsRankScoreCol:
         # Raw conviction order would be TSLA(0.06) > AAPL(0.02) > MMM(0.015) -> top 2 = TSLA, AAPL.
         # Handicap TSLA below MMM so the top 2 becomes AAPL, MMM instead.
         scored["rank_score"] = [0.02, 0.01, 0.015]
-        candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30, rank_score_col="rank_score")
+        candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, rank_score_col="rank_score")
         assert {c.symbol for c in candidates} == {"AAPL", "MMM"}
         # sizing weight still uses the real conviction_score (0.02 vs 0.015), not rank_score
         by_symbol = {c.symbol: c for c in candidates}
@@ -312,7 +312,7 @@ def test_select_concentrated_trades_splits_by_relative_conviction():
         ]
     )
     # conviction_score: AAPL=0.04, TSLA=0.02 -> raw split 2:1 -> 0.667/0.333, within [0.30, 0.70] bounds.
-    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
 
     assert len(candidates) == 2
     by_symbol = {c.symbol: c for c in candidates}
@@ -330,7 +330,7 @@ def test_select_concentrated_trades_clamps_dominant_leg_at_bound():
         ]
     )
     # Raw split would be ~98/2 — clamped to 70/30 so one pick can't swallow the whole deployment.
-    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
 
     by_symbol = {c.symbol: c for c in candidates}
     assert by_symbol["AAPL"].target_position_pct == pytest.approx(0.70)
@@ -344,7 +344,7 @@ def test_select_concentrated_trades_signs_match_forecast_direction():
             {"symbol": "TSLA", "predicted_return": -0.02, "direction_agreement": 1.0, "confident": True},
         ]
     )
-    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
     by_symbol = {c.symbol: c for c in candidates}
     assert by_symbol["AAPL"].side == "long"
     assert by_symbol["AAPL"].target_position_pct > 0
@@ -356,7 +356,7 @@ def test_select_concentrated_trades_single_confident_candidate_goes_all_in():
     scored = _scored_df(
         [{"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True}]
     )
-    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
 
     assert len(candidates) == 1
     assert candidates[0].target_position_pct == pytest.approx(1.0)
@@ -366,7 +366,7 @@ def test_select_concentrated_trades_no_confident_candidates_returns_empty():
     scored = _scored_df(
         [{"symbol": "AAPL", "predicted_return": 0.20, "direction_agreement": 0.55, "confident": False}]
     )
-    assert select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30) == []
+    assert select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6) == []
 
 
 def test_select_concentrated_trades_respects_total_deploy_pct():
@@ -377,7 +377,7 @@ def test_select_concentrated_trades_respects_total_deploy_pct():
             {"symbol": "TSLA", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
         ]
     )
-    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30, total_deploy_pct=0.35)
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, total_deploy_pct=0.35)
     assert sum(abs(c.target_position_pct) for c in candidates) == pytest.approx(0.35)
 
 
@@ -390,7 +390,7 @@ def test_select_concentrated_trades_skips_unshortable_and_falls_through_ranking(
         ]
     )
     candidates = select_concentrated_trades(
-        scored, max_leg_pct=0.70, min_leg_pct=0.30,
+        scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6,
         is_shortable_fn=lambda symbol: symbol != "TSLA",
     )
 
@@ -398,9 +398,61 @@ def test_select_concentrated_trades_skips_unshortable_and_falls_through_ranking(
     assert symbols == {"AAPL", "MSFT"}  # TSLA skipped, next two ranked candidates picked instead
 
 
+def test_select_concentrated_trades_respects_max_positions_cap():
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.06, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "MSFT", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "NVDA", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": 0.03, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, max_positions=3)
+    assert {c.symbol for c in candidates} == {"AAPL", "MSFT", "NVDA"}  # top 3 by conviction, TSLA dropped
+    assert sum(abs(c.target_position_pct) for c in candidates) == pytest.approx(1.0)
+
+
+def test_select_concentrated_trades_splits_three_legs_weighted_with_a_floor():
+    """
+    Regression coverage for the min 2 / max 3 concentrated book: the raw
+    proportional split (60/30/10) would squeeze the third pick to a token
+    10% sliver -- the floor (0.6 * 1/3 = 20%) rescues it to a real size,
+    and the freed 10% redistributes across the other two by their own
+    relative conviction (2:1), not evenly.
+    """
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.06, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "MSFT", "predicted_return": 0.03, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "NVDA", "predicted_return": 0.01, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, max_positions=3)
+
+    assert len(candidates) == 3
+    by_symbol = {c.symbol: c for c in candidates}
+    assert by_symbol["NVDA"].target_position_pct == pytest.approx(0.20)
+    assert by_symbol["AAPL"].target_position_pct == pytest.approx(0.5333333, rel=1e-4)
+    assert by_symbol["MSFT"].target_position_pct == pytest.approx(0.2666667, rel=1e-4)
+    assert sum(abs(c.target_position_pct) for c in candidates) == pytest.approx(1.0)
+
+
+def test_select_concentrated_trades_never_forces_a_third_pick_to_hit_max_positions():
+    """max_positions=3 but only 2 clear the confidence bar -- the cap is a ceiling, never a floor to force-fill."""
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "MSFT", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "NVDA", "predicted_return": 0.001, "direction_agreement": 0.55, "confident": False},
+        ]
+    )
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, max_positions=3)
+    assert {c.symbol for c in candidates} == {"AAPL", "MSFT"}
+
+
 def test_attach_reasoning_picks_top_features_by_absolute_contribution():
     scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
-    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_pct=0.30)
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [1.5], "f2": [-0.5], "f3": [0.1]})
     # Indexed by symbol, matching what _attach_reasoning's X (latest.set_index("symbol")) actually looks like.
     contributions = pd.DataFrame(
@@ -410,7 +462,7 @@ def test_attach_reasoning_picks_top_features_by_absolute_contribution():
 
     _attach_reasoning(
         candidates, ensemble, latest, feature_cols=["f1", "f2", "f3"], scored=scored, regime=TREND,
-        max_leg_pct=0.70, min_leg_pct=0.30, top_n=2,
+        max_leg_pct=0.70, min_leg_floor_fraction=0.6, top_n=2,
     )
 
     phases = {p["phase"]: p for p in candidates[0].reasoning}
@@ -424,7 +476,7 @@ def test_attach_reasoning_empty_candidates_is_noop():
     ensemble = _FakeEnsemble(mean_prediction=[], direction_agreement=[])
     _attach_reasoning(
         [], ensemble, pd.DataFrame(), feature_cols=[], scored=pd.DataFrame({"confident": []}),
-        regime=TREND, max_leg_pct=0.70, min_leg_pct=0.30,    )  # should not raise
+        regime=TREND, max_leg_pct=0.70, min_leg_floor_fraction=0.6,    )  # should not raise
 
 
 # --- strategy dispatch ----------------------------------------------------
@@ -508,6 +560,29 @@ def test_run_screen_concentrated_mode_uses_the_two_trade_split(monkeypatch):
     assert "concentrated" in calls and "diversified" not in calls
 
 
+def test_run_screen_concentrated_mode_passes_position_count_and_split_settings(monkeypatch):
+    scr, calls = _run_screen_harness(monkeypatch, "concentrated")
+    monkeypatch.setattr(scr.settings, "max_concentrated_position_pct", 0.70)
+    monkeypatch.setattr(scr.settings, "min_concentrated_leg_floor_fraction", 0.6)
+    monkeypatch.setattr(scr.settings, "max_concentrated_positions", 3)
+
+    scr.run_screen("v3", ["A"])
+
+    assert calls["concentrated"]["max_leg_pct"] == 0.70
+    assert calls["concentrated"]["min_leg_floor_fraction"] == 0.6
+    assert calls["concentrated"]["max_positions"] == 3
+
+
+def test_run_screen_concentrated_mode_max_positions_override_wins_over_setting(monkeypatch):
+    """execution/contradiction_monitor.py's reactivation passes this to cap new picks at the open slot count."""
+    scr, calls = _run_screen_harness(monkeypatch, "concentrated")
+    monkeypatch.setattr(scr.settings, "max_concentrated_positions", 3)
+
+    scr.run_screen("v3", ["A"], max_positions_override=1)
+
+    assert calls["concentrated"]["max_positions"] == 1
+
+
 def test_run_screen_diversified_scales_sizes_by_the_freed_capital_fraction(monkeypatch):
     from models.screener import TradeCandidate
 
@@ -555,7 +630,7 @@ def test_attach_reasoning_diversified_wording_tells_the_topk_story():
 
     _attach_reasoning(
         candidates, ensemble, latest, feature_cols=["f1"], scored=scored, regime=TREND,
-        max_leg_pct=0.70, min_leg_pct=0.30,        strategy="diversified", top_k=10,
+        max_leg_pct=0.70, min_leg_floor_fraction=0.6,        strategy="diversified", top_k=10,
     )
 
     phase4 = next(p for p in candidates[0].reasoning if p["phase"] == 4)

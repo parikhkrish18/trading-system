@@ -156,7 +156,7 @@ def test_concentrated_split_skips_shorts_and_falls_through_the_ranking():
     )
 
     candidates = select_concentrated_trades(
-        scored, max_leg_pct=0.70, min_leg_pct=0.30, allow_shorts=False
+        scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, allow_shorts=False
     )
 
     assert [c.symbol for c in candidates] == ["AAPL", "MMM"]
@@ -175,7 +175,7 @@ def test_concentrated_split_keeps_shorts_when_allowed():
     )
 
     candidates = select_concentrated_trades(
-        scored, max_leg_pct=0.70, min_leg_pct=0.30, allow_shorts=True
+        scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, allow_shorts=True
     )
 
     assert {c.side for c in candidates} == {"short", "long"}
@@ -187,7 +187,7 @@ def test_concentrated_split_with_only_shorts_available_returns_nothing():
     )
 
     assert select_concentrated_trades(
-        scored, max_leg_pct=0.70, min_leg_pct=0.30, allow_shorts=False
+        scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, allow_shorts=False
     ) == []
 
 

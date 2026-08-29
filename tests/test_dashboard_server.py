@@ -218,21 +218,6 @@ def test_analysis_runs_endpoint_returns_records(monkeypatch, client):
     assert body[0]["directional_accuracy"] == pytest.approx(0.52)
 
 
-def test_last_test_run_returns_none_when_no_cache(monkeypatch, client, tmp_path):
-    monkeypatch.setattr(server, "LAST_TEST_RUN_PATH", tmp_path / "last_test_run.json")
-    resp = client.get("/api/tests/last")
-    assert resp.json() is None
-
-
-def test_last_test_run_returns_cached_result(monkeypatch, client, tmp_path):
-    cache_path = tmp_path / "last_test_run.json"
-    cache_path.write_text(json.dumps({"ts": "2026-07-29T00:00:00Z", "passed": True, "summary": "5 passed", "output": "..."}))
-    monkeypatch.setattr(server, "LAST_TEST_RUN_PATH", cache_path)
-
-    resp = client.get("/api/tests/last")
-    assert resp.json()["passed"] is True
-
-
 def test_live_accuracy_no_decisions_returns_null_hit_rate(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "forecast", "mode"]))
@@ -552,23 +537,6 @@ def test_feature_frequency_skips_old_decisions_without_top_features(monkeypatch,
     assert resp.json() == []
 
 
-def test_run_tests_executes_subprocess_and_caches(monkeypatch, client, tmp_path):
-    class _FakeResult:
-        returncode = 0
-        stdout = "..\n2 passed in 0.1s\n"
-        stderr = ""
-
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _FakeResult())
-    monkeypatch.setattr(server, "LAST_TEST_RUN_PATH", tmp_path / "last_test_run.json")
-
-    resp = client.post("/api/tests/run")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["passed"] is True
-    assert "2 passed" in body["summary"]
-    assert (tmp_path / "last_test_run.json").exists()
-
-
 # --- model report card ------------------------------------------------------
 
 
@@ -621,131 +589,6 @@ def test_report_card_endpoint_unavailable_when_no_runs(monkeypatch, client):
     resp = client.get("/api/analysis/report_card")
 
     assert resp.json()["available"] is False
-
-
-# --- what-if thresholds -----------------------------------------------------
-
-
-def _whatif_batch():
-    ts = pd.Timestamp("2026-08-07T14:00:00Z")
-    return pd.DataFrame(
-        [
-            {
-                "ts": ts, "symbol": sym, "forecast": fc, "regime": "trend",
-                "target_position": tp, "executed_position": None, "mode": "paper",
-            }
-            for sym, fc, tp in [
-                ("AAPL", 0.05, 0.10),
-                ("TSLA", -0.02, -0.05),
-            ]
-        ]
-    )
-
-
-def test_whatif_endpoint_filters_by_the_move_slider(monkeypatch, client):
-    monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _whatif_batch())
-
-    resp = client.get("/api/whatif?min_abs_move=0.03")
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["available"] is True
-    assert body["n_before"] == 2
-    assert body["n_after"] == 1  # TSLA's 2% move fails a 3% bar
-    assert [r["Symbol"] for r in body["rows"]] == ["AAPL"]
-    assert "1 pick" in body["summary"]
-
-
-def test_whatif_endpoint_no_longer_takes_or_reports_agreement(monkeypatch, client):
-    """
-    The agreement slider went with the threshold it tuned. An unknown query
-    parameter must be ignored rather than filtering on a number that
-    predicts nothing.
-    """
-    monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _whatif_batch())
-
-    body = client.get("/api/whatif?min_agreement=0.99").json()
-
-    assert body["n_after"] == 2  # nothing was filtered
-    assert "min_agreement" not in body
-    assert not any("agreement" in str(k).lower() for k in body["rows"][0])
-
-
-def test_whatif_endpoint_with_no_decisions_at_all(monkeypatch, client):
-    monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
-
-    resp = client.get("/api/whatif")
-
-    body = resp.json()
-    assert body["available"] is False
-    assert body["rows"] == []
-
-
-# --- /api/tests/run auth gate ------------------------------------------------
-
-
-class _FakePytestResult:
-    returncode = 0
-    stdout = "..\n2 passed in 0.1s\n"
-    stderr = ""
-
-
-@pytest.fixture
-def _runnable_tests(monkeypatch, tmp_path):
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _FakePytestResult())
-    monkeypatch.setattr(server, "LAST_TEST_RUN_PATH", tmp_path / "last_test_run.json")
-
-
-def test_run_tests_allowed_on_loopback_with_no_password_set(client, _runnable_tests):
-    """Local development needs no ceremony — the client fixture is already loopback, no password."""
-    resp = client.post("/api/tests/run")
-
-    assert resp.status_code == 200
-
-
-def test_run_tests_forbidden_on_open_interface_without_a_password(client, _runnable_tests):
-    """
-    An open bind with no password must refuse — never run subprocesses for
-    the whole network. `client` (loopback base_url) is only here for its
-    fixture side effect of pinning dashboard_password=""; what makes this
-    request "public" is the separate client's base_url below — the gate
-    reads the actual connection's host (request.scope["server"]), not the
-    dashboard_host setting.
-    """
-    public = TestClient(server.app, base_url="http://0.0.0.0")
-
-    resp = public.post("/api/tests/run")
-
-    assert resp.status_code == 503
-    assert "DASHBOARD_PASSWORD" in resp.text
-
-
-def test_run_tests_requires_the_session_cookie_when_a_password_is_configured(monkeypatch, client, _runnable_tests):
-    monkeypatch.setattr(server.settings, "dashboard_password", "sekrit")
-
-    no_cookie = client.post("/api/tests/run")
-
-    client.cookies.set(server._SESSION_COOKIE, "wrong")
-    wrong_cookie = client.post("/api/tests/run")
-
-    client.cookies.set(server._SESSION_COOKIE, server._session_token("sekrit"))
-    right_cookie = client.post("/api/tests/run")
-
-    assert no_cookie.status_code == 401
-    assert wrong_cookie.status_code == 401
-    assert right_cookie.status_code == 200
-
-
-def test_configured_password_is_checked_even_on_loopback(monkeypatch, client, _runnable_tests):
-    """Configuring a password means wanting it enforced — the loopback exemption is only for the blank case."""
-    monkeypatch.setattr(server.settings, "dashboard_password", "sekrit")
-
-    resp = client.post("/api/tests/run")
-
-    assert resp.status_code == 401
 
 
 # --------------------------------------------------------------------------

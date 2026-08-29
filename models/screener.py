@@ -321,38 +321,106 @@ def _make_candidate(row: pd.Series, weight: float, total_deploy_pct: float) -> T
     )
 
 
+def _bounded_conviction_weights(
+    scores: list[float],
+    max_leg_pct: float,
+    min_leg_floor_fraction: float,
+) -> list[float]:
+    """
+    Splits 1.0 across len(scores) legs proportional to conviction (each
+    score's share of the total), then bounds every leg two ways:
+
+      - never above `max_leg_pct` — one pick can't swallow the whole
+        allocation regardless of how many legs there are or how lopsided
+        the confidence gap is.
+      - never below `min_leg_floor_fraction` of what an EQUAL split would
+        have given that leg (1/n) — e.g. with 3 legs and
+        min_leg_floor_fraction=0.6, no leg is squeezed below
+        0.6 * 1/3 = 20%, so an also-ran third pick still gets a real,
+        tradeable slice instead of a token sliver. Expressed relative to
+        the equal share (not an absolute percentage) so the floor sums to
+        at most `min_leg_floor_fraction` (<= 1 by construction) and stays
+        feasible for any leg count, rather than being tuned for one
+        specific n.
+
+    Capped/floored legs are fixed first and the remaining allocation is
+    re-split by conviction among the still-free legs, iterating (like
+    water-filling) until every leg sits inside its bounds. Falls back to an
+    equal split only if the bounds are configured infeasibly (shouldn't
+    happen with the defaults above, for any n).
+    """
+    n = len(scores)
+    if n == 1:
+        return [1.0]
+
+    equal_share = 1.0 / n
+    min_leg_pct = min_leg_floor_fraction * equal_share
+    clipped_scores = [max(s, 0.0) for s in scores]
+    total = sum(clipped_scores)
+
+    fixed: list[float | None] = [None] * n
+    for _ in range(n):
+        free_idx = [i for i in range(n) if fixed[i] is None]
+        if not free_idx:
+            break
+        remaining = 1.0 - sum(fixed[i] for i in range(n) if fixed[i] is not None)
+        free_scores = [clipped_scores[i] for i in free_idx]
+        free_total = sum(free_scores)
+        proposal = (
+            {i: remaining / len(free_idx) for i in free_idx}
+            if free_total <= 0
+            else {i: remaining * clipped_scores[i] / free_total for i in free_idx}
+        )
+        any_violation = False
+        for i in free_idx:
+            if proposal[i] > max_leg_pct + 1e-9:
+                fixed[i] = max_leg_pct
+                any_violation = True
+            elif proposal[i] < min_leg_pct - 1e-9:
+                fixed[i] = min_leg_pct
+                any_violation = True
+        if not any_violation:
+            for i in free_idx:
+                fixed[i] = proposal[i]
+            break
+    else:
+        return [equal_share] * n
+
+    return [w if w is not None else equal_share for w in fixed]
+
+
 def select_concentrated_trades(
     scored: pd.DataFrame,
     max_leg_pct: float,
-    min_leg_pct: float,
+    min_leg_floor_fraction: float,
     total_deploy_pct: float = 1.0,
     is_shortable_fn: Callable[[str], bool] | None = None,
     allow_shorts: bool = True,
     rank_score_col: str | None = None,
+    max_positions: int = 2,
 ) -> list[TradeCandidate]:
     """
-    The concentrated strategy (STRATEGY_MODE=concentrated): put all deployable capital into the top 2
-    highest-conviction candidates instead of spreading across many names —
-    the point is to make a small number of high-confidence bets, not to
-    track the market with a diversified book.
+    The concentrated strategy (STRATEGY_MODE=concentrated): put all
+    deployable capital into a small, high-conviction book of at most
+    `max_positions` names instead of spreading across many — the point is
+    to make a small number of high-confidence bets, not to track the
+    market with a diversified book.
 
-    The split between the two legs is weighted by each pick's relative
-    conviction_score (the size of the predicted move), bounded to
-    [min_leg_pct, max_leg_pct] of the *dominant* leg so one pick can't
-    swallow the whole deployment even at an extreme confidence ratio.
-    min_leg_pct should be 1 - max_leg_pct so both bounds are satisfiable
-    simultaneously with exactly two candidates.
+    Takes the top `max_positions` confident candidates by conviction (or
+    fewer if fewer clear the confidence bar — see DEFAULT_MIN_ABS_RETURN;
+    this never forces a weaker candidate in just to hit a target count).
+    The split across however many legs that ends up being is weighted by
+    each pick's relative conviction_score, bounded by
+    _bounded_conviction_weights so no leg swallows the book and none gets
+    squeezed to a token sliver. If only one candidate clears the bar, it
+    gets the full total_deploy_pct alone. If none do, returns [].
 
-    If only one candidate clears the confidence bar, it gets the full
-    total_deploy_pct alone rather than forcing a weaker second trade just
-    to fill the split. If none do, returns [].
-
-    allow_shorts=False skips short candidates entirely when picking the two
+    allow_shorts=False skips short candidates entirely when filling the
     legs, so a rejected short frees its slot for the next long rather than
-    leaving the book half-deployed. See settings.allow_shorts for why it
+    leaving the book under-deployed. See settings.allow_shorts for why it
     defaults off in production.
 
-    `rank_score_col`: which column picks the two legs and their order —
+    `rank_score_col`: which column picks the legs and their order —
     defaults to "conviction_score" (unchanged original behavior) when None
     or when the named column isn't present; run_screen passes "rank_score"
     (see apply_short_preference). The eventual split WEIGHT below still
@@ -361,15 +429,16 @@ def select_concentrated_trades(
     picked.
 
     `total_deploy_pct` is the fraction of portfolio value to put to work in
-    total, both legs combined — pass less than 1.0 for e.g. regime-based
-    damping (see run_screen).
+    total, across every leg combined — pass less than 1.0 for e.g.
+    execution/contradiction_monitor.py's mid-week reactivation, which only
+    has the freed slice of the book to redeploy.
     """
     sort_col = rank_score_col if rank_score_col and rank_score_col in scored.columns else "conviction_score"
     confident = scored.loc[scored["confident"]].sort_values(sort_col, ascending=False)
 
     picks: list[pd.Series] = []
     for _, row in confident.iterrows():
-        if len(picks) >= 2:
+        if len(picks) >= max_positions:
             break
         is_short = row["predicted_return"] < 0
         if is_short and not allow_shorts:
@@ -385,13 +454,7 @@ def select_concentrated_trades(
         return [_make_candidate(picks[0], weight=1.0, total_deploy_pct=total_deploy_pct)]
 
     scores = [max(row["conviction_score"], 0.0) for row in picks]
-    total_score = sum(scores)
-    weights = [0.5, 0.5] if total_score <= 0 else [s / total_score for s in scores]
-
-    if weights[0] > max_leg_pct:
-        weights = [max_leg_pct, 1.0 - max_leg_pct]
-    elif weights[0] < min_leg_pct:
-        weights = [min_leg_pct, 1.0 - min_leg_pct]
+    weights = _bounded_conviction_weights(scores, max_leg_pct=max_leg_pct, min_leg_floor_fraction=min_leg_floor_fraction)
 
     return [_make_candidate(row, weight, total_deploy_pct) for row, weight in zip(picks, weights, strict=False)]
 
@@ -404,7 +467,7 @@ def _attach_reasoning(
     scored: pd.DataFrame,
     regime: str,
     max_leg_pct: float,
-    min_leg_pct: float,
+    min_leg_floor_fraction: float,
     top_n: int = 5,
     strategy: str = "concentrated",
     top_k: int | None = None,
@@ -449,14 +512,21 @@ def _attach_reasoning(
                 top_k or len(candidates),
             )
         else:
+            # reasoning.phase_selection still speaks in absolute per-leg
+            # percentages (its own signature/tests are unchanged) — convert
+            # the floor-fraction setting to the actual bound for THIS set's
+            # leg count right here, rather than pushing the floor-fraction
+            # abstraction into the reasoning layer.
+            n_selected = len(candidates)
+            effective_min_leg_pct = min_leg_floor_fraction * (1.0 / n_selected) if n_selected > 1 else min_leg_floor_fraction
             phase4 = reasoning.phase_selection(
                 candidate.symbol,
                 candidate.side,
                 candidate.target_position_pct,
                 n_confident,
-                len(candidates),
+                n_selected,
                 max_leg_pct,
-                min_leg_pct,
+                effective_min_leg_pct,
             )
         candidate.reasoning = [
             reasoning.phase_signals(regime, top_features),
@@ -528,6 +598,7 @@ def run_screen(
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
     total_deploy_pct: float = 1.0,
+    max_positions_override: int | None = None,
 ) -> list[TradeCandidate]:
     """The shortlist-only view of run_screen_with_scores — see ScreenResult for who needs more."""
     return run_screen_with_scores(
@@ -539,6 +610,7 @@ def run_screen(
         regime=regime,
         is_shortable_fn=is_shortable_fn,
         total_deploy_pct=total_deploy_pct,
+        max_positions_override=max_positions_override,
     ).candidates
 
 
@@ -551,13 +623,15 @@ def run_screen_with_scores(
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
     total_deploy_pct: float = 1.0,
+    max_positions_override: int | None = None,
 ) -> ScreenResult:
     """
     Trains a fresh ensemble on all available history, scores today's
     snapshot, and sizes `total_deploy_pct` of capital by whichever strategy
     STRATEGY_MODE selects: the diversified top-k book (default, sized under
-    the conservative caps in risk/sizing.py) or the concentrated top-2
-    split (select_concentrated_trades).
+    the conservative caps in risk/sizing.py) or the concentrated small book
+    (select_concentrated_trades, at most settings.max_concentrated_positions
+    names).
 
     `total_deploy_pct` defaults to 1.0 (the normal weekly-cycle behavior --
     100% of the book). execution/contradiction_monitor.py's mid-week
@@ -568,6 +642,13 @@ def run_screen_with_scores(
     bar upstream, but no longer dampens total deployment on top of that (see
     git history -- the old chop-dampening was leveraged-ETF-specific decay
     protection that doesn't apply to plain equity/short positions).
+
+    `max_positions_override`: only consulted in concentrated mode, in place
+    of settings.max_concentrated_positions. contradiction_monitor.py's
+    reactivation passes the actual number of open slots left (max positions
+    minus what's currently held) so a mid-week refill tops the book back up
+    to the target count instead of adding a fresh 2-3 names on top of
+    whatever's already held.
     """
     # None -> the configured horizon (TARGET_HORIZON_DAYS), so the screener
     # always trains on the same forward-return definition the evaluation
@@ -614,15 +695,27 @@ def run_screen_with_scores(
             )
 
     if settings.strategy_mode == "concentrated":
+        max_positions = (
+            max_positions_override if max_positions_override is not None else settings.max_concentrated_positions
+        )
         candidates = select_concentrated_trades(
             scored,
             max_leg_pct=settings.max_concentrated_position_pct,
-            min_leg_pct=settings.min_concentrated_position_pct,
+            min_leg_floor_fraction=settings.min_concentrated_leg_floor_fraction,
+            max_positions=max_positions,
             total_deploy_pct=total_deploy_pct,
             is_shortable_fn=is_shortable_fn,
             allow_shorts=settings.allow_shorts,
             rank_score_col="rank_score",
         )
+        if max_positions_override is None and len(candidates) < settings.min_concentrated_positions:
+            # Informational only — see settings.min_concentrated_positions:
+            # this is a target the screen tries to reach, never a reason to
+            # force a candidate with no real edge into the book.
+            logger.info(
+                "Concentrated screen: only %d of the target minimum %d position(s) cleared the confidence bar this cycle.",
+                len(candidates), settings.min_concentrated_positions,
+            )
     else:
         # Diversified default: top-k book sized through the full risk
         # pipeline (confidence scaling, regime damping, correlation caps).
@@ -666,7 +759,7 @@ def run_screen_with_scores(
         scored,
         regime,
         settings.max_concentrated_position_pct,
-        settings.min_concentrated_position_pct,
+        settings.min_concentrated_leg_floor_fraction,
         strategy=settings.strategy_mode,
         top_k=settings.screener_top_k,
     )

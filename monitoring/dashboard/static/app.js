@@ -155,39 +155,6 @@ async function loadReportCard() {
   callouts.innerHTML = result.callouts.map((c) => `<div class="callout">${c}</div>`).join("");
 }
 
-// ---------- What-if thresholds ----------
-async function loadWhatif() {
-  const minMove = document.getElementById("whatif-move").value;
-  document.getElementById("whatif-move-value").textContent = `${(minMove * 100).toFixed(1)}%`;
-
-  const result = await fetchJSON(`/api/whatif?min_abs_move=${minMove}`);
-  const summary = document.getElementById("whatif-summary");
-  const tbody = document.querySelector("#whatif-table tbody");
-  if (!result.available) {
-    summary.innerHTML = `<div class="empty-state">${result.message}</div>`;
-    tbody.innerHTML = "";
-    return;
-  }
-  summary.innerHTML = `<div class="stat-card"><div class="value">${result.n_after}/${result.n_before}</div><div class="label">${result.summary}</div></div>`;
-  if (result.rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Nothing clears this threshold.</td></tr>';
-    return;
-  }
-  tbody.innerHTML = result.rows
-    .map(
-      (r) => `
-      <tr>
-        <td><strong>${r["Symbol"]}</strong></td>
-        <td>${r["Direction"]}</td>
-        <td>${r["Market regime"]}</td>
-        <td>${fmt.pct(r["Predicted move"], 2)}</td>
-        <td>${fmt.pct(r["Target size"], 1)}</td>
-        <td>${r["Placed?"]}</td>
-      </tr>`
-    )
-    .join("");
-}
-
 // ---------- Positions ----------
 
 // Legacy fallback for decisions logged before the 7-phase reasoning model —
@@ -577,77 +544,6 @@ async function loadLiveAccuracy() {
   box.innerHTML = html;
 }
 
-// ---------- Decision history ----------
-async function loadDecisions(symbol) {
-  const url = symbol ? `/api/decisions?symbol=${encodeURIComponent(symbol)}` : "/api/decisions";
-  const rows = await fetchJSON(url);
-  const tbody = document.querySelector("#decisions-table tbody");
-  if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No decisions logged yet.</td></tr>';
-    return;
-  }
-  tbody.innerHTML = rows
-    .map((r, i) => {
-      const reasoningCell = r.reasoning && r.reasoning.length
-        ? `<span class="reasoning-link" data-decision-idx="${i}">${r.reasoning.length} phase(s)</span>`
-        : '<span class="muted">—</span>';
-      return `
-      <tr>
-        <td>${fmt.time(r.ts)}</td>
-        <td><strong>${r.symbol}</strong></td>
-        <td>${fmt.pct(r.forecast, 2)}</td>
-        <td>${r.regime || "—"}</td>
-        <td>${fmt.pct(r.target_position, 1)}</td>
-        <td>${r.executed_position === null ? "—" : fmt.num(r.executed_position, 2)}</td>
-        <td>${r.mode}</td>
-        <td>${reasoningCell}</td>
-      </tr>`;
-    })
-    .join("");
-
-  tbody.querySelectorAll(".reasoning-link").forEach((el) => {
-    el.addEventListener("click", () => {
-      const r = rows[Number(el.dataset.decisionIdx)];
-      const text = r.reasoning[0].phase !== undefined
-        ? r.reasoning.map((p) => `Phase ${p.phase} — ${p.title}\n${p.lines.map((l) => `  • ${l}`).join("\n")}`).join("\n\n")
-        : r.reasoning.map((f) => `${f.feature_name}: ${fmt.num(f.contribution, 4)} (value=${fmt.num(f.value, 3)})`).join("\n");
-      alert(text);
-    });
-  });
-}
-
-// ---------- Tests ----------
-function renderTestStatus(result) {
-  const box = document.getElementById("test-status");
-  const output = document.getElementById("test-output");
-  if (!result) {
-    box.textContent = "Never run";
-    box.className = "stat-card";
-    output.textContent = "";
-    return;
-  }
-  box.innerHTML = `<div class="value">${result.passed ? "✅ Passing" : "❌ Failing"}</div><div class="label">${result.summary} — ${fmt.time(result.ts)}</div>`;
-  box.className = `stat-card ${result.passed ? "good" : "bad"}`;
-  output.textContent = result.output;
-}
-
-async function loadLastTestRun() {
-  const result = await fetchJSON("/api/tests/last");
-  renderTestStatus(result);
-}
-
-async function runTestsNow() {
-  const btn = document.getElementById("run-tests-btn");
-  btn.disabled = true;
-  btn.textContent = "Running… (can take a minute)";
-  try {
-    const result = await fetchJSON("/api/tests/run", { method: "POST" });
-    renderTestStatus(result);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Run tests now";
-  }
-}
 
 // ---------- Mode badge ----------
 async function loadModeBadge() {
@@ -823,31 +719,18 @@ async function loadAll() {
     loadAnalysis(),
     loadReportCard(),
     loadDrift(),
-    loadWhatif(),
     loadFeatureImportance(),
     loadLiveAccuracy(),
-    loadDecisions(),
-    loadLastTestRun(),
   ]);
   if (activeTab === "news") await loadLiveNews(currentNewsFilter());
 }
 
 document.getElementById("refresh-btn").addEventListener("click", loadAll);
-document.getElementById("run-tests-btn").addEventListener("click", runTestsNow);
-document.getElementById("decision-filter-btn").addEventListener("click", () => {
-  loadDecisions(document.getElementById("decision-symbol-filter").value.trim().toUpperCase());
-});
-document.getElementById("decision-symbol-filter").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") document.getElementById("decision-filter-btn").click();
-});
 document.getElementById("news-filter-btn").addEventListener("click", () => loadLiveNews(currentNewsFilter()));
 document.getElementById("news-refresh-btn").addEventListener("click", () => loadLiveNews(currentNewsFilter()));
 document.getElementById("news-symbol-filter").addEventListener("keydown", (e) => {
   if (e.key === "Enter") document.getElementById("news-filter-btn").click();
 });
-// The sliders re-hit the endpoint on every input tick — the endpoint is a
-// read-only re-filter of one already-logged batch, so that's cheap.
-document.getElementById("whatif-move").addEventListener("input", loadWhatif);
 
 // The status strip re-polls on its own, lightweight timer — a full loadAll()
 // only runs on page load or the Refresh button, but "last headline Xm ago"

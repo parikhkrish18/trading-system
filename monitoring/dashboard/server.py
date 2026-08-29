@@ -18,8 +18,6 @@ import hashlib
 import hmac
 import json
 import logging
-import subprocess
-import sys
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -38,15 +36,13 @@ from features.quant.momentum import adx as compute_adx
 from models.regime.trend_chop_classifier import RuleBasedRegime
 from monitoring import drift
 from monitoring.breaker_state import load_latest_breaker_state
-from monitoring.dashboard import report_card, whatif
+from monitoring.dashboard import report_card
 from monitoring.equity import load_equity_curve
 from monitoring.forecast_accuracy import compute_forecast_accuracy
 
 logger = logging.getLogger(__name__)
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-LAST_TEST_RUN_PATH = REPO_ROOT / "logs" / "last_test_run.json"
 
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
@@ -473,45 +469,6 @@ def get_report_card() -> dict:
     }
 
 
-@app.get("/api/whatif")
-def get_whatif(min_abs_move: float = 0.0) -> dict:
-    """
-    The what-if threshold playground: re-filter the latest logged screener
-    batch at whatever bar the slider asks for. Read-only — nothing is
-    retrained or rescored; the question is only "which of these picks would
-    still have made the cut".
-
-    There was a second slider over model agreement. It went with the
-    agreement threshold itself — the number was measured to predict
-    nothing, and a control that appears to tune rigour over a meaningless
-    number is worse than no control.
-    """
-    engine = get_engine()
-    batch = pd.read_sql(
-        text(
-            """SELECT ts, symbol, forecast, regime, target_position, executed_position, mode
-               FROM decisions
-               WHERE mode = 'paper' AND forecast IS NOT NULL
-                 AND ts = (
-                     SELECT MAX(ts) FROM decisions WHERE mode = 'paper' AND forecast IS NOT NULL
-                 )"""
-        ),
-        engine,
-    )
-    if batch.empty:
-        return {"available": False, "message": "No scored screener batch logged yet.", "rows": [], "summary": ""}
-
-    filtered = whatif.filter_by_thresholds(batch, min_abs_move=min_abs_move)
-    return {
-        "available": True,
-        "min_abs_move": min_abs_move,
-        "n_before": len(batch),
-        "n_after": len(filtered),
-        "summary": whatif.shortlist_summary(len(batch), len(filtered)),
-        "rows": _clean_records(whatif.whatif_table(filtered)),
-    }
-
-
 def _price_at_or_before(sym_prices: pd.DataFrame, ts) -> float | None:
     """Nearest known close at or before `ts`; falls back to the earliest known close if none exists."""
     before = sym_prices[sym_prices["ts"] <= ts]
@@ -767,36 +724,6 @@ def get_feature_frequency(limit: int = 200) -> list[dict]:
     ]
     result.sort(key=lambda r: r["times_in_top5"], reverse=True)
     return result
-
-
-@app.get("/api/tests/last")
-def get_last_test_run() -> dict | None:
-    if not LAST_TEST_RUN_PATH.exists():
-        return None
-    return json.loads(LAST_TEST_RUN_PATH.read_text())
-
-
-@app.post("/api/tests/run")
-def run_tests() -> dict:
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--tb=short"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    output = result.stdout + result.stderr
-    summary = output.strip().splitlines()[-1] if output.strip() else ""
-    payload = {
-        "ts": dt.datetime.now(tz=dt.UTC).isoformat(),
-        "exit_code": result.returncode,
-        "passed": result.returncode == 0,
-        "summary": summary,
-        "output": output,
-    }
-    LAST_TEST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LAST_TEST_RUN_PATH.write_text(json.dumps(payload))
-    return payload
 
 
 # Static frontend, mounted last so it doesn't shadow /api/* routes. A mount

@@ -282,8 +282,8 @@ class Settings(BaseSettings):
 
     # --- Strategy selection ---
     # "diversified" (default) = top-k book sized by risk.sizing.select_trades
-    # under the conservative caps above. "concentrated" = the 2-trade
-    # high-conviction split below (needs the env cap overrides to breathe).
+    # under the conservative caps above. "concentrated" = the small
+    # high-conviction book below (needs the env cap overrides to breathe).
     strategy_mode: str = Field(default="diversified", alias="STRATEGY_MODE")  # "diversified" | "concentrated"
     # How many names the diversified book holds at most.
     screener_top_k: int = Field(default=10, alias="SCREENER_TOP_K")
@@ -296,13 +296,33 @@ class Settings(BaseSettings):
     # default anyone should inherit by accident.
     full_deployment: bool = Field(default=False, alias="FULL_DEPLOYMENT")
 
-    # --- Concentrated 2-trade strategy (models.screener.select_concentrated_trades) ---
-    # Split between the two highest-conviction picks is weighted by relative
-    # confidence, bounded so the dominant leg can't swallow the whole
-    # deployment: max_concentrated_position_pct caps it, and
-    # min_concentrated_position_pct (= 1 - max) floors the other leg.
+    # --- Concentrated strategy (models.screener.select_concentrated_trades) ---
+    # A small, high-conviction book: never more than max_concentrated_positions
+    # names held at once, never fewer than min_concentrated_positions UNLESS
+    # fewer than that many actually clear the confidence bar that cycle — the
+    # minimum is a target the screen tries to reach, never a reason to force
+    # a trade with no real edge (see DEFAULT_MIN_ABS_RETURN in
+    # models/screener.py). execution/contradiction_monitor.py's mid-week
+    # reactivation targets this same range: if an emergency close drops the
+    # book below the max, it re-screens immediately to top back up rather
+    # than waiting for the next weekly cycle.
+    min_concentrated_positions: int = Field(default=2, alias="MIN_CONCENTRATED_POSITIONS")
+    max_concentrated_positions: int = Field(default=3, alias="MAX_CONCENTRATED_POSITIONS")
+    # Capital is split across however many names are actually held (between
+    # the min and max above), weighted by relative conviction — the stronger
+    # the predicted move, the bigger that leg — bounded two ways so no single
+    # pick swallows the whole book and no also-ran pick gets squeezed to a
+    # token sliver:
+    #   - max_concentrated_position_pct: hard ceiling on any one leg,
+    #     regardless of how many names are held.
+    #   - min_concentrated_leg_floor_fraction: every leg is guaranteed at
+    #     least this fraction of what an EQUAL split would have given it
+    #     (e.g. 0.6 with 3 legs = at least 0.6 * 1/3 = 20% each). Expressed
+    #     as a fraction of the equal share, not an absolute percentage, so
+    #     it stays feasible however many names end up held (2 or 3) instead
+    #     of being tuned for one specific count.
     max_concentrated_position_pct: float = Field(default=0.70, alias="MAX_CONCENTRATED_POSITION_PCT")
-    min_concentrated_position_pct: float = Field(default=0.30, alias="MIN_CONCENTRATED_POSITION_PCT")
+    min_concentrated_leg_floor_fraction: float = Field(default=0.6, alias="MIN_CONCENTRATED_LEG_FLOOR_FRACTION")
 
     @property
     def db_url(self) -> str:

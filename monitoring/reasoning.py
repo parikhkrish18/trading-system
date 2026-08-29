@@ -417,16 +417,16 @@ def phase_selection(
     lines = [f"{n_confident} symbol(s) cleared the confidence bar this cycle; the top {n_selected} by conviction score were picked."]
     lines.append(f"{symbol} was sized as a {side} position for {abs(weight_pct):.1%} of total portfolio capital.")
     if n_selected == 1:
-        lines.append("Only one candidate cleared the bar, so it received the full deployable capital alone rather than splitting with a weaker second pick.")
+        lines.append("Only one candidate cleared the bar, so it received the full deployable capital alone rather than splitting across multiple picks.")
     else:
         at_bound = abs(abs(weight_pct) - max_leg_pct) < 1e-6 or abs(abs(weight_pct) - min_leg_pct) < 1e-6
         if at_bound:
             lines.append(
-                f"The split between the two picks is capped to [{min_leg_pct:.0%}, {max_leg_pct:.0%}] of capital per leg "
+                f"The split across the {n_selected} picks is capped to [{min_leg_pct:.0%}, {max_leg_pct:.0%}] of capital per leg "
                 "so one pick can't swallow the whole book even at an extreme confidence gap — this leg hit that cap."
             )
         else:
-            lines.append("The split between the two picks is weighted by their relative conviction scores.")
+            lines.append(f"The split across the {n_selected} picks is weighted by their relative conviction scores.")
     return {
         "phase": 4,
         "title": "Candidate Selection & Sizing",

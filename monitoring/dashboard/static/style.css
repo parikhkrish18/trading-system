@@ -251,23 +251,6 @@ tbody tr:hover { background: var(--bg-elevated); }
 
 .reasoning-link { color: var(--accent); cursor: pointer; font-size: 12px; }
 
-#test-output-wrap {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 10px 14px;
-}
-#test-output-wrap summary { cursor: pointer; font-size: 13px; color: var(--text-muted); }
-#test-output {
-  white-space: pre-wrap;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  max-height: 400px;
-  overflow-y: auto;
-  margin-top: 10px;
-  color: var(--text-muted);
-}
-
 .empty-state { color: var(--text-muted); font-size: 13px; padding: 16px 0; }
 
 .news-row { padding: 8px 0; border-bottom: 1px solid var(--border); }
@@ -333,7 +316,3 @@ tbody tr:hover { background: var(--bg-elevated); }
   margin-right: 5px;
   vertical-align: baseline;
 }
-.whatif-sliders { display: flex; gap: 32px; flex-wrap: wrap; margin-bottom: 12px; }
-.whatif-sliders label { font-size: 13px; color: var(--text-muted); display: flex; flex-direction: column; gap: 6px; }
-.whatif-sliders label span { color: var(--text); font-variant-numeric: tabular-nums; }
-.whatif-sliders input[type="range"] { width: 220px; accent-color: var(--accent); }

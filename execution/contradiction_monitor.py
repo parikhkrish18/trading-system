@@ -320,25 +320,49 @@ def _log_reactivation(
 def _attempt_reactivation(broker, engine, request_fn=None) -> None:
     """
     After a contradiction close, checks whether meaningful capital is now
-    sitting idle and, if so, immediately re-screens for a new candidate to
-    redeploy it -- same 80% confidence bar and top-2-concentrated selection
-    logic as the weekly cycle (models.screener.run_screen), just scoped to
-    the freed fraction of capital instead of the whole book, and restricted
-    to symbols not currently held. No-ops if the freed slice is too small to
-    bother with, or nothing confident turns up.
+    sitting idle and, if so, immediately re-screens for new candidate(s) to
+    redeploy it -- same confidence bar and selection logic as the weekly
+    cycle (models.screener.run_screen), just scoped to the freed fraction of
+    capital instead of the whole book, and restricted to symbols not
+    currently held. No-ops if the freed slice is too small to bother with,
+    or nothing confident turns up.
+
+    In concentrated mode (STRATEGY_MODE=concentrated) this also caps how
+    many NEW names it will pick at how many slots are actually open --
+    settings.max_concentrated_positions minus what's still held after the
+    close(s) -- so a mid-week close on a 3-name book tops back up to 3
+    rather than adding a fresh 2-3 on top of whatever survived. This is what
+    keeps the book at its target count continuously instead of only at the
+    next weekly cycle.
     """
     freed_fraction = _freed_capital_fraction(broker, engine)
     if freed_fraction < _MIN_REACTIVATION_FRACTION:
         return
 
     held_symbols = {s for s, q in broker.get_positions().items() if q != 0}
+
+    max_positions_override = None
+    if settings.strategy_mode == "concentrated":
+        open_slots = max(0, settings.max_concentrated_positions - len(held_symbols))
+        if open_slots <= 0:
+            logger.info(
+                "Book already holds %d of %d target position(s) — freed capital stays in cash rather than "
+                "adding a name beyond the concentrated cap.",
+                len(held_symbols), settings.max_concentrated_positions,
+            )
+            return
+        max_positions_override = open_slots
+
     candidate_pool = [s for s in load_active_universe() if s not in held_symbols]
     if not candidate_pool:
         return
 
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
     try:
-        candidates = run_screen("v3", candidate_pool, is_shortable_fn=is_shortable_fn, total_deploy_pct=freed_fraction)
+        candidates = run_screen(
+            "v3", candidate_pool, is_shortable_fn=is_shortable_fn,
+            total_deploy_pct=freed_fraction, max_positions_override=max_positions_override,
+        )
     except Exception:
         logger.exception("Reactivation screen failed — leaving freed capital in cash until the next check.")
         return

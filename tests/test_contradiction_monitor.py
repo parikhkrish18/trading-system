@@ -404,6 +404,73 @@ def test_attempt_reactivation_noop_when_no_confident_candidate(monkeypatch):
     assert broker.closed == []
 
 
+# --------------------------------------------------------------------------
+# Concentrated-mode position-count cap: reactivation must top the book back
+# up to the target count (min 2 / max 3), never past the max regardless of
+# how much capital is freed.
+# --------------------------------------------------------------------------
+
+
+def test_attempt_reactivation_caps_new_picks_to_open_slots_in_concentrated_mode(monkeypatch):
+    """
+    A 3-name concentrated book that just lost one position to a
+    contradiction close should look for exactly 1 replacement, not a fresh
+    2-3 -- otherwise the book would balloon past the max on every mid-week
+    close.
+    """
+    monkeypatch.setattr(cm.settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(cm.settings, "max_concentrated_positions", 3)
+    broker = _FakeBroker({"BBB": 10, "CCC": 10}, portfolio_value=100_000.0)  # 2 held after 1 closed
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL", "BBB", "CCC"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["BBB", "CCC"], "close": [10.0, 10.0]}))
+
+    captured = {}
+
+    def fake_run_screen(feature_set_id, symbols, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cm, "run_screen", fake_run_screen)
+
+    cm._attempt_reactivation(broker, engine=object())
+
+    assert captured["max_positions_override"] == 1  # 3 max - 2 held
+
+
+def test_attempt_reactivation_noop_when_concentrated_book_already_at_max(monkeypatch):
+    """Freed capital (e.g. a position that grew and threw off cash) stays in cash rather than adding a 3rd+1 name."""
+    monkeypatch.setattr(cm.settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(cm.settings, "max_concentrated_positions", 2)
+    broker = _FakeBroker({"BBB": 10, "CCC": 10}, portfolio_value=100_000.0)  # already at the max
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["BBB", "CCC"], "close": [10.0, 10.0]}))
+    run_screen_calls = []
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: run_screen_calls.append(1))
+
+    cm._attempt_reactivation(broker, engine=object())
+
+    assert run_screen_calls == []
+
+
+def test_attempt_reactivation_diversified_mode_ignores_position_count_cap(monkeypatch):
+    """Diversified mode (the non-default fallback strategy) has no position-count target -- no override applied."""
+    monkeypatch.setattr(cm.settings, "strategy_mode", "diversified")
+    broker = _FakeBroker({"BBB": 10}, portfolio_value=100_000.0)
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL", "BBB"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["BBB"], "close": [10.0]}))
+
+    captured = {}
+
+    def fake_run_screen(feature_set_id, symbols, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cm, "run_screen", fake_run_screen)
+
+    cm._attempt_reactivation(broker, engine=object())
+
+    assert captured["max_positions_override"] is None
+
+
 def test_log_closure_builds_valid_phase_reasoning(monkeypatch):
     captured = {}
 
