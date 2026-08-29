@@ -66,9 +66,14 @@ class Settings(BaseSettings):
     # --- MLflow ---
     mlflow_tracking_uri: str = Field(default="http://localhost:5000", alias="MLFLOW_TRACKING_URI")
 
-    # --- Dashboard (HTTP Basic Auth; see monitoring/dashboard/server.py) ---
-    dashboard_user: str = Field(default="admin", alias="DASHBOARD_USER")
-    # No default on purpose: with this empty the dashboard only serves on loopback.
+    # --- Dashboard (password-only login page; see monitoring/dashboard/server.py) ---
+    # One shared password gates the whole dashboard — the page itself, every
+    # /api read, and the manual-trigger buttons alike. No username, no
+    # separate operator token for the mutating endpoints: enter this once at
+    # /login and the session cookie it sets covers everything until it's
+    # cleared (or the password changes, which invalidates every outstanding
+    # cookie at once — see _session_token). No default on purpose: with this
+    # empty the dashboard only serves on loopback.
     dashboard_password: str = Field(default="", alias="DASHBOARD_PASSWORD")
 
     # --- Feature set ---
@@ -78,10 +83,6 @@ class Settings(BaseSettings):
     feature_set_id: str = Field(default="v4", alias="FEATURE_SET_ID")
 
     # --- Dashboard ---
-    # Bearer token protecting mutating dashboard endpoints (POST
-    # /api/tests/run). Blank is fine on localhost; required when the
-    # dashboard binds a non-loopback interface.
-    dashboard_api_token: str = Field(default="", alias="DASHBOARD_API_TOKEN")
     # Where the dashboard listens. Loopback by default so it isn't reachable
     # from the network by accident; the Docker image sets 0.0.0.0 explicitly
     # (containers need it to publish the port).

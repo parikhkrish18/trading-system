@@ -13,8 +13,8 @@ Usage:
 """
 from __future__ import annotations
 
-import base64
 import datetime as dt
+import hashlib
 import hmac
 import json
 import logging
@@ -22,11 +22,12 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import mlflow
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
@@ -50,66 +51,139 @@ LAST_TEST_RUN_PATH = REPO_ROOT / "logs" / "last_test_run.json"
 
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
+# One shared password gates the whole dashboard — the static page, every
+# /api route (reads included), and the manual-trigger buttons. There used to
+# be a second, separate operator token for the mutating endpoints on top of
+# HTTP Basic Auth for everything else; that split is gone. Log in once at
+# /login and the session cookie it sets covers everything until it's cleared
+# (see _session_token below for how logging out and changing the password
+# both invalidate it).
+app = FastAPI(title="Trading System Monitor")
 
-def _require_api_token(request: Request) -> None:
+_SESSION_COOKIE = "dashboard_session"
+_SESSION_MAX_AGE_S = 30 * 24 * 3600  # 30 days — a shared operator password, not a per-user login
+
+
+def _session_token(password: str) -> str:
     """
-    The gate on every /api route — reads included. Three cases:
-
-    - Token configured: every caller must present it as a bearer header,
-      loopback or not — configuring a token means wanting it checked.
-    - No token, loopback bind: allowed. The only people who can reach a
-      127.0.0.1 dashboard are already on the machine, so local development
-      needs no ceremony.
-    - No token, non-loopback bind: 403 always. An open interface with an
-      endpoint that runs subprocesses must not be one blank env var away
-      from the network.
-
-    Reads are gated as well as writes. What this dashboard returns is the
-    book — every open position, its size, the model's reasoning for holding
-    it, and the equity curve. On paper money that is merely embarrassing;
-    the habit of publishing it is what must not survive to real money, and a
-    URL that was public for months does not quietly become private later.
+    Stateless session token: an HMAC of a fixed label under the current
+    dashboard password. No server-side session store to manage — anyone who
+    supplied the right password once is re-recognized by this token on
+    later requests, and changing DASHBOARD_PASSWORD invalidates every
+    outstanding cookie at once, since the recomputed token changes with it.
     """
-    token = settings.dashboard_api_token
-    if token:
-        supplied = request.headers.get("authorization", "")
-        if not hmac.compare_digest(supplied, f"Bearer {token}"):
-            raise HTTPException(status_code=403, detail="Missing or invalid bearer token.")
-        return
-    if settings.dashboard_host not in _LOOPBACK_HOSTS:
-        raise HTTPException(
-            status_code=403,
-            detail="This endpoint is disabled: the dashboard is bound to a non-loopback "
-                   "interface and DASHBOARD_API_TOKEN is not set.",
+    return hmac.new(password.encode(), b"trading-system-dashboard-session", hashlib.sha256).hexdigest()
+
+
+def _is_authenticated(request: Request) -> bool:
+    password = settings.dashboard_password
+    if not password:
+        return True  # the loopback-only fallback below is what actually gates this case
+    cookie = request.cookies.get(_SESSION_COOKIE, "")
+    return hmac.compare_digest(cookie, _session_token(password))
+
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Trading System Monitor — Log in</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0b0e14; color: #e6e9f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }}
+  form {{
+    background: #161b26; border: 1px solid #262c3b; border-radius: 10px;
+    padding: 32px 28px; width: 280px; text-align: center;
+  }}
+  h1 {{ font-size: 16px; margin: 0 0 20px; }}
+  input {{
+    width: 100%; padding: 9px 12px; margin-bottom: 12px; border-radius: 6px;
+    border: 1px solid #262c3b; background: #131722; color: #e6e9f0; font-size: 14px; box-sizing: border-box;
+  }}
+  button {{
+    width: 100%; padding: 9px 12px; border-radius: 6px; border: 1px solid #5b8cff;
+    background: #5b8cff; color: white; font-size: 14px; font-weight: 600; cursor: pointer;
+  }}
+  .error {{ color: #e5484d; font-size: 12px; margin: -6px 0 14px; }}
+</style>
+</head>
+<body>
+  <form method="post" action="/login">
+    <h1>Trading System Monitor</h1>
+    {error_html}
+    <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password" />
+    <button type="submit">Enter</button>
+  </form>
+</body>
+</html>"""
+
+
+@app.get("/login", include_in_schema=False)
+def login_form(request: Request) -> Response:
+    if _is_authenticated(request):
+        return RedirectResponse("/")
+    return HTMLResponse(_LOGIN_PAGE.format(error_html=""))
+
+
+@app.post("/login", include_in_schema=False)
+async def login_submit(request: Request) -> Response:
+    # Parsed by hand (stdlib urllib) rather than FastAPI's Form(...), which
+    # pulls in python-multipart as a new dependency for a single field on a
+    # login form the app itself renders — not worth it for one text input.
+    body = await request.body()
+    password = (parse_qs(body.decode("utf-8")).get("password") or [""])[0]
+
+    configured = settings.dashboard_password
+    if not configured or not hmac.compare_digest(password, configured):
+        return HTMLResponse(
+            _LOGIN_PAGE.format(error_html='<div class="error">Wrong password.</div>'), status_code=401
         )
+    resp = RedirectResponse("/", status_code=303)
+    server_host = (request.scope.get("server") or ("", 0))[0]
+    resp.set_cookie(
+        _SESSION_COOKIE,
+        _session_token(configured),
+        max_age=_SESSION_MAX_AGE_S,
+        httponly=True,
+        samesite="lax",
+        # Secure unless we're plainly in loopback dev — a real deploy is
+        # always HTTPS, and browsers treat 127.0.0.1/localhost as
+        # "potentially trustworthy" so Secure cookies still round-trip there
+        # over plain http during local testing.
+        secure=server_host not in _LOOPBACK_HOSTS,
+    )
+    return resp
 
 
-# The gate is declared once, on the app, rather than per route: a new
-# endpoint added later is then private by default instead of private only
-# if its author remembered. tests/test_dashboard_server.py enforces that no
-# /api route escapes it.
-#
-# The static frontend is mounted separately (see the bottom of this file)
-# and is deliberately NOT behind the gate — the page has to load before
-# anyone can type a token into it.
-app = FastAPI(title="Trading System Monitor", dependencies=[Depends(_require_api_token)])
+@app.get("/logout", include_in_schema=False)
+def logout() -> Response:
+    resp = RedirectResponse("/login")
+    resp.delete_cookie(_SESSION_COOKIE)
+    return resp
 
 
-def _check_basic_auth(request: Request) -> PlainTextResponse | None:
+def _check_dashboard_auth(request: Request) -> PlainTextResponse | JSONResponse | RedirectResponse | None:
     """
-    A second, coarser gate in front of the token one above — HTTP Basic
-    Auth, applied to EVERY request including the static mount, which the
-    token dependency deliberately skips (the page has to load before anyone
-    can type a token into it). Once the dashboard sits on a public domain,
-    that static page and its JS are also better off not being world-
-    readable, and this is the one place a browser's own login prompt
-    covers a mounted StaticFiles app rather than just declared routes.
+    The one gate in front of EVERY request — the static page, every /api
+    route (reads included), and /login itself. Returns a response to
+    short-circuit with, or None to let the request through.
 
-    Returns a response to short-circuit with, or None to let the request
-    through. With DASHBOARD_PASSWORD unset, only requests arriving on a
-    loopback interface are served — any other interface fails closed
-    instead of exposing positions and the test runner to the public
-    internet.
+    - DASHBOARD_PASSWORD unset: served only on a loopback bind. The only
+      people who can reach a 127.0.0.1 dashboard are already on the
+      machine, so local development needs no ceremony; any other interface
+      fails closed rather than exposing positions and the test runner to
+      the public internet on a blank env var.
+    - DASHBOARD_PASSWORD set: /login and /logout stay reachable logged out
+      (the login flow has to work before anyone is logged in); everything
+      else needs the session cookie /login sets. An unauthenticated /api
+      call gets a 401 JSON body instead of a redirect — the frontend's own
+      fetch wrapper sends the browser to /login on that, rather than a
+      fetch() silently following a redirect into an HTML page.
     """
     password = settings.dashboard_password
     server_host = (request.scope.get("server") or ("", 0))[0]
@@ -120,24 +194,21 @@ def _check_basic_auth(request: Request) -> PlainTextResponse | None:
             "DASHBOARD_PASSWORD is not set; refusing to serve on a non-loopback interface.",
             status_code=503,
         )
-    scheme, _, encoded = request.headers.get("authorization", "").partition(" ")
-    ok = False
-    if scheme.lower() == "basic":
-        try:
-            user, _, supplied = base64.b64decode(encoded).decode().partition(":")
-        except (ValueError, UnicodeDecodeError):
-            user = supplied = ""
-        ok = hmac.compare_digest(user, settings.dashboard_user) & hmac.compare_digest(supplied, password)
-    if ok:
+
+    if request.url.path in ("/login", "/logout"):
         return None
-    return PlainTextResponse(
-        "Unauthorized", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Trading System Monitor"'}
-    )
+
+    if _is_authenticated(request):
+        return None
+
+    if request.url.path.startswith("/api"):
+        return JSONResponse({"detail": "Not authenticated. Log in at /login."}, status_code=401)
+    return RedirectResponse("/login")
 
 
 @app.middleware("http")
-async def _basic_auth_middleware(request: Request, call_next):
-    return _check_basic_auth(request) or await call_next(request)
+async def _dashboard_auth_middleware(request: Request, call_next):
+    return _check_dashboard_auth(request) or await call_next(request)
 
 
 def _clean_records(df: pd.DataFrame) -> list[dict]:
@@ -536,6 +607,55 @@ def get_positions_news(limit_per_symbol: int = 8) -> dict[str, list[dict]]:
     return result
 
 
+@app.get("/api/news/live")
+def get_live_news(limit: int = Query(default=150, le=1000)) -> list[dict]:
+    """
+    The most recent news across the whole universe (not just held
+    positions — see /api/positions/news for that narrower feed), grouped by
+    story rather than listed one row per symbol.
+
+    One article commonly fans out to several rows in news_events — a Fed
+    headline tagged to five names writes five rows with the same headline
+    and timestamp, one per symbol (see data/ingest/news_stream.py and
+    data/ingest/news.py). Grouping by (headline, ts) here turns that back
+    into "one story, these symbols, this sentiment each" instead of making
+    that story read as five unrelated news items on the dashboard.
+
+    Sentiment can be null for a little while: the real-time stream writes
+    headlines to news_events immediately, but the LLM sentiment pass
+    (features/qualitative/sentiment.py::backfill_unscored_news) only runs
+    piggybacked on the hourly contradiction monitor and the weekly cycle —
+    a very fresh headline can show "not yet scored" for up to about an hour
+    during market hours.
+    """
+    engine = get_engine()
+    df = pd.read_sql(
+        text(
+            "SELECT symbol, ts, headline, source, sentiment FROM news_events "
+            "WHERE headline IS NOT NULL AND headline != '' ORDER BY ts DESC LIMIT :limit"
+        ),
+        engine,
+        params={"limit": limit},
+    )
+    if df.empty:
+        return []
+
+    grouped: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for _, row in df.iterrows():
+        ts = row["ts"]
+        ts_key = ts.isoformat() if hasattr(ts, "isoformat") else ts
+        key = (row["headline"], ts_key)
+        if key not in grouped:
+            grouped[key] = {"headline": row["headline"], "ts": ts_key, "source": row["source"], "symbols": []}
+            order.append(key)
+        sentiment = row["sentiment"]
+        grouped[key]["symbols"].append(
+            {"symbol": row["symbol"], "sentiment": None if pd.isna(sentiment) else float(sentiment)}
+        )
+    return [grouped[k] for k in order]
+
+
 @app.get("/api/regime_history")
 def get_regime_history(market_proxy: str = "SPY") -> list[dict]:
     """Dense daily trend/chop classification (ADX on the market proxy) for overlaying on the equity chart."""
@@ -633,7 +753,7 @@ def run_tests() -> dict:
 # cycle" button only STARTS the cycle — scripts/run_weekly_cycle.py still
 # walks through the Telegram approval gate before any order exists, so the
 # button authorizes computation, never trades. Like every /api route these
-# sit behind the app-level _require_api_token gate; being state-changing,
+# sit behind the app-level dashboard-password gate; being state-changing,
 # they are the ones that would hurt most if that ever came off.
 # --------------------------------------------------------------------------
 
@@ -757,10 +877,11 @@ def run_job(job_name: str) -> dict:
 
 
 # Static frontend, mounted last so it doesn't shadow /api/* routes. A mount
-# is not a route, so the app-level token dependency does not apply to it —
-# which is what we want: the page, its JS and its CSS have to be reachable
-# for anyone to type a token in. The page ships no data of its own; every
-# number on it arrives through a gated /api call.
+# is not a route-level dependency, but the middleware above gates it anyway
+# (it runs in front of every request, mount or not) — the page, its JS and
+# its CSS are only reachable once the session cookie from /login is
+# present. The page ships no data of its own; every number on it arrives
+# through a gated /api call.
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 

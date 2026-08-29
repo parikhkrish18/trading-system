@@ -11,22 +11,21 @@ from monitoring.dashboard import server
 @pytest.fixture(autouse=True)
 def _local_dev_bind(monkeypatch):
     """
-    Every /api route is token-gated now, so each test has to say which side
-    of that gate it is on. The default is the local-development case —
-    loopback bind, no token configured — which is the one nearly every test
-    here cares nothing about. The gate's own tests override it.
+    Every request is auth-gated now, so each test has to say which side of
+    that gate it is on. The default is the local-development case —
+    loopback bind, no password configured — which is the one nearly every
+    test here cares nothing about. The gate's own tests override it.
 
     Pinned explicitly rather than inherited from the ambient settings so a
     developer's own .env cannot decide whether the suite passes.
     """
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
     monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
 
 
 @pytest.fixture
 def client(monkeypatch):
-    # Loopback base URL: with no DASHBOARD_PASSWORD the Basic Auth middleware
-    # only lets requests through on a loopback bind (see the auth tests below).
+    # Loopback base URL: with no DASHBOARD_PASSWORD the auth middleware only
+    # lets requests through on a loopback bind (see the auth tests below).
     monkeypatch.setattr(server.settings, "dashboard_password", "")
     return TestClient(server.app, base_url="http://127.0.0.1")
 
@@ -685,7 +684,7 @@ def test_whatif_endpoint_with_no_decisions_at_all(monkeypatch, client):
     assert body["rows"] == []
 
 
-# --- /api/tests/run token gate ----------------------------------------------
+# --- /api/tests/run auth gate ------------------------------------------------
 
 
 class _FakePytestResult:
@@ -700,47 +699,53 @@ def _runnable_tests(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "LAST_TEST_RUN_PATH", tmp_path / "last_test_run.json")
 
 
-def test_run_tests_allowed_on_loopback_without_a_token(monkeypatch, client, _runnable_tests):
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
-    monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
-
+def test_run_tests_allowed_on_loopback_with_no_password_set(client, _runnable_tests):
+    """Local development needs no ceremony — the client fixture is already loopback, no password."""
     resp = client.post("/api/tests/run")
 
     assert resp.status_code == 200
 
 
-def test_run_tests_forbidden_on_open_interface_without_a_token(monkeypatch, client, _runnable_tests):
-    """An open bind with no token must refuse — never run subprocesses for the whole network."""
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
-    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+def test_run_tests_forbidden_on_open_interface_without_a_password(client, _runnable_tests):
+    """
+    An open bind with no password must refuse — never run subprocesses for
+    the whole network. `client` (loopback base_url) is only here for its
+    fixture side effect of pinning dashboard_password=""; what makes this
+    request "public" is the separate client's base_url below — the gate
+    reads the actual connection's host (request.scope["server"]), not the
+    dashboard_host setting.
+    """
+    public = TestClient(server.app, base_url="http://0.0.0.0")
+
+    resp = public.post("/api/tests/run")
+
+    assert resp.status_code == 503
+    assert "DASHBOARD_PASSWORD" in resp.text
+
+
+def test_run_tests_requires_the_session_cookie_when_a_password_is_configured(monkeypatch, client, _runnable_tests):
+    monkeypatch.setattr(server.settings, "dashboard_password", "sekrit")
+
+    no_cookie = client.post("/api/tests/run")
+
+    client.cookies.set(server._SESSION_COOKIE, "wrong")
+    wrong_cookie = client.post("/api/tests/run")
+
+    client.cookies.set(server._SESSION_COOKIE, server._session_token("sekrit"))
+    right_cookie = client.post("/api/tests/run")
+
+    assert no_cookie.status_code == 401
+    assert wrong_cookie.status_code == 401
+    assert right_cookie.status_code == 200
+
+
+def test_configured_password_is_checked_even_on_loopback(monkeypatch, client, _runnable_tests):
+    """Configuring a password means wanting it enforced — the loopback exemption is only for the blank case."""
+    monkeypatch.setattr(server.settings, "dashboard_password", "sekrit")
 
     resp = client.post("/api/tests/run")
 
-    assert resp.status_code == 403
-    assert "DASHBOARD_API_TOKEN" in resp.json()["detail"]
-
-
-def test_run_tests_requires_the_bearer_token_when_configured(monkeypatch, client, _runnable_tests):
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
-    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
-
-    no_token = client.post("/api/tests/run")
-    wrong = client.post("/api/tests/run", headers={"Authorization": "Bearer wrong"})
-    right = client.post("/api/tests/run", headers={"Authorization": "Bearer sekrit"})
-
-    assert no_token.status_code == 403
-    assert wrong.status_code == 403
-    assert right.status_code == 200
-
-
-def test_configured_token_is_checked_even_on_loopback(monkeypatch, client, _runnable_tests):
-    """Configuring a token means wanting it enforced — the loopback exemption is only for the blank case."""
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
-    monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
-
-    resp = client.post("/api/tests/run")
-
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 # --- manual triggers (ingest / trading cycle) --------------------------------
@@ -760,7 +765,6 @@ def _job_env(monkeypatch, tmp_path):
         stderr = ""
 
     monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _OkResult())
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
     monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
 
 
@@ -817,35 +821,35 @@ def test_run_job_request_returns_before_completion_semantics(client, _job_env, m
     assert spawned == ["ingest"]
 
 
-def test_run_job_is_token_gated_like_tests_run(client, _job_env, monkeypatch):
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
-    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+def test_run_job_is_gated_by_the_session_cookie_like_tests_run(client, _job_env, monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "sekrit")
 
-    no_token = client.post("/api/jobs/ingest/run")
-    right = client.post("/api/jobs/ingest/run", headers={"Authorization": "Bearer sekrit"})
+    no_cookie = client.post("/api/jobs/ingest/run")
 
-    assert no_token.status_code == 403
-    assert right.status_code == 200
+    client.cookies.set(server._SESSION_COOKIE, server._session_token("sekrit"))
+    right_cookie = client.post("/api/jobs/ingest/run")
 
-
-def test_run_job_forbidden_on_open_interface_without_a_token(client, _job_env, monkeypatch):
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
-    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
-
-    assert client.post("/api/jobs/cycle/run").status_code == 403
+    assert no_cookie.status_code == 401
+    assert right_cookie.status_code == 200
 
 
-def test_jobs_status_endpoint_needs_the_token_too(client, _job_env, monkeypatch):
+def test_run_job_forbidden_on_open_interface_without_a_password(client, _job_env):
+    public = TestClient(server.app, base_url="http://0.0.0.0")
+
+    assert public.post("/api/jobs/cycle/run").status_code == 503
+
+
+def test_jobs_status_endpoint_needs_authentication_too(client, _job_env, monkeypatch):
     """
-    Job status used to be readable without a token on the grounds that it
-    only reads. It names what the system is doing right now, and it is an
-    /api route like any other — no exemptions.
+    Job status names what the system is doing right now, and it is an /api
+    route like any other — no exemptions just because it only reads.
     """
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
+    monkeypatch.setattr(server.settings, "dashboard_password", "sekrit")
 
-    assert client.get("/api/jobs").status_code == 403
+    assert client.get("/api/jobs").status_code == 401
 
-    ok = client.get("/api/jobs", headers={"Authorization": "Bearer sekrit"})
+    client.cookies.set(server._SESSION_COOKIE, server._session_token("sekrit"))
+    ok = client.get("/api/jobs")
     assert ok.status_code == 200
     assert set(ok.json()) == {"init_db", "ingest", "cycle"}
 
@@ -928,86 +932,43 @@ def test_bind_defaults_stay_loopback_8501_when_nothing_is_injected(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _api_paths() -> list[str]:
-    """Every /api route the app declares, mounts excluded."""
-    return sorted(
-        route.path for route in server.app.routes
-        if getattr(route, "path", "").startswith("/api")
-    )
-
-
-def test_no_api_route_escapes_the_token_gate():
-    """
-    Declared once on the app so a route added later is private by default.
-    This asserts that arrangement holds: if someone moves the gate back to
-    per-route decorators and forgets one, this fails rather than quietly
-    publishing the new endpoint.
-    """
-    gated = {
-        route.path
-        for route in server.app.routes
-        if getattr(route, "path", "").startswith("/api")
-        and any(d.call is server._require_api_token for d in route.dependant.dependencies)
-    }
-
-    assert gated == set(_api_paths())
-    assert len(gated) > 10, "route introspection found almost nothing — the check has gone blind"
-
-
-def test_reads_are_refused_on_a_public_bind_without_a_token(client, monkeypatch):
+def test_reads_are_refused_without_a_session_cookie_once_a_password_is_configured(client, monkeypatch):
     """
     What these return is the book: open positions, their size, the model's
-    reasoning, the equity curve. A public URL must not hand that to whoever
-    finds it.
+    reasoning, the equity curve. Configuring a password means every one of
+    these needs the session cookie from /login — even on loopback, which is
+    what `client` is bound to here; see test_configured_password_is_checked_
+    even_on_loopback for that property in isolation.
     """
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
-    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+    monkeypatch.setattr(server.settings, "dashboard_password", "sekrit")
 
     for path in ("/api/positions", "/api/decisions", "/api/equity_curve", "/api/trades/closed"):
-        assert client.get(path).status_code == 403, f"{path} leaked without a token"
+        assert client.get(path).status_code == 401, f"{path} leaked without a session cookie"
 
 
-def test_reads_are_refused_on_a_public_bind_even_with_no_token_configured(client, monkeypatch):
-    """Fails closed: a blank DASHBOARD_API_TOKEN must not mean 'open to all'."""
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "")
-    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+def test_reads_are_refused_on_a_public_bind_even_with_no_password_configured(client):
+    """Fails closed: a blank DASHBOARD_PASSWORD must not mean 'open to all'."""
+    public = TestClient(server.app, base_url="http://0.0.0.0")
 
-    assert client.get("/api/positions").status_code == 403
+    assert public.get("/api/positions").status_code == 503
 
 
-def test_reads_still_work_on_loopback_without_a_token(monkeypatch, client):
+def test_reads_still_work_on_loopback_without_a_password(monkeypatch, client):
     """Local development keeps its no-ceremony path."""
     monkeypatch.setattr(server, "get_broker", lambda: _FakeBroker([]))
 
     assert client.get("/api/positions").status_code == 200
 
 
-def test_the_static_page_itself_stays_reachable(client, monkeypatch):
-    """
-    The gate must not lock the door it hands you the key through: the page
-    has to load before anyone can type a token into it. It carries no data
-    of its own — every number arrives via a gated /api call.
-    """
-    monkeypatch.setattr(server.settings, "dashboard_api_token", "sekrit")
-    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
-
-    resp = client.get("/")
-
-    assert resp.status_code == 200
-    assert "api-token-input" in resp.text
+# --------------------------------------------------------------------------
+# Password login page + session cookie (replaces the old separate operator
+# token + HTTP Basic Auth pair with one gate: enter the password once at
+# /login, everything else — the static page, every /api route, the
+# mutating job/test-run endpoints — is covered by the cookie it sets).
+# --------------------------------------------------------------------------
 
 
-# --- HTTP Basic Auth (a second, coarser gate that also covers the static
-# mount, which the token dependency above deliberately skips) ---------------
-
-
-def _basic(user, password):
-    import base64
-
-    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
-
-
-def test_auth_no_password_on_public_bind_is_refused(monkeypatch):
+def test_no_password_on_public_bind_is_refused(monkeypatch):
     monkeypatch.setattr(server.settings, "dashboard_password", "")
     public = TestClient(server.app, base_url="http://0.0.0.0")
     resp = public.get("/api/circuit_breakers")
@@ -1015,30 +976,207 @@ def test_auth_no_password_on_public_bind_is_refused(monkeypatch):
     assert "DASHBOARD_PASSWORD" in resp.text
 
 
-def test_auth_no_password_on_loopback_is_allowed(monkeypatch, client):
+def test_no_password_on_loopback_is_allowed(monkeypatch, client):
     monkeypatch.setattr(server, "load_latest_breaker_state", lambda limit: pd.DataFrame())
     assert client.get("/api/circuit_breakers").status_code == 200
 
 
-def test_auth_wrong_password_is_401_with_challenge(monkeypatch):
+def test_login_page_is_reachable_without_a_session(monkeypatch):
+    """The login flow itself must work before anyone is logged in."""
     monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
     public = TestClient(server.app, base_url="http://0.0.0.0")
-    for headers in ({}, _basic("admin", "nope"), _basic("someone", "s3cret")):
-        resp = public.get("/api/circuit_breakers", headers=headers)
-        assert resp.status_code == 401
-        assert resp.headers["WWW-Authenticate"].startswith("Basic")
+
+    resp = public.get("/login")
+
+    assert resp.status_code == 200
+    assert "<form" in resp.text and 'name="password"' in resp.text
 
 
-def test_auth_correct_password_is_200(monkeypatch):
+def test_login_page_redirects_home_when_already_authenticated(monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    public = TestClient(server.app, base_url="http://0.0.0.0", follow_redirects=False)
+    public.cookies.set(server._SESSION_COOKIE, server._session_token("s3cret"))
+
+    resp = public.get("/login")
+
+    assert resp.status_code in (302, 307)
+    assert resp.headers["location"] == "/"
+
+
+def test_wrong_password_is_401_and_sets_no_cookie(monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    public = TestClient(server.app, base_url="http://0.0.0.0")
+
+    resp = public.post("/login", data={"password": "nope"})
+
+    assert resp.status_code == 401
+    assert "Wrong password" in resp.text
+    assert server._SESSION_COOKIE not in resp.cookies
+
+
+def test_correct_password_sets_a_session_cookie_and_redirects_home(monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    public = TestClient(server.app, base_url="http://0.0.0.0", follow_redirects=False)
+
+    resp = public.post("/login", data={"password": "s3cret"})
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/"
+    assert resp.cookies[server._SESSION_COOKIE] == server._session_token("s3cret")
+
+
+def test_session_cookie_from_login_grants_access_to_the_page_and_the_api(monkeypatch):
+    """
+    The end-to-end flow: log in once, then both the static page and a gated
+    /api route work. base_url is https here (unlike the other public-bind
+    tests) because a real deploy always is — Railway serves HTTPS — and the
+    session cookie is Secure-flagged (see login_submit), so a plain http
+    round trip in the test client would drop it just like a browser would.
+    """
     monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
     monkeypatch.setattr(server, "load_latest_breaker_state", lambda limit: pd.DataFrame())
-    public = TestClient(server.app, base_url="http://0.0.0.0")
-    resp = public.get("/api/circuit_breakers", headers=_basic("admin", "s3cret"))
-    assert resp.status_code == 200
+    public = TestClient(server.app, base_url="https://0.0.0.0", follow_redirects=False)
+
+    login = public.post("/login", data={"password": "s3cret"})
+    assert login.status_code == 303
+
+    # TestClient carries cookies across requests within the same instance,
+    # same as a browser would — the Set-Cookie from the login response above
+    # is already in its jar for these two follow-up requests.
+    assert public.get("/").status_code == 200
+    assert public.get("/api/circuit_breakers").status_code == 200
 
 
-def test_auth_static_page_is_gated_too(monkeypatch):
+def test_unauthenticated_api_request_gets_401_json_not_a_redirect(monkeypatch):
+    """
+    fetch() in app.js can't usefully follow a redirect into an HTML login
+    page — it needs a machine-readable signal to act on (see fetchJSON in
+    app.js, which sends the browser to /login on exactly this).
+    """
     monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
     public = TestClient(server.app, base_url="http://0.0.0.0")
-    assert public.get("/").status_code == 401
-    assert public.get("/", headers=_basic("admin", "s3cret")).status_code == 200
+
+    resp = public.get("/api/circuit_breakers")
+
+    assert resp.status_code == 401
+    assert resp.json()["detail"]
+
+
+def test_unauthenticated_page_request_redirects_to_login(monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    public = TestClient(server.app, base_url="http://0.0.0.0", follow_redirects=False)
+
+    resp = public.get("/")
+
+    assert resp.status_code in (302, 307)
+    assert resp.headers["location"] == "/login"
+
+
+def test_static_page_is_gated_too(monkeypatch):
+    """The mount isn't exempt: it needs the same session cookie as everything else."""
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    public = TestClient(server.app, base_url="http://0.0.0.0", follow_redirects=False)
+
+    assert public.get("/").status_code in (302, 307)
+    public.cookies.set(server._SESSION_COOKIE, server._session_token("s3cret"))
+    assert public.get("/").status_code == 200
+
+
+def test_logout_clears_the_session_cookie(monkeypatch):
+    # The session is established through a real POST /login (rather than
+    # poking the cookie jar directly) so the cookie is associated with the
+    # right domain in the test client's jar — otherwise the deleting
+    # Set-Cookie that /logout sends back doesn't line up with a manually
+    # inserted one and this test would pass for the wrong reason. https
+    # base_url for the same reason as the login test above: the cookie is
+    # Secure-flagged.
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    monkeypatch.setattr(server, "load_latest_breaker_state", lambda limit: pd.DataFrame())
+    public = TestClient(server.app, base_url="https://0.0.0.0", follow_redirects=False)
+    public.post("/login", data={"password": "s3cret"})
+    assert public.get("/api/circuit_breakers").status_code == 200
+
+    logout = public.get("/logout")
+
+    assert logout.status_code in (302, 307)
+    assert public.get("/api/circuit_breakers").status_code == 401
+
+
+def test_changing_the_password_invalidates_outstanding_sessions(monkeypatch):
+    """No server-side session store to revoke — the token is derived from the password itself."""
+    monkeypatch.setattr(server.settings, "dashboard_password", "old-password")
+    monkeypatch.setattr(server, "load_latest_breaker_state", lambda limit: pd.DataFrame())
+    public = TestClient(server.app, base_url="https://0.0.0.0", follow_redirects=False)
+    public.post("/login", data={"password": "old-password"})
+    assert public.get("/api/circuit_breakers").status_code == 200
+
+    monkeypatch.setattr(server.settings, "dashboard_password", "new-password")
+
+    assert public.get("/api/circuit_breakers").status_code == 401
+
+
+# --------------------------------------------------------------------------
+# /api/news/live — universe-wide news feed for the dashboard's Live News tab
+# --------------------------------------------------------------------------
+
+
+def test_live_news_empty_when_no_articles(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "headline", "source", "sentiment"]))
+
+    resp = client.get("/api/news/live")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_live_news_groups_multiple_symbols_under_the_same_story(monkeypatch, client):
+    """One Fed headline tagged to two names must read as one story with two symbols, not two news items."""
+    ts = pd.Timestamp("2026-08-28T14:30:00Z")
+    df = pd.DataFrame(
+        [
+            {"symbol": "AAPL", "ts": ts, "headline": "Fed holds rates steady", "source": "alpaca_stream", "sentiment": 0.2},
+            {"symbol": "MSFT", "ts": ts, "headline": "Fed holds rates steady", "source": "alpaca_stream", "sentiment": -0.1},
+        ]
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/news/live")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["headline"] == "Fed holds rates steady"
+    symbols = {s["symbol"]: s["sentiment"] for s in body[0]["symbols"]}
+    assert symbols == {"AAPL": pytest.approx(0.2), "MSFT": pytest.approx(-0.1)}
+
+
+def test_live_news_separate_headlines_stay_separate(monkeypatch, client):
+    df = pd.DataFrame(
+        [
+            {"symbol": "AAPL", "ts": pd.Timestamp("2026-08-28T14:30:00Z"), "headline": "AAPL beats earnings", "source": "polygon", "sentiment": 0.6},
+            {"symbol": "TSLA", "ts": pd.Timestamp("2026-08-28T15:00:00Z"), "headline": "TSLA recalls vehicles", "source": "polygon", "sentiment": -0.5},
+        ]
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/news/live")
+
+    body = resp.json()
+    assert len(body) == 2
+    assert body[0]["headline"] == "AAPL beats earnings"  # newest (ORDER BY ts DESC from the query) first
+
+
+def test_live_news_leaves_sentiment_null_when_not_yet_scored(monkeypatch, client):
+    """A freshly streamed article (see data/ingest/news_stream.py) has sentiment=NaN until the hourly scoring pass reaches it."""
+    df = pd.DataFrame(
+        [{"symbol": "NVDA", "ts": pd.Timestamp("2026-08-28T16:00:00Z"), "headline": "NVDA announces new chip", "source": "alpaca_stream", "sentiment": float("nan")}]
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/news/live")
+
+    assert resp.json()[0]["symbols"][0]["sentiment"] is None

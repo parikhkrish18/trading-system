@@ -7,43 +7,19 @@ const fmt = {
   time: (v) => (v ? new Date(v).toLocaleString() : "—"),
 };
 
-// ---------- Operator token ----------
-// The mutating endpoints (POST /api/tests/run, /api/jobs/*/run) are gated by
-// DASHBOARD_API_TOKEN, which is mandatory once the dashboard is bound to a
-// public interface. Without this the hosted dashboard's own buttons would be
-// permanently 403 and the only way to run a job would be curl. The token
-// lives in this browser's localStorage and is never sent anywhere except as
-// a bearer header back to this same origin.
-const TOKEN_STORAGE_KEY = "dashboardApiToken";
-
-function getApiToken() {
-  try {
-    return localStorage.getItem(TOKEN_STORAGE_KEY) || "";
-  } catch {
-    return ""; // private browsing / storage disabled — the field just won't persist
-  }
-}
-
-function setApiToken(value) {
-  try {
-    if (value) localStorage.setItem(TOKEN_STORAGE_KEY, value);
-    else localStorage.removeItem(TOKEN_STORAGE_KEY);
-  } catch {
-    /* not persisting is survivable; the in-page value still works this session */
-  }
-}
-
+// ---------- Auth ----------
+// A single dashboard password gates everything now (see
+// monitoring/dashboard/server.py) — the session cookie /login sets is sent
+// automatically by the browser on every same-origin fetch, no token
+// plumbing needed here. The one thing this page still has to handle is a
+// cookie that's missing or has gone stale (expired, or the password
+// changed under it): the server answers with 401, and the right response
+// to that is to send the browser to /login, not to show a broken panel.
 async function fetchJSON(url, opts) {
-  const options = { ...opts };
-  const token = getApiToken();
-  if (token) options.headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` };
-  const res = await fetch(url, options);
-  if (res.status === 403) {
-    throw new Error(
-      token
-        ? "403 — the operator token was rejected. Check it matches DASHBOARD_API_TOKEN on the server."
-        : "403 — this action needs the operator token. Paste DASHBOARD_API_TOKEN into the box at the top right."
-    );
+  const res = await fetch(url, opts);
+  if (res.status === 401) {
+    window.location.href = "/login";
+    throw new Error("401 — not logged in, redirecting to /login");
   }
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
   return res.json();
@@ -729,8 +705,9 @@ async function startJob(name) {
     await fetchJSON(`/api/jobs/${name}/run`, { method: "POST" });
     await loadJobs();
   } catch (e) {
-    // 409 = already running, 403 = missing/rejected token. Show it: a button
-    // that silently does nothing is the worst way to report a missing token.
+    // 409 = already running. Show it: a button that silently does nothing
+    // is the worst way to report a failure (401 is handled by fetchJSON
+    // itself, which redirects to /login before this catch ever sees it).
     await loadJobs();
     document.getElementById("job-output").textContent =
       `Could not start ${name}: ${e.message}\n\n` + document.getElementById("job-output").textContent;
@@ -751,29 +728,83 @@ async function loadModeBadge() {
   }
 }
 
-// ---------- Orchestration ----------
-// Every panel fetches independently, so a missing token would otherwise
-// show up as a dozen separately-broken panels and no explanation. One probe
-// up front turns that into a single sentence saying what to do.
-async function checkAccess() {
-  const banner = document.getElementById("auth-banner");
+// ---------- Live News tab ----------
+// Turns a raw sentiment float (-1..1, or null before the hourly scoring
+// pass has reached a headline) into something readable at a glance, rather
+// than making a reader interpret "0.42" themselves.
+function sentimentLabel(score) {
+  if (score === null || score === undefined) return { text: "Not yet scored", cls: "muted" };
+  const abs = Math.abs(score);
+  if (abs < 0.1) return { text: "Neutral", cls: "" };
+  const direction = score > 0 ? "Positive" : "Negative";
+  const strength = abs >= 0.65 ? "Strongly " : abs >= 0.35 ? "" : "Slightly ";
+  return { text: `${strength}${direction}`, cls: score > 0 ? "pl-pos" : "pl-neg" };
+}
+
+function newsCardHTML(item) {
+  const pills = item.symbols
+    .map((s) => {
+      const label = sentimentLabel(s.sentiment);
+      const score = s.sentiment === null || s.sentiment === undefined ? "" : ` (${fmt.num(s.sentiment, 2)})`;
+      return `<span class="news-symbol-pill ${label.cls}"><strong>${s.symbol}</strong> — ${label.text}${score}</span>`;
+    })
+    .join("");
+  return `
+    <div class="news-card">
+      <div class="news-card-headline">${item.headline}</div>
+      <div class="news-card-meta">${fmt.time(item.ts)} · ${item.source || ""}</div>
+      <div class="news-card-symbols">${pills}</div>
+    </div>`;
+}
+
+async function loadLiveNews(symbolFilter) {
+  const list = document.getElementById("live-news-list");
+  let items;
   try {
-    await fetchJSON("/api/jobs");
-    banner.hidden = true;
-    return true;
+    items = await fetchJSON("/api/news/live?limit=150");
   } catch (e) {
-    if (!/^403/.test(e.message)) {
-      banner.hidden = true;
-      return true; // some other failure — let the panels report it themselves
-    }
-    banner.textContent = e.message;
-    banner.hidden = false;
-    return false;
+    list.innerHTML = `<div class="empty-state">Could not load news: ${e.message}</div>`;
+    return;
+  }
+  if (symbolFilter) {
+    const needle = symbolFilter.toUpperCase();
+    items = items.filter((it) => it.symbols.some((s) => s.symbol.toUpperCase() === needle));
+  }
+  if (items.length === 0) {
+    list.innerHTML = '<div class="empty-state">No recent news found.</div>';
+    return;
+  }
+  list.innerHTML = items.map(newsCardHTML).join("");
+}
+
+function currentNewsFilter() {
+  return document.getElementById("news-symbol-filter").value.trim();
+}
+
+// ---------- Tabs ----------
+let newsTabLoadedOnce = false;
+let activeTab = "overview";
+
+function switchTab(name) {
+  activeTab = name;
+  document.querySelectorAll(".tab-panel").forEach((el) => {
+    el.hidden = el.id !== `tab-${name}`;
+  });
+  document.querySelectorAll(".tab-btn").forEach((el) => {
+    el.classList.toggle("active", el.dataset.tab === name);
+  });
+  if (name === "news" && !newsTabLoadedOnce) {
+    newsTabLoadedOnce = true;
+    loadLiveNews(currentNewsFilter());
   }
 }
 
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+});
+
+// ---------- Orchestration ----------
 async function loadAll() {
-  if (!(await checkAccess())) return;
   await Promise.allSettled([
     loadModeBadge(),
     loadPositions(),
@@ -790,14 +821,8 @@ async function loadAll() {
     loadLastTestRun(),
     loadJobs(),
   ]);
+  if (activeTab === "news") await loadLiveNews(currentNewsFilter());
 }
-
-const tokenInput = document.getElementById("api-token-input");
-tokenInput.value = getApiToken();
-tokenInput.addEventListener("change", () => {
-  setApiToken(tokenInput.value.trim());
-  loadAll(); // a freshly-pasted token should fill the page, not need a second click
-});
 
 document.getElementById("refresh-btn").addEventListener("click", loadAll);
 document.getElementById("run-tests-btn").addEventListener("click", runTestsNow);
@@ -809,6 +834,11 @@ document.getElementById("decision-filter-btn").addEventListener("click", () => {
 });
 document.getElementById("decision-symbol-filter").addEventListener("keydown", (e) => {
   if (e.key === "Enter") document.getElementById("decision-filter-btn").click();
+});
+document.getElementById("news-filter-btn").addEventListener("click", () => loadLiveNews(currentNewsFilter()));
+document.getElementById("news-refresh-btn").addEventListener("click", () => loadLiveNews(currentNewsFilter()));
+document.getElementById("news-symbol-filter").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("news-filter-btn").click();
 });
 // The sliders re-hit the endpoint on every input tick — the endpoint is a
 // read-only re-filter of one already-logged batch, so that's cheap.
