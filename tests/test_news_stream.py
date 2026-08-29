@@ -188,3 +188,30 @@ class TestNewsStreamBuffer:
         buf, _, _ = self._buffer()
         assert buf.flush_interval == DEFAULT_FLUSH_INTERVAL_SECONDS
         assert buf.max_batch == DEFAULT_FLUSH_MAX_BATCH
+
+    def test_flush_dedupes_a_redelivered_article_within_one_batch(self):
+        """Regression: Alpaca redelivering the same article (reconnect, or a
+        corrected version) within one flush window used to write two rows
+        with the same (id, ts) in a single upsert statement, which Postgres
+        rejects with CardinalityViolation and crashed the whole stream."""
+        buf, writes, _ = self._buffer()
+        buf.add_article(_article(symbols=["AAPL"]))
+        buf.add_article(_article(symbols=["AAPL"]))  # exact redelivery: same id, same ts
+
+        n = buf.flush()
+
+        assert n == 1
+        assert len(writes[0]) == 1
+
+    def test_flush_keeps_distinct_rows_with_different_timestamps(self):
+        """Dedup is scoped to (id, ts) together, not id alone -- a follow-up
+        article that reuses an id (shouldn't happen, but) at a different ts
+        must not be silently dropped."""
+        buf, writes, _ = self._buffer()
+        buf.add_article(_article(id="art-1", symbols=["AAPL"], created_at="2026-08-20T14:30:00Z"))
+        buf.add_article(_article(id="art-1", symbols=["AAPL"], created_at="2026-08-20T15:00:00Z"))
+
+        n = buf.flush()
+
+        assert n == 2
+        assert len(writes[0]) == 2
