@@ -23,12 +23,12 @@ from data.ingest.news_stream import (
 
 
 def _article(**overrides):
-    defaults = dict(
-        id="alpaca-article-1",
-        headline="Some Company beats on earnings",
-        created_at="2026-08-20T14:30:00Z",
-        symbols=["AAPL", "MSFT"],
-    )
+    defaults = {
+        "id": "alpaca-article-1",
+        "headline": "Some Company beats on earnings",
+        "created_at": "2026-08-20T14:30:00Z",
+        "symbols": ["AAPL", "MSFT"],
+    }
     return types.SimpleNamespace(**{**defaults, **overrides})
 
 
@@ -147,7 +147,7 @@ class TestNewsStreamBuffer:
         assert writes == []
 
     def test_malformed_article_is_dropped_not_buffered(self):
-        buf, writes, _ = self._buffer()
+        buf, _writes, _ = self._buffer()
 
         added = buf.add_article(_article(symbols=[]))
 
@@ -178,7 +178,7 @@ class TestNewsStreamBuffer:
     def test_handle_article_delegates_to_add_article(self):
         """handle_article is the coroutine handed to NewsDataStream.subscribe_news —
         run without a real event loop (no pytest-asyncio dependency needed)."""
-        buf, writes, _ = self._buffer()
+        buf, _writes, _ = self._buffer()
 
         asyncio.run(buf.handle_article(_article()))
 

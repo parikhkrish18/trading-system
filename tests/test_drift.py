@@ -55,8 +55,7 @@ class TestAccuracyDriftFlag:
         for week_offset, hit_rate in enumerate([0.3, 0.2, 0.4]):  # 3 straight bad weeks
             day = pd.Timestamp("2026-08-03") + pd.Timedelta(weeks=week_offset)
             n_hits = round(hit_rate * 10)
-            for i in range(10):
-                rows.append((f"S{i}", (day + pd.Timedelta(days=i % 5)).isoformat(), i < n_hits))
+            rows.extend((f"S{i}", (day + pd.Timedelta(days=i % 5)).isoformat(), i < n_hits) for i in range(10))
         weekly = drift.weekly_hit_rate(_scored(rows))
         result = drift.accuracy_drift_flag(weekly, baseline_accuracy=0.52, consecutive_weeks=3)
         assert result["flagged"] is True
@@ -67,8 +66,7 @@ class TestAccuracyDriftFlag:
         for week_offset, hit_rate in enumerate([0.3, 0.2, 0.9]):  # last week is strong
             day = pd.Timestamp("2026-08-03") + pd.Timedelta(weeks=week_offset)
             n_hits = round(hit_rate * 10)
-            for i in range(10):
-                rows.append((f"S{i}", (day + pd.Timedelta(days=i % 5)).isoformat(), i < n_hits))
+            rows.extend((f"S{i}", (day + pd.Timedelta(days=i % 5)).isoformat(), i < n_hits) for i in range(10))
         weekly = drift.weekly_hit_rate(_scored(rows))
         result = drift.accuracy_drift_flag(weekly, baseline_accuracy=0.52, consecutive_weeks=3)
         assert result["flagged"] is False

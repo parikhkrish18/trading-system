@@ -356,7 +356,6 @@ def _bounded_conviction_weights(
     equal_share = 1.0 / n
     min_leg_pct = min_leg_floor_fraction * equal_share
     clipped_scores = [max(s, 0.0) for s in scores]
-    total = sum(clipped_scores)
 
     fixed: list[float | None] = [None] * n
     for _ in range(n):

@@ -85,7 +85,7 @@ def accuracy_drift_flag(
         return {
             "flagged": False,
             "message": f"Only {len(weekly)} week(s) of matured live decisions so far -- need {consecutive_weeks} before a drift check means anything.",
-            "weeks_checked": int(len(weekly)),
+            "weeks_checked": len(weekly),
         }
 
     recent = weekly.tail(consecutive_weeks)
@@ -105,7 +105,7 @@ def accuracy_drift_flag(
     return {
         "flagged": below,
         "message": message,
-        "weeks_checked": int(len(recent)),
+        "weeks_checked": len(recent),
         "worst_week_hit_rate": worst,
     }
 
