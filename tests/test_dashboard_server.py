@@ -24,8 +24,11 @@ def _local_dev_bind(monkeypatch):
 
 
 @pytest.fixture
-def client():
-    return TestClient(server.app)
+def client(monkeypatch):
+    # Loopback base URL: with no DASHBOARD_PASSWORD the Basic Auth middleware
+    # only lets requests through on a loopback bind (see the auth tests below).
+    monkeypatch.setattr(server.settings, "dashboard_password", "")
+    return TestClient(server.app, base_url="http://127.0.0.1")
 
 
 class _FakeBroker:
@@ -992,3 +995,50 @@ def test_the_static_page_itself_stays_reachable(client, monkeypatch):
 
     assert resp.status_code == 200
     assert "api-token-input" in resp.text
+
+
+# --- HTTP Basic Auth (a second, coarser gate that also covers the static
+# mount, which the token dependency above deliberately skips) ---------------
+
+
+def _basic(user, password):
+    import base64
+
+    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
+
+
+def test_auth_no_password_on_public_bind_is_refused(monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "")
+    public = TestClient(server.app, base_url="http://0.0.0.0")
+    resp = public.get("/api/circuit_breakers")
+    assert resp.status_code == 503
+    assert "DASHBOARD_PASSWORD" in resp.text
+
+
+def test_auth_no_password_on_loopback_is_allowed(monkeypatch, client):
+    monkeypatch.setattr(server, "load_latest_breaker_state", lambda limit: pd.DataFrame())
+    assert client.get("/api/circuit_breakers").status_code == 200
+
+
+def test_auth_wrong_password_is_401_with_challenge(monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    public = TestClient(server.app, base_url="http://0.0.0.0")
+    for headers in ({}, _basic("admin", "nope"), _basic("someone", "s3cret")):
+        resp = public.get("/api/circuit_breakers", headers=headers)
+        assert resp.status_code == 401
+        assert resp.headers["WWW-Authenticate"].startswith("Basic")
+
+
+def test_auth_correct_password_is_200(monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    monkeypatch.setattr(server, "load_latest_breaker_state", lambda limit: pd.DataFrame())
+    public = TestClient(server.app, base_url="http://0.0.0.0")
+    resp = public.get("/api/circuit_breakers", headers=_basic("admin", "s3cret"))
+    assert resp.status_code == 200
+
+
+def test_auth_static_page_is_gated_too(monkeypatch):
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    public = TestClient(server.app, base_url="http://0.0.0.0")
+    assert public.get("/").status_code == 401
+    assert public.get("/", headers=_basic("admin", "s3cret")).status_code == 200

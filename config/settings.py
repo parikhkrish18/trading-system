@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # --- MLflow ---
     mlflow_tracking_uri: str = Field(default="http://localhost:5000", alias="MLFLOW_TRACKING_URI")
 
+    # --- Dashboard (HTTP Basic Auth; see monitoring/dashboard/server.py) ---
+    dashboard_user: str = Field(default="admin", alias="DASHBOARD_USER")
+    # No default on purpose: with this empty the dashboard only serves on loopback.
+    dashboard_password: str = Field(default="", alias="DASHBOARD_PASSWORD")
+
     # --- Feature set ---
     # Which feature set the dashboard-triggered pipeline runs on. CLI
     # invocations still pass --feature-set-id explicitly; this only feeds
