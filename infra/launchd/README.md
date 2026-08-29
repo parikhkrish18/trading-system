@@ -6,14 +6,22 @@ LaunchDaemon) is used deliberately: it only runs while you're logged in,
 which is the right scope for a personal-machine paper-trading job — no root,
 no running unattended before anyone's confirmed the Mac is actually on.
 
-Two jobs:
+Three jobs:
 - **`weekly-cycle`** — full universe refresh, re-ingest, retrain, screen and
   trade. Runs once a week.
 - **`contradiction-monitor`** — checks currently held positions against
-  fresh news sentiment and short-term price momentum, closing anything the
-  evidence has turned against. Runs hourly, no-ops itself outside market
-  hours (see `execution/contradiction_monitor.py`) rather than relying on a
-  DST-sensitive fixed schedule.
+  fresh news sentiment, short-term price momentum, and each position's own
+  take-profit/stop-loss, closing anything the evidence (or the position's
+  own resolution) has turned against. Runs hourly, no-ops itself outside
+  market hours (see `execution/contradiction_monitor.py`) rather than
+  relying on a DST-sensitive fixed schedule.
+- **`news-stream`** — a long-lived process, not a periodic job: it holds
+  Alpaca's news websocket open and writes headlines to `news_events`
+  continuously instead of on a weekly poll (see
+  `data/ingest/news_stream.py`). `KeepAlive` restarts it if it ever exits;
+  `RunAtLoad` starts it as soon as the plist is loaded. This is a
+  data-freshness job only — it does not screen or trade; that stays on
+  `weekly-cycle` plus the hourly `contradiction-monitor` above.
 
 ## Install
 
@@ -21,9 +29,16 @@ Two jobs:
 mkdir -p logs
 cp infra/launchd/com.trading-system.weekly-cycle.plist ~/Library/LaunchAgents/
 cp infra/launchd/com.trading-system.contradiction-monitor.plist ~/Library/LaunchAgents/
+cp infra/launchd/com.trading-system.news-stream.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.trading-system.weekly-cycle.plist
 launchctl load ~/Library/LaunchAgents/com.trading-system.contradiction-monitor.plist
+launchctl load ~/Library/LaunchAgents/com.trading-system.news-stream.plist
 ```
+
+`news-stream` needs an Alpaca API key configured (`ALPACA_PAPER_API_KEY` /
+`ALPACA_PAPER_SECRET_KEY`, or the `_LIVE_` variants) even if `BROKER=ibkr` —
+it only reads news, it never places an order, and Alpaca's paper keys are
+free and enough on their own.
 
 ## Verify it's loaded
 
@@ -39,6 +54,9 @@ tail -f logs/weekly-cycle.log logs/weekly-cycle.error.log
 
 launchctl start com.trading-system.contradiction-monitor
 tail -f logs/contradiction-monitor.log logs/contradiction-monitor.error.log
+
+launchctl start com.trading-system.news-stream
+tail -f logs/news-stream.log logs/news-stream.error.log
 ```
 
 ## Uninstall
@@ -49,6 +67,9 @@ rm ~/Library/LaunchAgents/com.trading-system.weekly-cycle.plist
 
 launchctl unload ~/Library/LaunchAgents/com.trading-system.contradiction-monitor.plist
 rm ~/Library/LaunchAgents/com.trading-system.contradiction-monitor.plist
+
+launchctl unload ~/Library/LaunchAgents/com.trading-system.news-stream.plist
+rm ~/Library/LaunchAgents/com.trading-system.news-stream.plist
 ```
 
 ## Notes
@@ -59,7 +80,9 @@ rm ~/Library/LaunchAgents/com.trading-system.contradiction-monitor.plist
 - Only fires while this Mac is on, awake, and you're logged in. If the Mac
   is asleep at the scheduled time, launchd runs it as soon as the Mac wakes
   (it doesn't just skip the run), but if it's fully off, that week's cycle
-  is missed — check `logs/weekly-cycle.log` periodically.
+  is missed — check `logs/weekly-cycle.log` periodically. `news-stream` is
+  the same story in reverse: it just stops collecting news while the Mac is
+  off/asleep and picks back up on wake/login, it doesn't backfill the gap.
 - `--feature-set-id v3` and `--top-k 10` are baked into the plist; edit
   `ProgramArguments` and reload (`launchctl unload` + `launchctl load`) to
   change them.

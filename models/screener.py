@@ -165,6 +165,59 @@ def score_universe(
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
 
+def apply_short_preference(
+    scored: pd.DataFrame,
+    vol_by_symbol: dict[str, float],
+    horizon_days: int,
+    penalty: float = 0.0,
+    low_risk_stop_loss_pct: float | None = None,
+) -> pd.DataFrame:
+    """
+    Adds a `rank_score` column used to decide WHICH candidates make the
+    shortlist (see select_trades/select_concentrated_trades's `rank_score_col`)
+    — never how big a selected position is sized, which still runs off the
+    real predicted_return/conviction_score untouched.
+
+    Every long keeps rank_score == conviction_score. A short is handicapped
+    by `penalty` (rank_score = conviction_score * (1 - penalty)) UNLESS its
+    own derived stop-loss — see execution/exit_levels.py, sized to that
+    specific stock's volatility, not a blanket number — is at or below
+    `low_risk_stop_loss_pct`, in which case it competes on raw conviction
+    like a long would. That carve-out is what turns "slight preference for
+    longs" into "unless it's a confident short with contained downside":
+    the penalty only ever protects longs from a marginal short outbidding
+    them on a coin-flip-sized edge, it never blocks a short that is both
+    genuinely confident AND backed by a stock that doesn't move much.
+
+    `penalty=0.0` (or `low_risk_stop_loss_pct=None`) makes this a no-op —
+    rank_score equals conviction_score for every row, so callers that don't
+    care about the preference (e.g. every existing caller before this was
+    added) see identical ranking to before.
+    """
+    if scored.empty:
+        return scored.assign(rank_score=pd.Series(dtype=float))
+
+    out = scored.copy()
+    if penalty <= 0.0 or low_risk_stop_loss_pct is None:
+        out["rank_score"] = out["conviction_score"]
+        return out
+
+    def _rank_score(row: pd.Series) -> float:
+        if row["predicted_return"] >= 0:
+            return float(row["conviction_score"])
+        stop_loss = exit_levels_for(
+            predicted_return=row["predicted_return"],
+            daily_volatility=vol_by_symbol.get(row["symbol"]),
+            horizon_days=horizon_days,
+        ).stop_loss_pct
+        if stop_loss <= low_risk_stop_loss_pct:
+            return float(row["conviction_score"])  # confident + contained downside: no handicap
+        return float(row["conviction_score"]) * (1.0 - penalty)
+
+    out["rank_score"] = out.apply(_rank_score, axis=1)
+    return out
+
+
 def select_trades(
     scored: pd.DataFrame,
     regime: str,
@@ -177,6 +230,7 @@ def select_trades(
     current_positions: dict[str, float] | None = None,
     is_shortable_fn: Callable[[str], bool] | None = None,
     allow_shorts: bool = True,
+    rank_score_col: str | None = None,
 ) -> list[TradeCandidate]:
     """
     The diversified-book path — the default strategy (STRATEGY_MODE=
@@ -199,9 +253,17 @@ def select_trades(
     run_screen passes settings.allow_shorts (default False — shorts lost
     -1.069% per trade in the walk-forward). The parameter defaults to True
     here because this function is the mechanism; the policy lives in config.
+
+    `rank_score_col`: which column decides WHO makes the top_k cut and in
+    what order — defaults to "conviction_score" (the original behavior,
+    unchanged) when None or when the named column isn't present. run_screen
+    passes "rank_score" (see apply_short_preference) so a long/short
+    ranking preference can apply without touching how a selected
+    candidate is actually sized below.
     """
     current_positions = current_positions or {}
-    confident = scored.loc[scored["confident"]].sort_values("conviction_score", ascending=False)
+    sort_col = rank_score_col if rank_score_col and rank_score_col in scored.columns else "conviction_score"
+    confident = scored.loc[scored["confident"]].sort_values(sort_col, ascending=False)
 
     candidates: list[TradeCandidate] = []
     for _, row in confident.iterrows():
@@ -266,6 +328,7 @@ def select_concentrated_trades(
     total_deploy_pct: float = 1.0,
     is_shortable_fn: Callable[[str], bool] | None = None,
     allow_shorts: bool = True,
+    rank_score_col: str | None = None,
 ) -> list[TradeCandidate]:
     """
     The concentrated strategy (STRATEGY_MODE=concentrated): put all deployable capital into the top 2
@@ -289,11 +352,20 @@ def select_concentrated_trades(
     leaving the book half-deployed. See settings.allow_shorts for why it
     defaults off in production.
 
+    `rank_score_col`: which column picks the two legs and their order —
+    defaults to "conviction_score" (unchanged original behavior) when None
+    or when the named column isn't present; run_screen passes "rank_score"
+    (see apply_short_preference). The eventual split WEIGHT below still
+    uses each pick's real conviction_score, never the ranking column — the
+    preference only affects who gets picked, not how big their leg is once
+    picked.
+
     `total_deploy_pct` is the fraction of portfolio value to put to work in
     total, both legs combined — pass less than 1.0 for e.g. regime-based
     damping (see run_screen).
     """
-    confident = scored.loc[scored["confident"]].sort_values("conviction_score", ascending=False)
+    sort_col = rank_score_col if rank_score_col and rank_score_col in scored.columns else "conviction_score"
+    confident = scored.loc[scored["confident"]].sort_values(sort_col, ascending=False)
 
     picks: list[pd.Series] = []
     for _, row in confident.iterrows():
@@ -517,6 +589,17 @@ def run_screen_with_scores(
     latest = load_latest_features(feature_set_id, symbols)
     scored = score_universe(ensemble, latest, feature_cols, min_abs_return)
 
+    # Computed once, up front, so it can inform BOTH which candidates get
+    # picked (the long/short ranking preference below, when configured) and
+    # the exit levels every candidate is proposed with — the same volatility
+    # read used for both, rather than recomputed twice and risking drift.
+    vol_by_symbol = daily_volatility(train_df[["symbol", "ts", "close"]])
+    scored = apply_short_preference(
+        scored, vol_by_symbol, target_horizon_days,
+        penalty=settings.short_ranking_penalty,
+        low_risk_stop_loss_pct=settings.short_low_risk_stop_loss_pct,
+    )
+
     if not settings.allow_shorts and not scored.empty:
         # Logged rather than silent: the shortlist can look thin for a
         # perfectly good reason, and "the model wanted to short 6 names and
@@ -538,6 +621,7 @@ def run_screen_with_scores(
             total_deploy_pct=total_deploy_pct,
             is_shortable_fn=is_shortable_fn,
             allow_shorts=settings.allow_shorts,
+            rank_score_col="rank_score",
         )
     else:
         # Diversified default: top-k book sized through the full risk
@@ -559,6 +643,7 @@ def run_screen_with_scores(
             top_k=settings.screener_top_k,
             is_shortable_fn=is_shortable_fn,
             allow_shorts=settings.allow_shorts,
+            rank_score_col="rank_score",
         )
         # Reactivation semantics: when only a freed slice of the portfolio
         # is on the table, every size shrinks proportionally to fit it.
@@ -587,8 +672,10 @@ def run_screen_with_scores(
     )
     # Exit levels come from the same price history the model trained on, so
     # a pick is proposed with levels sized to that stock rather than to the
-    # average of every stock.
-    attach_exit_levels(candidates, daily_volatility(train_df[["symbol", "ts", "close"]]))
+    # average of every stock. Reuses vol_by_symbol computed above (same
+    # numbers apply_short_preference already ranked this candidate against)
+    # rather than recomputing it a second time.
+    attach_exit_levels(candidates, vol_by_symbol)
     return ScreenResult(candidates=candidates, scored=scored)
 
 

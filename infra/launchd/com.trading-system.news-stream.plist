@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trading-system.news-stream</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/kp/Downloads/trading-system/.venv/bin/python</string>
+        <string>-m</string>
+        <string>data.ingest.news_stream</string>
+        <string>--universe</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/kp/Downloads/trading-system</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/kp/Downloads/trading-system/logs/news-stream.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/kp/Downloads/trading-system/logs/news-stream.error.log</string>
+
+    <!--
+      A long-lived process, not a periodic job -- data/ingest/news_stream.py
+      blocks forever consuming Alpaca's news websocket. KeepAlive restarts
+      it if it exits for any reason (a fatal error past its own internal
+      reconnect/backoff, a Mac sleep/wake dropping the socket); RunAtLoad
+      starts it as soon as this plist is loaded rather than waiting for a
+      schedule. This is a DATA-freshness job only -- it does not screen or
+      trade. Screening/trading stays on weekly-cycle.plist plus the hourly
+      contradiction-monitor.plist above; see data/ingest/news_stream.py's
+      module docstring for why continuous ingestion and continuous trading
+      are deliberately kept separate.
+    -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Belt-and-suspenders against a crash-loop hammering Alpaca's
+         websocket if something is persistently broken (bad keys, etc). -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

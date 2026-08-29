@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import hmac
 import json
+import logging
 import subprocess
 import sys
 import threading
@@ -30,12 +31,16 @@ from sqlalchemy import text
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from execution.broker import get_broker
+from execution.hold_rules import load_exit_levels
 from features.quant.momentum import adx as compute_adx
 from models.regime.trend_chop_classifier import RuleBasedRegime
+from monitoring import drift
 from monitoring.breaker_state import load_latest_breaker_state
 from monitoring.dashboard import report_card, whatif
 from monitoring.equity import load_equity_curve
 from monitoring.forecast_accuracy import compute_forecast_accuracy
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -111,7 +116,28 @@ def get_positions() -> list[dict]:
     )
     decisions_by_symbol = {row["symbol"]: row.to_dict() for _, row in decisions.iterrows()}
 
+    # The take-profit/stop-loss pair each open position was actually approved
+    # with (execution/exit_levels.py, enforced weekly by execution/hold_rules.py).
+    # Best-effort: a dashboard panel going blank on a DB hiccup beats the whole
+    # positions endpoint 500ing over a field nothing above this depended on before.
+    try:
+        levels_by_symbol = load_exit_levels(engine)
+    except Exception:
+        logger.exception("Failed to load exit levels — positions will show without them.")
+        levels_by_symbol = {}
+
     for p in positions:
+        levels = levels_by_symbol.get(p["symbol"])
+        p["exit_levels"] = (
+            {
+                "take_profit_pct": levels.take_profit_pct,
+                "stop_loss_pct": levels.stop_loss_pct,
+                "derived": levels.derived,
+            }
+            if levels
+            else None
+        )
+
         decision = decisions_by_symbol.get(p["symbol"])
         if decision is None:
             p["decision"] = None
@@ -245,6 +271,57 @@ def get_live_accuracy(limit: int = 500) -> dict:
 
     is_live = decisions["mode"].isin(_LIVE_DECISION_MODES)
     return {**_scored(decisions[is_live]), "backfill": _scored(decisions[~is_live])}
+
+
+@app.get("/api/analysis/drift")
+def get_model_drift(consecutive_weeks: int = drift.DEFAULT_DRIFT_WEEKS) -> dict:
+    """
+    Read-only model-drift diagnostics (see monitoring/drift.py for the
+    2026-08-28 decision behind this): whether live directional accuracy has
+    fallen below the walk-forward baseline for several straight weeks, and
+    which recent top-driver features have shown up in decisions that turned
+    out wrong more often than right.
+
+    Deliberately does nothing but report. Nothing here retrains, reweights,
+    or otherwise changes the model — acting on what this shows (dropping a
+    feature, running models/train.py early, tightening the confidence bar)
+    stays a human call, same as every other change to what the model does.
+    """
+    empty = {"available": False, "message": "No live decisions logged yet.", "weekly": [], "accuracy_flag": None, "feature_drag": []}
+    engine = get_engine()
+    decisions = pd.read_sql(
+        text(
+            "SELECT symbol, ts, forecast, reasoning FROM decisions "
+            "WHERE forecast IS NOT NULL AND mode IN ('paper', 'live') ORDER BY ts DESC LIMIT 1000"
+        ),
+        engine,
+    )
+    if decisions.empty:
+        return empty
+
+    symbol_list = symbol_in_clause(decisions["symbol"].unique())
+    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
+    scored = compute_forecast_accuracy(decisions[["symbol", "ts", "forecast"]], prices)
+    if scored.empty:
+        return {**empty, "message": "No live decisions have matured yet (need a later price bar to grade against)."}
+
+    weekly = drift.weekly_hit_rate(scored)
+
+    baseline_accuracy = None
+    try:
+        runs = report_card.fetch_fold_runs(settings.mlflow_tracking_uri)
+        folds = report_card.fold_metrics_frame(runs)
+        baseline_accuracy = report_card.headline_metrics(folds)["directional_accuracy"]
+    except Exception:
+        logger.exception("Could not load the walk-forward baseline for the drift check — accuracy_flag will say why.")
+
+    return {
+        "available": True,
+        "baseline_accuracy": baseline_accuracy,
+        "weekly": _clean_records(weekly),
+        "accuracy_flag": drift.accuracy_drift_flag(weekly, baseline_accuracy, consecutive_weeks=consecutive_weeks),
+        "feature_drag": drift.feature_drag(decisions[["symbol", "ts", "reasoning"]], scored),
+    }
 
 
 @app.get("/api/analysis/report_card")

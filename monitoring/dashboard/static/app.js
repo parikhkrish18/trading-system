@@ -293,6 +293,30 @@ function positionCardHTML(p, idx, newsBySymbol) {
       <div class="reasoning-body" id="news-${idx}">${newsFeedHTML(news)}</div>
     `;
 
+  // Take-profit / stop-loss this position was actually approved with
+  // (execution/exit_levels.py), enforced every weekly cycle by
+  // execution/hold_rules.py. `derived: false` means volatility couldn't be
+  // measured for this stock and the global HOLD_*_PCT defaults were used
+  // instead of levels sized to it specifically.
+  const exitBlock = p.exit_levels
+    ? `
+      <div class="position-grid-stats">
+        <div><div class="label">Take profit</div><span class="pl-pos">+${fmt.pct(p.exit_levels.take_profit_pct, 1)}</span></div>
+        <div><div class="label">Stop loss</div><span class="pl-neg">−${fmt.pct(p.exit_levels.stop_loss_pct, 1)}</span></div>
+        <div><div class="label">Levels</div>${p.exit_levels.derived ? "sized to this stock" : "default (no vol data)"}</div>
+      </div>`
+    : '<div class="no-decision">No take-profit/stop-loss recorded for this position yet.</div>';
+
+  const watcherNote = `
+    <div class="muted" style="font-size:11px;margin-top:4px;">
+      Watched hourly during market hours — a close is proposed automatically (same human approval
+      gate as every other trade) the moment any of these fire: fresh news sentiment or 5-day price
+      momentum turning against this position, or the position's own take-profit/stop-loss above
+      being hit. That last one is the swing-trade exit: it doesn't wait for the weekly cycle, so a
+      volatile stock's target can close in a few days and a calmer one's can take longer, on its
+      own timeline (execution/contradiction_monitor.py).
+    </div>`;
+
   return `
     <div class="position-card">
       <div class="position-card-head">
@@ -306,6 +330,8 @@ function positionCardHTML(p, idx, newsBySymbol) {
         <div><div class="label">Current price</div>${fmt.money(p.current_price)}</div>
         <div><div class="label">Unrealized P/L</div><span class="${plClass}">${fmt.money(p.unrealized_pl)} (${fmt.pct(p.unrealized_plpc)})</span></div>
       </div>
+      ${exitBlock}
+      ${watcherNote}
       ${decisionBlock}
       ${newsBlock}
     </div>`;
@@ -456,6 +482,43 @@ async function loadFeatureImportance() {
       </div>`;
     })
     .join("");
+}
+
+// ---------- Model drift & self-diagnostics ----------
+// Read-only: surfaces signals for a human, never changes the model itself.
+// See monitoring/drift.py for the 2026-08-28 decision behind this panel.
+async function loadDrift() {
+  const result = await fetchJSON("/api/analysis/drift");
+  const callout = document.getElementById("drift-callout");
+  const tbody = document.querySelector("#drift-feature-table tbody");
+
+  if (!result.available) {
+    callout.innerHTML = `<div class="empty-state">${result.message}</div>`;
+    renderLineChart(document.getElementById("drift-accuracy-chart"), []);
+    tbody.innerHTML = '<tr><td colspan="3" class="empty-state">Not enough matured decisions yet.</td></tr>';
+    return;
+  }
+
+  const flag = result.accuracy_flag;
+  const calloutClass = flag && flag.flagged ? "callout bad" : "callout";
+  callout.innerHTML = `<div class="${calloutClass}">${flag ? flag.message : ""}</div>`;
+
+  renderLineChart(
+    document.getElementById("drift-accuracy-chart"),
+    result.weekly.map((w) => ({ y: w.hit_rate, label: w.week_start })),
+    { color: flag && flag.flagged ? "#e5484d" : "#5b8cff", zeroLine: false }
+  );
+
+  if (!result.feature_drag || result.feature_drag.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="3" class="empty-state">No feature has enough matured decisions behind it yet.</td></tr>';
+  } else {
+    tbody.innerHTML = result.feature_drag
+      .map((r) => {
+        const cls = r.hit_rate < 0.45 ? "pl-neg" : r.hit_rate > 0.55 ? "pl-pos" : "";
+        return `<tr><td>${r.feature_name}</td><td class="${cls}">${fmt.pct(r.hit_rate, 1)}</td><td>${r.n}</td></tr>`;
+      })
+      .join("");
+  }
 }
 
 // ---------- Circuit breakers ----------
@@ -719,6 +782,7 @@ async function loadAll() {
     loadBreakers(),
     loadAnalysis(),
     loadReportCard(),
+    loadDrift(),
     loadWhatif(),
     loadFeatureImportance(),
     loadLiveAccuracy(),

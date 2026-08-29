@@ -1,0 +1,22 @@
+[Unit]
+Description=Continuous real-time news ingestion (Alpaca websocket) for trading-system
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Long-lived, not a timer job: data/ingest/news_stream.py blocks forever,
+# consuming Alpaca's news websocket and flushing to news_events as headlines
+# arrive. Contrast with price-ingest.service/.timer, which are still a
+# scheduled batch pull -- this is the one continuous-ingestion process in
+# infra/, see data/ingest/news_stream.py's module docstring for why only
+# news moved to streaming and prices didn't (nothing downstream reads
+# intraday price ticks; every feature is a daily-bar rollup).
+Type=simple
+WorkingDirectory=/opt/trading-system
+EnvironmentFile=/opt/trading-system/.env
+ExecStart=/opt/trading-system/.venv/bin/python -m data.ingest.news_stream --universe
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

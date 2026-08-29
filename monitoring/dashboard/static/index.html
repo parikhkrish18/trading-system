@@ -122,6 +122,26 @@
       <div id="report-card-callouts"></div>
     </section>
 
+    <section id="drift-section">
+      <h2>Model Drift &amp; Self-Diagnostics <span class="muted">(read-only — surfaces signals, never changes the model automatically)</span></h2>
+      <div id="drift-callout"></div>
+      <div class="chart-pair">
+        <div class="chart-box">
+          <h3>Live weekly directional accuracy</h3>
+          <div id="drift-accuracy-chart"></div>
+        </div>
+        <div class="chart-box">
+          <h3>Features behind recent wrong calls <span class="muted">(min 5 matured decisions)</span></h3>
+          <div class="table-wrap">
+            <table id="drift-feature-table">
+              <thead><tr><th>Feature</th><th>Hit rate</th><th>n</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="whatif-section">
       <h2>What-If Thresholds <span class="muted">(re-filter the latest picks, nothing is retrained)</span></h2>
       <div class="filter-row whatif-sliders">

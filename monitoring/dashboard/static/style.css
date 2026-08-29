@@ -252,6 +252,7 @@ tbody tr:hover { background: var(--bg-elevated); }
   font-size: 13px;
   line-height: 1.5;
 }
+.callout.bad { border-left-color: var(--red); }
 .legend-item { margin-right: 14px; }
 .legend-swatch {
   display: inline-block;

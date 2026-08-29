@@ -559,13 +559,28 @@ def phase_ongoing_monitoring(closed: bool = False) -> dict:
 
 
 def phase_contradiction(reasons: list[dict]) -> dict:
-    """Phase 2 substitute used by the hourly contradiction monitor instead of phase_signals."""
+    """
+    Phase 2 substitute used by the hourly contradiction monitor
+    (execution/contradiction_monitor.py) instead of phase_signals — covers
+    both actual contradictions (news sentiment or price momentum turning
+    against the held side) and a position simply finishing (its own
+    take-profit or stop-loss, checked on the same hourly clock so a swing
+    trade closes when it resolves rather than waiting on the next weekly
+    cycle). The summary is worded differently for the two cases: hitting a
+    take-profit is the trade working as intended, not a contradiction, and
+    saying "contradiction" for it would read as something having gone
+    wrong when the opposite happened.
+    """
     lines = [r["detail"] for r in reasons]
-    signals = ", ".join(r["signal"] for r in reasons)
+    signals = [r["signal"] for r in reasons]
+    if signals and all(s == "take_profit" for s in signals):
+        summary = "Take-profit target reached — closing on schedule, not a contradiction."
+    else:
+        summary = f"Contradiction detected via: {', '.join(signals)}."
     return {
         "phase": 2,
         "title": "Market Regime & Signals",
-        "summary": f"Contradiction detected via: {signals}.",
+        "summary": summary,
         "lines": lines,
     }
 
