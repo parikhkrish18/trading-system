@@ -1,20 +1,23 @@
 """
-The human step between "the engine wants to trade" and "an order goes out".
+Decides which proposed opens/closes actually execute, and — in the default
+mode — gets Telegram out of the way and lets everything through.
 
 execution/trading_loop.py and execution/contradiction_monitor.py both know
-how to decide and how to execute; this module is the pause in between: send
-the batch of proposed opens/closes to a phone as one numbered Telegram
-message, poll for "approve 1" / "reject 2" / "approve all" replies, and
-hand back exactly which proposals a human said yes to.
+how to decide and how to execute; this module is the seam in between.
 
-Numbering is BATCH-LOCAL on purpose. At this seam no decisions rows exist
-yet (they are logged after execution), so there are no database ids to
-refer to. Each message numbers its proposals 1..N — closes first, then
-opens — and replies refer to THIS message only. A stale "approve 3" about
-last week's batch cannot hit this week's picks, because every request
-starts its own numbering and ignores updates from before it was sent.
+APPROVAL_MODE=auto (the default) approves every proposal immediately,
+without touching the network — trades are no longer held open waiting on a
+human reply. Telegram's role shifts to AFTER execution: the callers send a
+post-trade notification (send_followup, plus the outcome messages built in
+trading_loop.py/contradiction_monitor.py) once orders have actually been
+submitted, so the phone finds out what happened rather than being asked
+permission first.
 
-Fail-closed everywhere:
+APPROVAL_MODE=telegram is kept as an opt-in for anyone who wants the old
+pre-trade human gate back: send the batch of proposed opens/closes to a
+phone as one numbered Telegram message, poll for "approve 1" / "reject 2" /
+"approve all" replies, and hand back exactly which proposals a human said
+yes to. Fail-closed everywhere in this mode:
   - silence is never consent — an unanswered proposal is rejected at
     timeout (closes can be flipped to approve-on-timeout via
     APPROVAL_TIMEOUT_CLOSE_ACTION, a deliberate, documented exception:
@@ -28,8 +31,12 @@ Fail-closed everywhere:
     getUpdates is single-consumer — if another gate holds the lock, this
     one rejects its whole batch and alerts instead of stealing replies.
 
-APPROVAL_MODE=auto approves everything without touching the network — the
-documented escape hatch back to unattended behavior.
+Numbering is BATCH-LOCAL on purpose (used by both modes: telegram mode
+numbers what a human replies to, auto mode numbers what the outcome
+message and decisions rows refer back to). At this seam no decisions rows
+exist yet (they are logged after execution), so there are no database ids
+to refer to. Each message numbers its proposals 1..N — closes first, then
+opens — and replies refer to THIS message only.
 
 Nothing in this module knows what a broker is. It returns an
 ApprovalOutcome; acting on it is the caller's business.

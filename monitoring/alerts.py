@@ -2,11 +2,11 @@
 Alerting for: circuit breaker triggers, data pipeline failures, and any
 position exceeding risk limits (Phase 8, point 2).
 
-Delivery order: Slack webhook first, then the Telegram approval bot as a
-fallback when Slack is unconfigured or down (execution/telegram.py is the
-transport — same bot and chat the approval gate already uses, so if trade
-proposals can reach the phone, alerts can too). If neither channel is
-configured the alert is logged and dropped; an alert failure must never
+Delivery order: Slack webhook first, then the Telegram bot as a fallback
+when Slack is unconfigured or down (execution/telegram.py is the transport
+— same bot and chat the post-trade notifications already use, so if a
+"cycle complete" message can reach the phone, alerts can too). If neither
+channel is configured the alert is logged and dropped; an alert failure must never
 take a trading cycle down with it, so nothing in this module raises.
 
 Also home to configure_file_logging(): a rotating file handler on the

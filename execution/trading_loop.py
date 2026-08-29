@@ -748,21 +748,24 @@ def run_cycle(
         _flatten_and_alert(broker, reasons)
         return CycleResult("flattened_post_trade", len(candidates), orders_placed, reconciliation_summary, broker.get_portfolio_value())
 
-    send_slack_alert(
-        _cycle_outcome_message(
-            reconciliation=reconciliation,
-            reconciliation_summary=reconciliation_summary,
-            approved_candidates=approved_candidates,
-            approved_close_symbols=approved_close_symbols,
-            rejected=outcome.rejected,
-            intended_shares=intended_shares,
-            held_decisions=held_decisions,
-            actual_positions=actual_positions,
-            portfolio_value=new_portfolio_value,
-            order_type=order_type,
-        ),
-        severity="warning" if any(r.flagged for r in reconciliation) else "info",
+    outcome_message = _cycle_outcome_message(
+        reconciliation=reconciliation,
+        reconciliation_summary=reconciliation_summary,
+        approved_candidates=approved_candidates,
+        approved_close_symbols=approved_close_symbols,
+        rejected=outcome.rejected,
+        intended_shares=intended_shares,
+        held_decisions=held_decisions,
+        actual_positions=actual_positions,
+        portfolio_value=new_portfolio_value,
+        order_type=order_type,
     )
+    send_slack_alert(outcome_message, severity="warning" if any(r.flagged for r in reconciliation) else "info")
+    # Telegram's post-trade update (see approval_gate module docstring): the
+    # same "what actually happened" message, sent once orders are in rather
+    # than asked for beforehand. Best-effort — send_followup already
+    # degrades to a log line when Telegram isn't configured.
+    send_followup(outcome_message)
     return CycleResult("traded", len(candidates), orders_placed, reconciliation_summary, new_portfolio_value)
 
 

@@ -88,11 +88,13 @@ def test_trading_mode_defaults_to_paper_and_is_not_live(monkeypatch):
     assert _settings().is_live is False
 
 
-def test_approval_mode_defaults_to_the_human_gate(monkeypatch):
+def test_approval_mode_defaults_to_auto_execution(monkeypatch):
     """
-    Hosting must not create an unattended trading path. 'auto' has to be an
-    explicit, deliberate act — never something a blank env var falls into.
+    The system runs continuously and unattended by design (see
+    infra/railway/README.md) — 'telegram' (the pre-trade human gate) has to
+    be an explicit, deliberate opt-in, never something a blank env var
+    falls into.
     """
     monkeypatch.delenv("APPROVAL_MODE", raising=False)
 
-    assert _settings().approval_mode == "telegram"
+    assert _settings().approval_mode == "auto"

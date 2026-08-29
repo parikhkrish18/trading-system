@@ -243,15 +243,19 @@ tbody tr:hover { background: var(--bg-elevated); }
 .news-card-headline { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
 .news-card-meta { font-size: 11px; color: var(--text-muted); margin-bottom: 10px; }
 .news-card-symbols { display: flex; flex-wrap: wrap; gap: 6px; }
+/* Same filled-tint convention as .side-badge (LONG/SHORT) rather than an
+   outlined chip, so a sentiment tag reads as the same kind of thing as
+   every other colored tag in the dashboard. */
 .news-symbol-pill {
   font-size: 12px;
+  font-weight: 600;
   padding: 3px 10px;
   border-radius: 999px;
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  color: var(--text-muted);
 }
-.news-symbol-pill.pl-pos { border-color: var(--green); }
-.news-symbol-pill.pl-neg { border-color: var(--red); }
+.news-symbol-pill.pl-pos { background: rgba(38,166,91,0.15); color: var(--green); }
+.news-symbol-pill.pl-neg { background: rgba(229,72,77,0.15); color: var(--red); }
 
 .feature-freq-list {
   background: var(--bg-card);

@@ -418,7 +418,9 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
         reopened.append(f"{c.symbol} {target_shares:+,.2f} sh")
 
     if reopened:
-        send_slack_alert(f"♻️ Freed capital redeployed: {', '.join(reopened)}", severity="info")
+        message = f"♻️ Freed capital redeployed: {', '.join(reopened)}"
+        send_slack_alert(message, severity="info")
+        send_followup(message)  # Telegram's post-trade update — see approval_gate module docstring
 
 
 def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
@@ -534,7 +536,9 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     if kept:
         parts.append(f"🤝 Flagged but kept open on your call: {', '.join(kept)}")
     if parts:
-        send_slack_alert("Contradiction check done.\n" + "\n".join(parts), severity="warning")
+        outcome_message = "Contradiction check done.\n" + "\n".join(parts)
+        send_slack_alert(outcome_message, severity="warning")
+        send_followup(outcome_message)  # Telegram's post-trade update — see approval_gate module docstring
 
     if closed_any:
         _attempt_reactivation(broker, engine, request_fn=request_fn)

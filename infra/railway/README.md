@@ -21,7 +21,10 @@ editing the cron unless the run drifts across the close.
 
 The scheduled services must have their restart policy set to **Never**. A
 cron job is supposed to exit; "On failure" would restart the weekly cycle
-in a loop, and every restart re-sends trade proposals to Telegram.
+in a loop, and every restart runs the cycle again — trades execute
+immediately by default (see "What hosting does not change" below), so a
+restart loop here means repeated, unintended trading, not just repeated
+messages.
 
 ## Why a Dockerfile and not Railway's automatic detection
 
@@ -93,14 +96,17 @@ times.
 | `ALPACA_PAPER_SECRET_KEY` | secret | Alpaca paper dashboard |
 | `TELEGRAM_BOT_TOKEN` | secret | BotFather |
 | `TELEGRAM_CHAT_ID` | negative number | the group's id — negative because it is a group, not a DM |
-| `APPROVAL_MODE` | `telegram` | fixed |
-| `APPROVAL_TIMEOUT_S` | `900` | must stay under 3600; the hourly monitor shares the one bot |
 | `DASHBOARD_PASSWORD` | secret | any long random string |
 | `FEATURE_SET_ID` | `v4` | must match what features were built with |
 
 `DASHBOARD_HOST` is already `0.0.0.0` in the image and does not need
 setting. **Do not set `PORT`** — Railway injects it and routes the domain
 to whatever it chose; overriding it points the health check at a dead port.
+`APPROVAL_MODE` already defaults to `auto` (trade immediately, notify
+Telegram after) and does not need setting either — only add it if you
+deliberately want the old `telegram` pre-trade approval gate back, in
+which case also set `APPROVAL_TIMEOUT_S` (must stay under 3600 — the
+hourly monitor shares the one bot).
 
 Left unset on purpose: `MLFLOW_TRACKING_URI` (no MLflow server is deployed;
 the two dashboard analysis panels that use it degrade to empty and nothing
@@ -112,9 +118,9 @@ columns natively.
 ## What the password protects
 
 `DASHBOARD_PASSWORD` gates **everything** — the static page itself, every
-`/api` route (reads as much as `POST /api/tests/run` and
-`POST /api/jobs/*/run`), all behind one login page at `/login`. Once the
-dashboard is bound to a public interface it is not optional: with a
+`/api` route (reads as much as the state-changing `POST /api/tests/run`),
+all behind one login page at `/login`. Once the dashboard is bound to a
+public interface it is not optional: with a
 non-loopback bind and no password,
 `monitoring/dashboard/server.py::_check_dashboard_auth` refuses outright
 (503) rather than leaving the interface one blank variable from being open.
@@ -139,19 +145,24 @@ bind with no password configured needs no ceremony.
 
 ## What hosting does not change
 
-The trading cycle still walks through the Telegram approval gate before any
-order exists. The "Run trading cycle" button starts
-`scripts/run_weekly_cycle.py` — it authorizes computation, not trades — and
-the cron service runs the same entrypoint. `APPROVAL_MODE=auto` is the only
-way to bypass the human, and it has to be set deliberately; blank Telegram
-credentials in `telegram` mode reject the whole batch rather than
-auto-approving.
+Hosting does not change what `APPROVAL_MODE` does — it just means the
+default (`auto`) now runs unattended for real, on a schedule, rather than
+on a laptop when someone happens to trigger it. In `auto` mode
+`scripts.run_weekly_cycle` and `execution.contradiction_monitor` both
+execute their approved proposals immediately, no human reply required, and
+send a "cycle complete" style message to Telegram (if configured —
+best-effort, never blocking) once orders have actually been submitted, not
+before. See the `execution/approval_gate.py` module docstring for the full
+picture.
 
-The weekly cycle blocks for up to `APPROVAL_TIMEOUT_S` waiting for a reply.
-That is normal and Railway tolerates it: a cron service is a deployment
-that runs to completion, with no request timeout, and Railway will not
-start a second execution while one is still running.
-
-Do not run two replicas of a scheduled service. The approval poll holds a
-Postgres advisory lock, so a second copy rejects its whole batch rather
-than stealing the first one's Telegram replies — safe, but silently a no-op.
+Switching a service to `APPROVAL_MODE=telegram` brings back the old
+pre-trade human gate — every open/close needs an "approve"/"reject" reply
+on the phone before it executes, and blank Telegram credentials reject the
+whole batch rather than auto-approving. In that mode the weekly cycle
+blocks for up to `APPROVAL_TIMEOUT_S` waiting for a reply, which is normal
+and Railway tolerates it: a cron service is a deployment that runs to
+completion, with no request timeout, and Railway will not start a second
+execution while one is still running. Also in that mode: do not run two
+replicas of a scheduled service — the approval poll holds a Postgres
+advisory lock, so a second copy rejects its whole batch rather than
+stealing the first one's Telegram replies — safe, but silently a no-op.

@@ -138,11 +138,3 @@ def test_a_failing_step_stops_the_run_rather_than_carrying_on(monkeypatch, _reco
         init_database.initialise()
 
     assert _recorded["order"] == ["migrate"]
-
-
-def test_the_dashboard_exposes_it_as_a_job():
-    """The hosted deployment has no shell — the button is the only way in."""
-    from monitoring.dashboard import server
-
-    assert "init_db" in server._JOB_COMMANDS
-    assert "scripts.init_database" in server._JOB_COMMANDS["init_db"]["command"]

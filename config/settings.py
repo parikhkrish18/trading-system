@@ -67,19 +67,20 @@ class Settings(BaseSettings):
     mlflow_tracking_uri: str = Field(default="http://localhost:5000", alias="MLFLOW_TRACKING_URI")
 
     # --- Dashboard (password-only login page; see monitoring/dashboard/server.py) ---
-    # One shared password gates the whole dashboard — the page itself, every
-    # /api read, and the manual-trigger buttons alike. No username, no
-    # separate operator token for the mutating endpoints: enter this once at
-    # /login and the session cookie it sets covers everything until it's
+    # One shared password gates the whole dashboard — the page itself and
+    # every /api read alike. No username, no separate operator token for the
+    # state-changing endpoints (e.g. POST /api/tests/run): enter this once
+    # at /login and the session cookie it sets covers everything until it's
     # cleared (or the password changes, which invalidates every outstanding
     # cookie at once — see _session_token). No default on purpose: with this
     # empty the dashboard only serves on loopback.
     dashboard_password: str = Field(default="", alias="DASHBOARD_PASSWORD")
 
     # --- Feature set ---
-    # Which feature set the dashboard-triggered pipeline runs on. CLI
-    # invocations still pass --feature-set-id explicitly; this only feeds
-    # the manual-trigger endpoints in monitoring/dashboard/server.py.
+    # Which feature set scripts/init_database.py builds when no
+    # --feature-set-id is passed explicitly. Other CLI entry points
+    # (scripts/run_weekly_cycle.py etc.) always pass --feature-set-id
+    # themselves rather than reading this default.
     feature_set_id: str = Field(default="v4", alias="FEATURE_SET_ID")
 
     # --- Dashboard ---
@@ -97,17 +98,23 @@ class Settings(BaseSettings):
     # --- Alerts ---
     slack_webhook_url: str = Field(default="", alias="SLACK_WEBHOOK_URL")
 
-    # --- Trade approval (Telegram) ---
-    # Used by execution/approval_gate.py to send trade proposals to a human
-    # and read back approve/reject replies. Blank = approval transport
-    # unconfigured; in telegram mode that fails closed (all proposals
-    # rejected) rather than trading unattended.
+    # --- Trade approval / notifications (Telegram) ---
+    # Used by execution/approval_gate.py. In "auto" mode (the default) it is
+    # a notification channel only: proposals execute immediately and
+    # Telegram receives a message once a batch has actually been acted on
+    # (see send_followup and the post-trade outcome messages in
+    # execution/trading_loop.py and execution/contradiction_monitor.py).
+    # Blank credentials just mean those notifications are logged instead of
+    # sent — auto mode never blocks or fails closed on a missing bot.
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
-    # "telegram" = every open/close needs a human reply on the phone;
-    # "auto" = approve everything without asking (the old unattended
-    # behavior, kept as a deliberate escape hatch).
-    approval_mode: str = Field(default="telegram", alias="APPROVAL_MODE")  # "telegram" | "auto"
+    # "auto" = proposals execute immediately (no human reply required);
+    # Telegram, if configured, gets a post-trade notification, never a
+    # question. "telegram" = the old pre-trade human gate — every open/close
+    # needs an "approve"/"reject" reply on the phone before it executes, and
+    # blank credentials fail the whole batch closed rather than trading
+    # unattended. Kept as an opt-in for anyone who wants the gate back.
+    approval_mode: str = Field(default="auto", alias="APPROVAL_MODE")  # "auto" | "telegram"
     # How long to wait for replies before giving up. Must stay under 3600 —
     # the hourly contradiction monitor shares the one Telegram bot, and a
     # poll that outlives the hour would collide with the next cycle.

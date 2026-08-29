@@ -649,72 +649,6 @@ async function runTestsNow() {
   }
 }
 
-// ---------- Manual triggers (ingest / trading cycle) ----------
-// Same shape as the tests panel: POST to start, then poll /api/jobs while
-// anything is running. The cycle button only STARTS a cycle — trades still
-// wait on the Telegram approval gate.
-
-let jobsPollTimer = null;
-
-// Idle button text per job. Keyed by job name so adding a job to
-// _JOB_COMMANDS server-side needs a line here and its markup, not a change
-// to the rendering logic.
-const JOB_BUTTON_LABELS = {
-  init_db: "First-run setup",
-  ingest: "Run data ingestion",
-  cycle: "Run trading cycle",
-};
-
-function renderJobStatus(name, job) {
-  const box = document.getElementById(`job-${name}-status`);
-  const btn = document.getElementById(`run-${name}-btn`);
-  if (!box) return;
-  const labels = { never_run: "Never run", running: "⏳ Running…", finished: "✅ Finished", failed: "❌ Failed" };
-  const when = job.finished_at || job.started_at;
-  box.innerHTML = `<div class="value">${labels[job.status] || job.status}</div><div class="label">${job.label}${when ? ` — ${fmt.time(when)}` : ""}</div>`;
-  box.className = `stat-card ${job.status === "finished" ? "good" : job.status === "failed" ? "bad" : ""}`;
-  if (btn) {
-    btn.disabled = job.status === "running";
-    btn.textContent = job.status === "running"
-      ? "Running… (runs in background)"
-      : JOB_BUTTON_LABELS[name] || name;
-  }
-}
-
-async function loadJobs() {
-  const jobs = await fetchJSON("/api/jobs");
-  let tail = "";
-  let anyRunning = false;
-  for (const [name, job] of Object.entries(jobs)) {
-    renderJobStatus(name, job);
-    anyRunning = anyRunning || job.status === "running";
-    if (job.output_tail) tail += `=== ${name} ===\n${job.output_tail}\n\n`;
-  }
-  document.getElementById("job-output").textContent = tail;
-  // Keep polling while something is running; stop when everything settles.
-  if (anyRunning && !jobsPollTimer) {
-    jobsPollTimer = setInterval(loadJobs, 5000);
-  } else if (!anyRunning && jobsPollTimer) {
-    clearInterval(jobsPollTimer);
-    jobsPollTimer = null;
-  }
-}
-
-async function startJob(name) {
-  try {
-    await fetchJSON(`/api/jobs/${name}/run`, { method: "POST" });
-    await loadJobs();
-  } catch (e) {
-    // 409 = already running. Show it: a button that silently does nothing
-    // is the worst way to report a failure (401 is handled by fetchJSON
-    // itself, which redirects to /login before this catch ever sees it).
-    await loadJobs();
-    document.getElementById("job-output").textContent =
-      `Could not start ${name}: ${e.message}\n\n` + document.getElementById("job-output").textContent;
-    document.getElementById("job-output-wrap").open = true;
-  }
-}
-
 // ---------- Mode badge ----------
 async function loadModeBadge() {
   try {
@@ -733,7 +667,7 @@ async function loadModeBadge() {
 // pass has reached a headline) into something readable at a glance, rather
 // than making a reader interpret "0.42" themselves.
 function sentimentLabel(score) {
-  if (score === null || score === undefined) return { text: "Not yet scored", cls: "muted" };
+  if (score === null || score === undefined) return { text: "Not yet scored", cls: "" };
   const abs = Math.abs(score);
   if (abs < 0.1) return { text: "Neutral", cls: "" };
   const direction = score > 0 ? "Positive" : "Negative";
@@ -745,8 +679,7 @@ function newsCardHTML(item) {
   const pills = item.symbols
     .map((s) => {
       const label = sentimentLabel(s.sentiment);
-      const score = s.sentiment === null || s.sentiment === undefined ? "" : ` (${fmt.num(s.sentiment, 2)})`;
-      return `<span class="news-symbol-pill ${label.cls}"><strong>${s.symbol}</strong> — ${label.text}${score}</span>`;
+      return `<span class="news-symbol-pill ${label.cls}"><strong>${s.symbol}</strong> — ${label.text}</span>`;
     })
     .join("");
   return `
@@ -819,16 +752,12 @@ async function loadAll() {
     loadLiveAccuracy(),
     loadDecisions(),
     loadLastTestRun(),
-    loadJobs(),
   ]);
   if (activeTab === "news") await loadLiveNews(currentNewsFilter());
 }
 
 document.getElementById("refresh-btn").addEventListener("click", loadAll);
 document.getElementById("run-tests-btn").addEventListener("click", runTestsNow);
-document.getElementById("run-init_db-btn").addEventListener("click", () => startJob("init_db"));
-document.getElementById("run-ingest-btn").addEventListener("click", () => startJob("ingest"));
-document.getElementById("run-cycle-btn").addEventListener("click", () => startJob("cycle"));
 document.getElementById("decision-filter-btn").addEventListener("click", () => {
   loadDecisions(document.getElementById("decision-symbol-filter").value.trim().toUpperCase());
 });

@@ -87,8 +87,8 @@ Fully working now:
   analysis from MLflow, live directional hit-rate, equity/drawdown,
   circuit-breaker status, and the test suite runnable on demand. `make dashboard`
 - Alerting: Slack webhook (`SLACK_WEBHOOK_URL`) with automatic fallback to
-  the Telegram approval bot when Slack is unconfigured/down; entry points
-  also log to a rotating `logs/trading-system.log`
+  the Telegram bot when Slack is unconfigured/down; entry points also log
+  to a rotating `logs/trading-system.log`
 - Unit tests across ingestion, features, the ensemble model, the screener,
   sizing, and the highest-risk modules (decay sim, validators, circuit breakers)
 

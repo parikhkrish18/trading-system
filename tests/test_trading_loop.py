@@ -672,9 +672,12 @@ def test_caps_still_bind_after_approval_and_the_shortfall_is_reported(monkeypatc
     shares = dict(broker.submitted)
     assert shares["AAA"] == pytest.approx(250.0)  # 25% cap at $100/share
     assert shares["BBB"] == pytest.approx(250.0)
-    (msg,) = followups
+    # Two Telegram messages per cycle now: the pre-order sizing confirmation,
+    # then the post-execution outcome (see approval_gate module docstring).
+    msg, outcome_msg = followups
     assert "50.0%" in msg  # deployed
     assert "not reached" in msg.lower() or "cap" in msg.lower()
+    assert "Cycle complete." in outcome_msg
 
 
 def test_followup_confirmation_lists_each_approved_size(monkeypatch):
@@ -687,8 +690,11 @@ def test_followup_confirmation_lists_each_approved_size(monkeypatch):
 
     trading_loop.run_cycle("v3", ["AAPL"])
 
-    (msg,) = followups
+    # Two Telegram messages per cycle now: the pre-order sizing confirmation,
+    # then the post-execution outcome (see approval_gate module docstring).
+    msg, outcome_msg = followups
     assert "AAPL (long): 100.0% of portfolio" in msg
+    assert "Cycle complete." in outcome_msg
 
 
 def test_kept_positions_shrink_what_the_approved_picks_can_deploy(monkeypatch):

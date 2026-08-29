@@ -22,10 +22,12 @@ A held position is now closed only when a REAL exit condition fires:
      time the weekly cycle looks).
 
 A symbol that made this cycle's shortlist is never an exit candidate: the
-model just re-picked it, and the approval flow will resize (or reverse) it.
+model just re-picked it, and the approval gate will resize (or reverse) it.
 
-Every close this module recommends still goes through the human approval
-gate — this file only decides what to PROPOSE.
+Every close this module recommends still goes through execution/approval_gate.py
+— this file only decides what to PROPOSE. By default that gate executes
+proposals immediately (APPROVAL_MODE=auto); it can be switched back to a
+pre-trade human gate (APPROVAL_MODE=telegram) if that's ever wanted again.
 
 State (the consecutive-miss counter) lives in the position_hold_state
 table, rewritten each cycle to exactly the currently-held set, so closes

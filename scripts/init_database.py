@@ -107,7 +107,10 @@ def main() -> None:
     print(f"  universe symbols : {results['universe']}")
     print(f"  price rows       : {results['price_rows']}")
     print(f"  feature rows     : {results['feature_rows']}")
-    print("\nNext: run a trading cycle. It still needs Telegram approval before any order.")
+    print(
+        "\nNext: run a trading cycle. By default (APPROVAL_MODE=auto) it trades "
+        "immediately and Telegram, if configured, gets a message once orders are in."
+    )
 
 
 if __name__ == "__main__":
