@@ -47,6 +47,47 @@ from execution.exit_levels import ExitLevels
 DEFAULT_MIN_FLIP_RETURN = round_trip_cost_fraction()
 
 
+@dataclasses.dataclass(frozen=True)
+class StopTargetHit:
+    """A position's unrealized P&L has breached its stop-loss or reached its take-profit."""
+
+    kind: str  # "stop_loss" | "take_profit"
+    message: str  # human-readable, e.g. "stop loss: -8.2% unrealized, limit -8.0%"
+
+
+def check_stop_or_target(
+    pnl_pct: float | None,
+    levels: ExitLevels | None,
+    fallback_stop_loss_pct: float,
+    fallback_take_profit_pct: float,
+) -> StopTargetHit | None:
+    """
+    Whether unrealized P&L has breached this position's own stop-loss or
+    reached its own take-profit — the levels it was actually approved with
+    (`levels`), falling back to the global HOLD_*_PCT settings only for a
+    position with none recorded.
+
+    Shared by two callers on two different clocks: evaluate_holds below
+    (the weekly cycle, for positions that missed this week's shortlist) and
+    execution/contradiction_monitor.py's hourly check (every held position,
+    every hour, regardless of shortlist status). The point of running it on
+    both clocks is that a swing trade should close when IT resolves — a
+    volatile stock's larger target reached in 3-4 days, a calm stock's
+    smaller target taking a week or more — rather than sitting past its own
+    target or stop until the next weekly checkpoint just because the
+    calendar hadn't come around yet.
+    """
+    if pnl_pct is None:
+        return None
+    stop = levels.stop_loss_pct if levels else fallback_stop_loss_pct
+    target = levels.take_profit_pct if levels else fallback_take_profit_pct
+    if pnl_pct <= -stop:
+        return StopTargetHit("stop_loss", f"stop loss: {pnl_pct:+.1%} unrealized, limit -{stop:.1%}")
+    if pnl_pct >= target:
+        return StopTargetHit("take_profit", f"profit target reached: {pnl_pct:+.1%} unrealized, target +{target:.1%}")
+    return None
+
+
 @dataclasses.dataclass
 class HoldDecision:
     """One held position's verdict for this cycle."""
@@ -111,15 +152,9 @@ def evaluate_holds(
         if prediction is not None and sign * prediction < 0 and abs(prediction) >= min_flip_return:
             reasons.append(f"model now predicts {prediction:+.2%} against the {side} position")
 
-        pnl = pnl_pct.get(symbol)
-        if pnl is not None:
-            levels = levels_by_symbol.get(symbol)
-            stop = levels.stop_loss_pct if levels else stop_loss_pct
-            target = levels.take_profit_pct if levels else take_profit_pct
-            if pnl <= -stop:
-                reasons.append(f"stop loss: {pnl:+.1%} unrealized, limit -{stop:.1%}")
-            elif pnl >= target:
-                reasons.append(f"profit target reached: {pnl:+.1%} unrealized, target +{target:.1%}")
+        hit = check_stop_or_target(pnl_pct.get(symbol), levels_by_symbol.get(symbol), stop_loss_pct, take_profit_pct)
+        if hit:
+            reasons.append(hit.message)
 
         decisions.append(
             HoldDecision(symbol=symbol, close=bool(reasons), missed_cycles=missed, reasons=reasons)

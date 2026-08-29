@@ -240,6 +240,33 @@ class Settings(BaseSettings):
     # positive excess return over the benchmark.
     allow_shorts: bool = Field(default=False, alias="ALLOW_SHORTS")
 
+    # --- Long/short ranking preference (only matters once ALLOW_SHORTS=true) ---
+    # A small handicap applied to a short candidate's ranking score relative
+    # to longs when the screener decides which candidates make the shortlist
+    # — ties and close calls go to the long side. 0.0 = no preference, longs
+    # and shorts compete purely on conviction. 1.0 effectively excludes every
+    # short (use ALLOW_SHORTS=false for that instead — it's the tested,
+    # evidenced way to turn shorts off entirely, and doesn't leave a stray
+    # knob implying shorts are "on" when nothing can ever clear it).
+    #
+    # This only changes SELECTION ORDER — which candidates make the cut. A
+    # short that is selected is still sized on its true conviction, under
+    # the existing MAX_SHORT_POSITION_PCT cap below (already more
+    # conservative than the long cap, for the structurally-uncapped-loss
+    # reason noted there).
+    short_ranking_penalty: float = Field(default=0.15, alias="SHORT_RANKING_PENALTY")
+    # A short is exempted from the handicap above — ranked on raw conviction
+    # like a long — when its own derived stop-loss (execution/exit_levels.py:
+    # how far *this* stock has to move against the position, based on its
+    # own volatility, before the loss is capped) is at or below this
+    # fraction. This is what "little downside risk" means operationally
+    # here: a calm stock the model is confident about, not a guess about the
+    # trade's odds. A short with unmeasurable volatility (falls back to the
+    # global HOLD_STOP_LOSS_PCT default, currently wider than this
+    # threshold) does not qualify — unknown risk is handicapped, not waved
+    # through.
+    short_low_risk_stop_loss_pct: float = Field(default=0.06, alias="SHORT_LOW_RISK_STOP_LOSS_PCT")
+
     # --- Strategy selection ---
     # "diversified" (default) = top-k book sized by risk.sizing.select_trades
     # under the conservative caps above. "concentrated" = the 2-trade

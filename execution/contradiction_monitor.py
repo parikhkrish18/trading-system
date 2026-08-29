@@ -3,8 +3,16 @@ Between weekly screen-and-trade cycles, a held position can go stale: fresh
 news can break against the direction we entered, or short-term price action
 can reverse hard enough to contradict the original thesis, days before the
 next scheduled screen would otherwise notice. This module checks every
-currently held position against both signals and closes out any position
-that's now fighting the evidence it was opened on.
+currently held position against both signals — plus its own take-profit/
+stop-loss (see check_stop_or_target below) — and closes out any position
+that's now fighting the evidence it was opened on, or that has simply
+finished: the swing trade the position was opened for is sized to that
+stock's own volatility (execution/exit_levels.py) and can resolve in a few
+days for a volatile name or take a week or more for a calm one — checking
+it hourly, same clock as the two contradiction signals, means a position
+closes when it resolves rather than sitting past its own target or stop
+until the next weekly checkpoint just because the calendar hadn't come
+around yet.
 
 Close-only for the contradiction check itself -- reversing requires a fresh
 conviction call, which is exactly what a screen does. But after a close
@@ -33,8 +41,10 @@ from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.news import ingest_news
 from data.ingest.universe import load_active_universe
+from execution import hold_rules
 from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.broker import get_broker
+from execution.exit_levels import ExitLevels
 from execution.trading_loop import (
     _allocation_confirmation,
     _apply_allocation,
@@ -102,7 +112,13 @@ def _recent_momentum(engine, symbol: str) -> float | None:
     return None if pd.isna(ret) else float(ret)
 
 
-def _check_position(engine, symbol: str, qty: float) -> ContradictionResult:
+def _check_position(
+    engine,
+    symbol: str,
+    qty: float,
+    pnl_pct: float | None = None,
+    levels: ExitLevels | None = None,
+) -> ContradictionResult:
     side = "long" if qty > 0 else "short"
     sign = 1.0 if qty > 0 else -1.0
     reasons: list[dict] = []
@@ -129,6 +145,17 @@ def _check_position(engine, symbol: str, qty: float) -> ContradictionResult:
                 "detail": f"{_MOMENTUM_WINDOW_DAYS}d return {momentum:.2%} contradicts {side} position",
             }
         )
+
+    # This is not a second contradiction signal, it's the swing trade
+    # actually finishing: a stock's own target/stop, sized to its own
+    # volatility (execution/exit_levels.py), can resolve in a few days for a
+    # volatile name or take longer for a calm one. Checking it on the same
+    # hourly clock as the two signals above means a trade closes when IT
+    # resolves rather than sitting past its own target or stop until next
+    # Monday's weekly cycle just because the calendar hadn't come around.
+    hit = hold_rules.check_stop_or_target(pnl_pct, levels, settings.hold_stop_loss_pct, settings.hold_take_profit_pct)
+    if hit:
+        reasons.append({"signal": hit.kind, "value": pnl_pct, "detail": hit.message})
 
     return ContradictionResult(symbol=symbol, side=side, closed=bool(reasons), reasons=reasons)
 
@@ -424,13 +451,30 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     except Exception:
         logger.exception("News refresh failed — checking against whatever sentiment is already in the DB.")
 
+    # Computed once, up front, so every position's stop/target check (inside
+    # _check_position below) reads the same P&L and the same levels it was
+    # actually approved with, rather than each position pulling its own
+    # separately. Also reused below for the approval message's P&L display.
+    pnl_by_symbol = current_pnl_by_symbol(broker)
+    try:
+        levels_by_symbol = hold_rules.load_exit_levels(engine)
+    except Exception:
+        # Same degrade-gracefully posture as the dashboard's positions
+        # endpoint: a position with no recorded levels still gets checked,
+        # just against the global HOLD_STOP_LOSS_PCT/HOLD_TAKE_PROFIT_PCT
+        # fallback (see check_stop_or_target) instead of skipping the
+        # stop/target check for everyone because one table read failed.
+        logger.exception("Could not load per-position exit levels — falling back to the global stop/target settings.")
+        levels_by_symbol = {}
+
     # Detect first, act later: every position is checked, and everything
     # that tripped goes to the human as ONE batch instead of a message per
     # position.
     results: list[ContradictionResult] = []
     flagged: list[ContradictionResult] = []
     for symbol, qty in positions.items():
-        result = _check_position(engine, symbol, qty)
+        pnl_pct = pnl_by_symbol.get(symbol, (None, None))[0]
+        result = _check_position(engine, symbol, qty, pnl_pct=pnl_pct, levels=levels_by_symbol.get(symbol))
         results.append(result)
         if result.closed:
             flagged.append(result)
@@ -441,10 +485,9 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         return results
 
     gate = request_fn if request_fn is not None else request_approval
-    # Each close proposal carries the contradiction evidence and the
+    # Each close proposal carries the contradiction/exit evidence and the
     # position's current P&L, so the phone message says WHY the system
     # wants out and what the position stands at — not just "close X".
-    pnl_by_symbol = current_pnl_by_symbol(broker)
     proposals = [
         ProposedTrade(
             index=0, symbol=r.symbol, action="close", side=r.side,
