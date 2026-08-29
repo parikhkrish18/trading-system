@@ -55,6 +55,47 @@ def test_build_qualitative_features_empty_inputs():
     assert build_qualitative_features(pd.DataFrame(), pd.DataFrame()).empty
 
 
+def test_build_qualitative_features_drops_mistagged_symbol_rows():
+    """A row flagged sentiment_relevant=False (a news vendor mistagging a symbol
+    onto a story that isn't actually about that company) must not feed the model."""
+    prices = _prices("SPY", ["2026-01-10"])
+    news = pd.DataFrame(
+        {
+            "symbol": ["SPY", "SPY"],
+            "ts": pd.to_datetime(["2026-01-09", "2026-01-10"], utc=True),
+            "sentiment": [0.8, -0.4],
+            "sentiment_relevant": [True, False],
+        }
+    )
+    result = build_qualitative_features(prices, news)
+
+    jan10 = result[(result["ts"] == pd.Timestamp("2026-01-10", tz="UTC"))]
+    by_name = dict(zip(jan10["feature_name"], jan10["value"], strict=False))
+    # Only the relevant=True row should count -- the mistagged -0.4 row is excluded.
+    assert by_name["sentiment_mean_10d"] == pytest.approx(0.8)
+    assert by_name["news_volume_3d"] == 1.0
+
+
+def test_build_qualitative_features_keeps_null_relevance_rows():
+    """NaN/missing sentiment_relevant (not yet scored for relevance, or scored
+    before the column existed) must be treated as relevant, never dropped."""
+    prices = _prices("SPY", ["2026-01-10"])
+    news = pd.DataFrame(
+        {
+            "symbol": ["SPY", "SPY"],
+            "ts": pd.to_datetime(["2026-01-09", "2026-01-10"], utc=True),
+            "sentiment": [0.8, -0.4],
+            "sentiment_relevant": [True, None],
+        }
+    )
+    result = build_qualitative_features(prices, news)
+
+    jan10 = result[(result["ts"] == pd.Timestamp("2026-01-10", tz="UTC"))]
+    by_name = dict(zip(jan10["feature_name"], jan10["value"], strict=False))
+    assert by_name["sentiment_mean_10d"] == pytest.approx((0.8 - 0.4) / 2)
+    assert by_name["news_volume_3d"] == 2.0
+
+
 def test_build_event_risk_features_computes_days_to_next_event():
     prices = _prices("SPY", ["2026-01-01"])
     macro = pd.DataFrame(

@@ -23,16 +23,27 @@ _MODEL = "claude-haiku-4-5"
 _BATCH_SIZE = 20
 
 _SYSTEM_PROMPT = (
-    "You are scoring financial news headlines for sentiment. For each "
-    "headline, assign a sentiment score from -1.0 (very negative for the "
-    "stock) to 1.0 (very positive for the stock), 0.0 for neutral/mixed. "
+    "You are scoring financial news headlines for sentiment, one headline "
+    "paired with one ticker symbol it was tagged with by a news vendor. "
+    "News vendors sometimes mistag a symbol onto a story that isn't "
+    "actually about that company -- check this first: is the headline "
+    "genuinely, substantively about THIS symbol's company, or is the tag "
+    "wrong/incidental (a passing mention, an unrelated company with a "
+    "similar name, or a clear vendor tagging error)? Set \"relevant\" to "
+    "false for the latter case. "
+    "For each headline, assign a sentiment score from -1.0 (very negative for "
+    "the stock) to 1.0 (very positive for the stock), 0.0 for neutral/mixed -- "
+    "if relevant is false, still give your best-guess sentiment, it just won't "
+    "be used. "
     "Also give a one-sentence, plain-English reason a trader could read at "
     "a glance explaining why THIS symbol is affected by THIS headline (under "
     "25 words) -- e.g. 'Direct competitor's product launch threatens market "
-    "share' or 'Company beat EPS estimates by a wide margin'. "
+    "share' or 'Company beat EPS estimates by a wide margin'; if relevant is "
+    "false, the reason should say what the story is actually about instead. "
     "Respond with ONLY a JSON array of objects: "
-    '[{"id": <id>, "sentiment": <float>, "reason": <string>}, ...], one '
-    "entry per headline, in the same order given. No other text."
+    '[{"id": <id>, "sentiment": <float>, "reason": <string>, "relevant": '
+    "<bool>}, ...], one entry per headline, in the same order given. No "
+    "other text."
 )
 
 
@@ -46,7 +57,7 @@ def _strip_code_fence(text: str) -> str:
     return text.strip()
 
 
-def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, tuple[float, str]]:
+def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, tuple[float, str, bool]]:
     items = [{"id": int(row["id"]), "symbol": row["symbol"], "headline": row["headline"]} for _, row in batch.iterrows()]
     resp = client.messages.create(
         model=_MODEL,
@@ -56,34 +67,49 @@ def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, tuple[floa
     )
     text = _strip_code_fence(resp.content[0].text)
     scores = json.loads(text)
-    # .get(..., "") rather than a required key: an older prompt version or a
-    # model that drops the field on a given call should degrade to "no
-    # reason text" rather than take the whole batch down with a KeyError --
-    # the sentiment score itself is the part everything else (contradiction
-    # monitor, hold rules) actually depends on.
-    return {int(s["id"]): (float(s["sentiment"]), str(s.get("reason", "") or "")) for s in scores}
+    # .get(..., default) rather than a required key: an older prompt version
+    # or a model that drops a field on a given call should degrade gracefully
+    # rather than take the whole batch down with a KeyError -- the sentiment
+    # score itself is the part everything else (contradiction monitor, hold
+    # rules) actually depends on. relevant defaults to True (assume the
+    # vendor's tag is fine) rather than False, since a missing field must
+    # never silently start excluding real data from the model/contradiction
+    # check that a prior prompt version's rows never had a chance to set.
+    return {
+        int(s["id"]): (float(s["sentiment"]), str(s.get("reason", "") or ""), bool(s.get("relevant", True)))
+        for s in scores
+    }
 
 
 def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
     """
     Input: dataframe with at least ['id', 'ts', 'symbol', 'headline'].
-    Output: same rows plus 'sentiment' (float, [-1, 1]) and 'sentiment_reason'
-    (a short plain-English explanation of why that symbol is affected) columns.
+    Output: same rows plus 'sentiment' (float, [-1, 1]), 'sentiment_reason'
+    (a short plain-English explanation of why that symbol is affected), and
+    'sentiment_relevant' (False when the vendor's symbol tag doesn't
+    actually fit the story -- see data/schema/010_news_sentiment_relevance.sql)
+    columns.
     """
     if headlines.empty:
-        return headlines.assign(sentiment=pd.Series(dtype=float), sentiment_reason=pd.Series(dtype=object))
+        return headlines.assign(
+            sentiment=pd.Series(dtype=float),
+            sentiment_reason=pd.Series(dtype=object),
+            sentiment_relevant=pd.Series(dtype=object),
+        )
 
     client = Anthropic(api_key=settings.anthropic_api_key)
     scored = headlines.copy()
     scored["sentiment"] = pd.NA
     scored["sentiment_reason"] = pd.NA
+    scored["sentiment_relevant"] = pd.NA
 
     for start in range(0, len(headlines), _BATCH_SIZE):
         batch = headlines.iloc[start : start + _BATCH_SIZE]
         id_to_result = _score_batch(client, batch)
-        for row_id, (score, reason) in id_to_result.items():
+        for row_id, (score, reason, relevant) in id_to_result.items():
             scored.loc[scored["id"] == row_id, "sentiment"] = score
             scored.loc[scored["id"] == row_id, "sentiment_reason"] = reason
+            scored.loc[scored["id"] == row_id, "sentiment_relevant"] = relevant
 
     return scored
 
@@ -105,7 +131,8 @@ def backfill_unscored_news(batch_size: int = 500) -> int:
     with engine.begin() as conn:
         for _, row in scored.iterrows():
             conn.exec_driver_sql(
-                "UPDATE news_events SET sentiment = %s, sentiment_reason = %s WHERE id = %s AND ts = %s",
-                (row["sentiment"], row["sentiment_reason"], row["id"], row["ts"]),
+                "UPDATE news_events SET sentiment = %s, sentiment_reason = %s, sentiment_relevant = %s "
+                "WHERE id = %s AND ts = %s",
+                (row["sentiment"], row["sentiment_reason"], bool(row["sentiment_relevant"]), row["id"], row["ts"]),
             )
     return len(scored)

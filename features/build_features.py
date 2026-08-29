@@ -60,11 +60,21 @@ def build_quant_features(prices: pd.DataFrame) -> pd.DataFrame:
 def build_qualitative_features(prices: pd.DataFrame, news: pd.DataFrame) -> pd.DataFrame:
     """
     news: columns [symbol, ts, sentiment] from news_events (unscored rows —
-    sentiment IS NULL — carry no signal yet and are dropped). Aggregates
-    trailing sentiment into daily features, anchored to each symbol's own
-    price dates so this joins cleanly onto build_quant_features' output.
-    News ts is naturally point-in-time (when it was published), so no
-    look-ahead risk here as long as each date only looks backward.
+    sentiment IS NULL — carry no signal yet and are dropped), plus an
+    optional 'sentiment_relevant' column. Aggregates trailing sentiment into
+    daily features, anchored to each symbol's own price dates so this joins
+    cleanly onto build_quant_features' output. News ts is naturally
+    point-in-time (when it was published), so no look-ahead risk here as
+    long as each date only looks backward.
+
+    Rows flagged sentiment_relevant == False are dropped before aggregation
+    — a news vendor mistagging a symbol onto a story that isn't actually
+    about that company (see data/schema/010_news_sentiment_relevance.sql)
+    would otherwise feed a wrong sentiment reading straight into that
+    symbol's model input features. The column is optional and NaN/missing
+    values are kept (== False, not `is False`, is deliberately NaN-safe —
+    "not yet scored for relevance" or "scored before this column existed"
+    both mean "assume relevant", never "silently drop real history").
 
     Vectorized via a time-based rolling window rather than a per-date Python
     loop (needed once --universe is scanning ~500 symbols, not 4): per
@@ -76,6 +86,8 @@ def build_qualitative_features(prices: pd.DataFrame, news: pd.DataFrame) -> pd.D
     if news.empty or prices.empty:
         return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
     scored = news.dropna(subset=["sentiment"])
+    if "sentiment_relevant" in scored.columns:
+        scored = scored[scored["sentiment_relevant"] != False]  # noqa: E712 — NaN-safe: only an explicit False is dropped
     if scored.empty:
         return pd.DataFrame(columns=["symbol", "ts", "feature_name", "value"])
 
@@ -215,7 +227,8 @@ def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int
         return 0
 
     news = pd.read_sql(
-        f"SELECT symbol, ts, sentiment FROM news_events WHERE symbol IN ({symbol_list})", engine  # noqa: S608 — symbols validated via symbol_in_clause
+        f"SELECT symbol, ts, sentiment, sentiment_relevant FROM news_events WHERE symbol IN ({symbol_list})",  # noqa: S608 — symbols validated via symbol_in_clause
+        engine,
     )
     macro_calendar = pd.read_sql("SELECT ts, category FROM macro_calendar", engine)
     fundamentals = pd.read_sql(

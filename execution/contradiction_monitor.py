@@ -90,7 +90,12 @@ class ContradictionResult:
 def _recent_sentiment(engine, symbol: str) -> tuple[float | None, int]:
     since = dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=_SENTIMENT_LOOKBACK_HOURS)
     df = pd.read_sql(
-        "SELECT sentiment FROM news_events WHERE symbol = %(symbol)s AND ts >= %(since)s AND sentiment IS NOT NULL",
+        "SELECT sentiment FROM news_events WHERE symbol = %(symbol)s AND ts >= %(since)s AND sentiment IS NOT NULL "
+        # A headline a news vendor mistagged onto this symbol (see
+        # data/schema/010_news_sentiment_relevance.sql) must not be able to
+        # trigger closing a real position -- IS NOT FALSE is the NULL-safe
+        # form, so unscored-for-relevance and pre-migration rows still count.
+        "AND sentiment_relevant IS NOT FALSE",
         engine,
         params={"symbol": symbol, "since": since},
     )

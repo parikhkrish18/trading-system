@@ -1,0 +1,24 @@
+-- A vendor-tagging correctness flag, alongside sentiment/sentiment_reason.
+--
+-- News vendors sometimes tag an article with a symbol that has nothing to
+-- do with the actual story (e.g. an article entirely about Microsoft
+-- getting tagged with NYT -- see the 2026-08-29 investigation of exactly
+-- that case). Nothing in this pipeline previously questioned a vendor's
+-- symbol tag; it was fanned out and trusted as-is by data/ingest/news.py,
+-- data/ingest/news_stream.py, the dashboard's news endpoints,
+-- execution/contradiction_monitor.py's mid-week sentiment check, and
+-- features/build_features.py's model input features -- meaning one bad
+-- vendor tag could silently feed a wrong sentiment reading into an actual
+-- position-closing decision or the forecast model's training data for
+-- whatever symbol got mistagged, not just look wrong on a dashboard.
+--
+-- features/qualitative/sentiment.py's scoring pass already has to read the
+-- headline closely to explain *why* a symbol is affected -- asking it to
+-- also flag "this symbol isn't really what this story is about" is a
+-- natural, free extension of that same read, not a new pass. NULL means
+-- "not yet scored" (same convention as sentiment/sentiment_reason) or
+-- "scored before this column existed" -- both treated as "assume relevant"
+-- by every reader (IS NOT FALSE), so this never retroactively invalidates
+-- real historical data, only actively-flagged rows going forward.
+
+ALTER TABLE news_events ADD COLUMN IF NOT EXISTS sentiment_relevant BOOLEAN;

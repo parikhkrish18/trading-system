@@ -37,6 +37,7 @@ def test_score_sentiment_merges_scores_back_onto_rows(monkeypatch):
                     "id": item["id"],
                     "sentiment": 0.5 if "good" in item["headline"] else -0.5,
                     "reason": "good news" if "good" in item["headline"] else "bad news",
+                    "relevant": True,
                 }
                 for item in items
             ]
@@ -57,7 +58,72 @@ def test_score_sentiment_merges_scores_back_onto_rows(monkeypatch):
 
     assert list(scored["sentiment"]) == [0.5, -0.5]
     assert list(scored["sentiment_reason"]) == ["good news", "bad news"]
-    assert set(scored.columns) >= {"id", "ts", "symbol", "headline", "sentiment", "sentiment_reason"}
+    assert list(scored["sentiment_relevant"]) == [True, True]
+    assert set(scored.columns) >= {
+        "id",
+        "ts",
+        "symbol",
+        "headline",
+        "sentiment",
+        "sentiment_reason",
+        "sentiment_relevant",
+    }
+
+
+def test_score_sentiment_flags_a_mistagged_symbol_as_not_relevant(monkeypatch):
+    """A news vendor mistagging a symbol onto a story (e.g. an MSFT story tagged NYT)
+    should come back with relevant=False rather than a fabricated sentiment reading."""
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        return json.dumps(
+            [
+                {
+                    "id": item["id"],
+                    "sentiment": 0.1,
+                    "reason": "story is actually about a different company",
+                    "relevant": False,
+                }
+                for item in items
+            ]
+        )
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+    headlines = pd.DataFrame(
+        {
+            "id": [1],
+            "ts": pd.to_datetime(["2026-08-29"], utc=True),
+            "symbol": ["NYT"],
+            "headline": ["Steve Ballmer is $65 Billion Richer than Bill Gates. Here's Why."],
+        }
+    )
+
+    scored = sentiment.score_sentiment(headlines)
+
+    assert list(scored["sentiment_relevant"]) == [False]
+
+
+def test_score_sentiment_missing_relevant_field_defaults_to_true(monkeypatch):
+    """An older prompt/model response that omits "relevant" must not silently start
+    excluding real data -- default to assuming the vendor's tag is fine."""
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        return json.dumps([{"id": item["id"], "sentiment": 0.2} for item in items])
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+    headlines = pd.DataFrame(
+        {
+            "id": [1],
+            "ts": pd.to_datetime(["2026-07-27"], utc=True),
+            "symbol": ["SPY"],
+            "headline": ["headline"],
+        }
+    )
+
+    scored = sentiment.score_sentiment(headlines)
+
+    assert list(scored["sentiment_relevant"]) == [True]
 
 
 def test_score_sentiment_missing_reason_field_degrades_to_empty_string(monkeypatch):

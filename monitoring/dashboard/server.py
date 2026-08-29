@@ -553,10 +553,16 @@ def get_positions_news(limit_per_symbol: int = 8) -> dict[str, list[dict]]:
     engine = get_engine()
     symbol_list = symbol_in_clause(symbols)
     df = pd.read_sql(
-        "SELECT symbol, ts, headline, sentiment, sentiment_reason, source FROM news_events "  # noqa: S608 — symbols validated via symbol_in_clause
+        "SELECT symbol, ts, headline, sentiment, sentiment_reason, sentiment_relevant, source FROM news_events "  # noqa: S608 — symbols validated via symbol_in_clause
         f"WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC",
         engine,
     )
+    # A headline a news vendor mistagged onto this symbol (see
+    # data/schema/010_news_sentiment_relevance.sql) shouldn't show up as
+    # "this symbol's news" at all -- IS NOT FALSE keeps NULL (not yet
+    # scored / scored before this column existed) visible as before.
+    if "sentiment_relevant" in df.columns:
+        df = df[df["sentiment_relevant"] != False]  # noqa: E712 — NaN-safe: only an explicit False is dropped
     result: dict[str, list[dict]] = {s: [] for s in symbols}
     for symbol, group in df.groupby("symbol"):
         result[symbol] = _clean_records(group.head(limit_per_symbol))
@@ -638,11 +644,19 @@ def get_live_news(limit: int = Query(default=150, le=1000)) -> list[dict]:
     backfill_unscored_news) only runs piggybacked on the hourly
     contradiction monitor and the weekly cycle — a very fresh headline can
     show "not yet scored" for up to about an hour during market hours.
+
+    A symbol the vendor mistagged onto a story (sentiment_relevant is
+    explicitly False — see data/schema/010_news_sentiment_relevance.sql,
+    e.g. a Ballmer/Gates headline entirely about MSFT tagged with NYT) is
+    dropped from that story's symbol list entirely, not just its
+    sentiment blanked out; a story left with no relevant symbols is
+    dropped from the response. NULL (not yet scored) stays visible as
+    before.
     """
     engine = get_engine()
     df = pd.read_sql(
         text(
-            "SELECT symbol, ts, headline, source, sentiment, sentiment_reason FROM news_events "
+            "SELECT symbol, ts, headline, source, sentiment, sentiment_reason, sentiment_relevant FROM news_events "
             "WHERE headline IS NOT NULL AND headline != '' ORDER BY ts DESC LIMIT :limit"
         ),
         engine,
@@ -654,6 +668,12 @@ def get_live_news(limit: int = Query(default=150, le=1000)) -> list[dict]:
     grouped: dict[tuple, dict] = {}
     order: list[tuple] = []
     for _, row in df.iterrows():
+        relevant = row["sentiment_relevant"]
+        # pd.isna(relevant) is True for NULL (not yet scored / pre-migration)
+        # -- those stay visible. `relevant is False` would miss a numpy.bool_
+        # from the DB driver, so compare via bool() instead.
+        if not pd.isna(relevant) and not bool(relevant):
+            continue
         ts = row["ts"]
         ts_key = ts.isoformat() if hasattr(ts, "isoformat") else ts
         key = (row["headline"], ts_key)
@@ -669,7 +689,7 @@ def get_live_news(limit: int = Query(default=150, le=1000)) -> list[dict]:
                 "sentiment_reason": None if pd.isna(reason) else reason,
             }
         )
-    return [grouped[k] for k in order]
+    return [grouped[k] for k in order if grouped[k]["symbols"]]
 
 
 @app.get("/api/regime_history")

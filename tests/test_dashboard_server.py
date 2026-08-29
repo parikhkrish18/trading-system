@@ -513,6 +513,46 @@ def test_positions_news_carries_sentiment_reason_through(monkeypatch, client):
     assert body["AAPL"][0]["sentiment_reason"] == "EPS beat estimates by a wide margin"
 
 
+def test_positions_news_hides_headlines_a_vendor_mistagged(monkeypatch, client):
+    """A headline flagged sentiment_relevant=False (e.g. an MSFT story a vendor
+    mistagged NYT) must not show up as "this position's news" at all."""
+
+    class _HeldBroker:
+        def get_positions(self):
+            return {"AAPL": 10.0}
+
+    monkeypatch.setattr(server, "get_broker", lambda: _HeldBroker())
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    news = pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "ts": pd.Timestamp("2026-07-29T00:00:00Z"),
+                "headline": "AAPL beats earnings",
+                "sentiment": 0.6,
+                "sentiment_reason": "EPS beat estimates by a wide margin",
+                "sentiment_relevant": True,
+                "source": "polygon",
+            },
+            {
+                "symbol": "AAPL",
+                "ts": pd.Timestamp("2026-07-30T00:00:00Z"),
+                "headline": "Unrelated story mistagged onto AAPL",
+                "sentiment": -0.5,
+                "sentiment_reason": "story is actually about a different company",
+                "sentiment_relevant": False,
+                "source": "polygon",
+            },
+        ]
+    )
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: news)
+
+    resp = client.get("/api/positions/news")
+    body = resp.json()
+    assert len(body["AAPL"]) == 1
+    assert body["AAPL"][0]["headline"] == "AAPL beats earnings"
+
+
 def test_regime_history_returns_empty_with_insufficient_data(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["ts", "high", "low", "close"]))
@@ -867,7 +907,11 @@ def test_changing_the_password_invalidates_outstanding_sessions(monkeypatch):
 def test_live_news_empty_when_no_articles(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(
-        server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "headline", "source", "sentiment", "sentiment_reason"])
+        server.pd,
+        "read_sql",
+        lambda *a, **k: pd.DataFrame(
+            columns=["symbol", "ts", "headline", "source", "sentiment", "sentiment_reason", "sentiment_relevant"]
+        ),
     )
 
     resp = client.get("/api/news/live")
@@ -888,6 +932,7 @@ def test_live_news_groups_multiple_symbols_under_the_same_story(monkeypatch, cli
                 "source": "alpaca_stream",
                 "sentiment": 0.2,
                 "sentiment_reason": "Lower-for-longer rate path eases AAPL's borrowing costs",
+                "sentiment_relevant": True,
             },
             {
                 "symbol": "MSFT",
@@ -896,6 +941,7 @@ def test_live_news_groups_multiple_symbols_under_the_same_story(monkeypatch, cli
                 "source": "alpaca_stream",
                 "sentiment": -0.1,
                 "sentiment_reason": "No rate cut removes a near-term tailwind priced into MSFT",
+                "sentiment_relevant": True,
             },
         ]
     )
@@ -927,6 +973,7 @@ def test_live_news_separate_headlines_stay_separate(monkeypatch, client):
                 "source": "polygon",
                 "sentiment": 0.6,
                 "sentiment_reason": "EPS beat estimates by a wide margin",
+                "sentiment_relevant": True,
             },
             {
                 "symbol": "TSLA",
@@ -935,6 +982,7 @@ def test_live_news_separate_headlines_stay_separate(monkeypatch, client):
                 "source": "polygon",
                 "sentiment": -0.5,
                 "sentiment_reason": "Recall raises near-term cost and reputational risk",
+                "sentiment_relevant": True,
             },
         ]
     )
@@ -960,6 +1008,7 @@ def test_live_news_leaves_sentiment_and_reason_null_when_not_yet_scored(monkeypa
                 "source": "alpaca_stream",
                 "sentiment": float("nan"),
                 "sentiment_reason": None,
+                "sentiment_relevant": None,
             }
         ]
     )
@@ -971,6 +1020,67 @@ def test_live_news_leaves_sentiment_and_reason_null_when_not_yet_scored(monkeypa
     symbol = resp.json()[0]["symbols"][0]
     assert symbol["sentiment"] is None
     assert symbol["sentiment_reason"] is None
+
+
+def test_live_news_hides_a_symbol_a_vendor_mistagged(monkeypatch, client):
+    """A Ballmer/Gates headline entirely about MSFT, mistagged NYT by the vendor
+    (sentiment_relevant=False), must not appear as NYT's news."""
+    ts = pd.Timestamp("2026-08-28T14:30:00Z")
+    df = pd.DataFrame(
+        [
+            {
+                "symbol": "MSFT",
+                "ts": ts,
+                "headline": "Steve Ballmer is $65 Billion Richer than Bill Gates. Here's Why.",
+                "source": "alpaca_stream",
+                "sentiment": 0.4,
+                "sentiment_reason": "Ballmer's MSFT stake gains highlight long-term shareholder value",
+                "sentiment_relevant": True,
+            },
+            {
+                "symbol": "NYT",
+                "ts": ts,
+                "headline": "Steve Ballmer is $65 Billion Richer than Bill Gates. Here's Why.",
+                "source": "alpaca_stream",
+                "sentiment": 0.1,
+                "sentiment_reason": "story is actually about Microsoft, not the New York Times",
+                "sentiment_relevant": False,
+            },
+        ]
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/news/live")
+
+    body = resp.json()
+    assert len(body) == 1
+    symbols = {s["symbol"] for s in body[0]["symbols"]}
+    assert symbols == {"MSFT"}
+
+
+def test_live_news_drops_a_story_left_with_no_relevant_symbols(monkeypatch, client):
+    """If every symbol tagged onto a story turns out mistagged, the story itself
+    should disappear from the feed rather than show up with an empty symbol list."""
+    df = pd.DataFrame(
+        [
+            {
+                "symbol": "NYT",
+                "ts": pd.Timestamp("2026-08-28T14:30:00Z"),
+                "headline": "Steve Ballmer is $65 Billion Richer than Bill Gates. Here's Why.",
+                "source": "alpaca_stream",
+                "sentiment": 0.1,
+                "sentiment_reason": "story is actually about Microsoft, not the New York Times",
+                "sentiment_relevant": False,
+            }
+        ]
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/news/live")
+
+    assert resp.json() == []
 
 
 # --------------------------------------------------------------------------

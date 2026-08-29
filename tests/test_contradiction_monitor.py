@@ -326,6 +326,35 @@ def test_recent_momentum_computed_from_price_history(monkeypatch):
     assert momentum < -0.09
 
 
+def test_recent_sentiment_query_excludes_mistagged_symbols(monkeypatch):
+    """A headline a news vendor mistagged onto this symbol (sentiment_relevant=False)
+    must never be able to trigger closing a real position -- see
+    data/schema/010_news_sentiment_relevance.sql."""
+    queries = []
+
+    def fake_read_sql(query, engine, params=None):
+        queries.append(query)
+        return pd.DataFrame({"sentiment": [-0.8, -0.9]})
+
+    monkeypatch.setattr(cm.pd, "read_sql", fake_read_sql)
+
+    mean, count = cm._recent_sentiment(engine=object(), symbol="AAPL")
+
+    assert mean == pytest.approx(-0.85)
+    assert count == 2
+    assert "sentiment_relevant" in queries[0]
+    assert "IS NOT FALSE" in queries[0]
+
+
+def test_recent_sentiment_empty_when_no_relevant_news(monkeypatch):
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"sentiment": []}))
+
+    mean, count = cm._recent_sentiment(engine=object(), symbol="AAPL")
+
+    assert mean is None
+    assert count == 0
+
+
 def test_freed_capital_fraction_with_no_positions_is_fully_idle():
     broker = _FakeBroker({}, portfolio_value=100_000.0)
     fraction = cm._freed_capital_fraction(broker, engine=object())
