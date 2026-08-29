@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import datetime as dt
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -27,6 +28,9 @@ class _FakePosition:
 @dataclass
 class _FakeClock:
     is_open: bool = True
+    timestamp: dt.datetime = field(default_factory=lambda: dt.datetime(2026, 8, 25, 14, 0, tzinfo=dt.UTC))
+    next_open: dt.datetime = field(default_factory=lambda: dt.datetime(2026, 8, 26, 13, 30, tzinfo=dt.UTC))
+    next_close: dt.datetime = field(default_factory=lambda: dt.datetime(2026, 8, 25, 20, 0, tzinfo=dt.UTC))
 
 
 @dataclass
@@ -254,3 +258,21 @@ def test_get_positions_detailed_maps_all_fields(monkeypatch):
 def test_get_positions_detailed_empty_when_no_positions(monkeypatch):
     broker, _ = _make_broker(monkeypatch)
     assert broker.get_positions_detailed() == []
+
+
+def test_get_clock_maps_alpaca_clock_fields(monkeypatch):
+    """Backs the dashboard's market-hours label — see monitoring/dashboard/server.py::get_market_clock."""
+    broker, _ = _make_broker(monkeypatch, is_open=True)
+
+    clock = broker.get_clock()
+
+    assert clock["is_open"] is True
+    assert clock["source"] == "alpaca"
+    assert clock["timestamp"] == "2026-08-25T14:00:00+00:00"
+    assert clock["next_open"] == "2026-08-26T13:30:00+00:00"
+    assert clock["next_close"] == "2026-08-25T20:00:00+00:00"
+
+
+def test_get_clock_reflects_closed_market(monkeypatch):
+    broker, _ = _make_broker(monkeypatch, is_open=False)
+    assert broker.get_clock()["is_open"] is False

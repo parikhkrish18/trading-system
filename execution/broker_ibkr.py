@@ -39,6 +39,7 @@ import time
 from ib_insync import IB, MarketOrder, Stock
 
 from config.settings import settings
+from execution import market_hours
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,17 @@ class IBKRBroker:
         summary["host"] = self.host
         summary["port"] = self.port
         return summary
+
+    def get_clock(self) -> dict:
+        """
+        IBKR/ib_insync has no single "is the market open" call the way
+        Alpaca does, so this uses the computed NYSE-hours fallback in
+        market_hours.py (see its docstring for what it does and doesn't
+        account for — no holiday calendar). Matches AlpacaBroker.get_clock's
+        return shape so the dashboard's market-hours label works the same
+        regardless of which broker is configured.
+        """
+        return market_hours.compute_clock()
 
     def get_positions(self) -> dict[str, float]:
         self.ib.reqPositions()

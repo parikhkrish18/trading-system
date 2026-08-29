@@ -662,6 +662,80 @@ async function loadModeBadge() {
   }
 }
 
+// ---------- Ingestion / market status strip ----------
+// Two deliberately separate signals (the user-facing reason this exists):
+//   1. Is news ingestion actually live right now? News publishes around
+//      the clock (data/ingest/news_stream.py's websocket never stops for
+//      market hours), so this must NOT be tied to #2 below.
+//   2. Are we inside NYSE regular trading hours? Independent of #1 —
+//      ingestion keeps running either way; only price/trading activity
+//      waits for the open.
+function relativeAgo(seconds) {
+  if (seconds === null || seconds === undefined) return "never";
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+  return `${Math.round(seconds / 86400)}d ago`;
+}
+
+async function loadNewsStatus() {
+  const pill = document.getElementById("news-status-pill");
+  const text = pill.querySelector(".status-text");
+  try {
+    const r = await fetchJSON("/api/news/ingestion_status");
+    const secs = r.seconds_since_latest;
+    let cls, label;
+    if (secs === null) {
+      cls = "stale";
+      label = "No news ingested yet";
+    } else if (secs < 30 * 60) {
+      cls = "live";
+      label = `News ingestion live — last headline ${relativeAgo(secs)}`;
+    } else if (secs < 4 * 3600) {
+      cls = "quiet";
+      label = `News ingestion connected, quiet — last headline ${relativeAgo(secs)}`;
+    } else {
+      cls = "stale";
+      label = `News ingestion may be stuck — last headline ${relativeAgo(secs)}`;
+    }
+    pill.className = `status-pill ${cls}`;
+    text.innerHTML = `${label} <span class="status-sub">(${r.count_last_hour} in last hour)</span>`;
+    pill.title = "Runs continuously — Alpaca's news stream publishes outside regular trading hours too, so this is independent of the market-hours label.";
+  } catch (e) {
+    pill.className = "status-pill unknown";
+    text.textContent = "News ingestion status unavailable";
+  }
+}
+
+async function loadMarketStatus() {
+  const pill = document.getElementById("market-status-pill");
+  const text = pill.querySelector(".status-text");
+  try {
+    const r = await fetchJSON("/api/market_clock");
+    const fmtNy = (iso) =>
+      new Date(iso).toLocaleString("en-US", {
+        timeZone: "America/New_York",
+        weekday: "short",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    if (r.is_open) {
+      pill.className = "status-pill open";
+      text.innerHTML = `Market open <span class="status-sub">— closes ${fmtNy(r.next_close)} ET</span>`;
+    } else {
+      pill.className = "status-pill closed";
+      text.innerHTML = `Market closed <span class="status-sub">— reopens ${fmtNy(r.next_open)} ET, news ingestion continues</span>`;
+    }
+    pill.title = "Price data and trading activity resume automatically at the open — news ingestion above runs regardless of this.";
+    if (r.source && r.source !== "alpaca") {
+      pill.title += " (computed estimate, no holiday calendar — BROKER is not set to alpaca)";
+    }
+  } catch (e) {
+    pill.className = "status-pill unknown";
+    text.textContent = "Market hours unavailable";
+  }
+}
+
 // ---------- Live News tab ----------
 // Turns a raw sentiment float (-1..1, or null before the hourly scoring
 // pass has reached a headline) into something readable at a glance, rather
@@ -740,6 +814,8 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
 async function loadAll() {
   await Promise.allSettled([
     loadModeBadge(),
+    loadNewsStatus(),
+    loadMarketStatus(),
     loadPositions(),
     loadClosedTrades(),
     loadEquity(),
@@ -772,5 +848,14 @@ document.getElementById("news-symbol-filter").addEventListener("keydown", (e) =>
 // The sliders re-hit the endpoint on every input tick — the endpoint is a
 // read-only re-filter of one already-logged batch, so that's cheap.
 document.getElementById("whatif-move").addEventListener("input", loadWhatif);
+
+// The status strip re-polls on its own, lightweight timer — a full loadAll()
+// only runs on page load or the Refresh button, but "last headline Xm ago"
+// visibly going stale while the tab sits open would undercut the entire
+// point of a liveness indicator.
+setInterval(() => {
+  loadNewsStatus();
+  loadMarketStatus();
+}, 60_000);
 
 loadAll();

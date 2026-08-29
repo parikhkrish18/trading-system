@@ -1051,3 +1051,94 @@ def test_live_news_leaves_sentiment_null_when_not_yet_scored(monkeypatch, client
     resp = client.get("/api/news/live")
 
     assert resp.json()[0]["symbols"][0]["sentiment"] is None
+
+
+# --------------------------------------------------------------------------
+# /api/news/ingestion_status and /api/market_clock — the two status-strip
+# indicators requested for Monday: is news ingestion actually alive right
+# now (independent of market hours -- see data/ingest/news_stream.py), and
+# are we inside NYSE regular trading hours.
+# --------------------------------------------------------------------------
+
+
+def _fake_read_sql_for_ingestion_status(latest_ts, count_last_hour):
+    """
+    get_news_ingestion_status runs two queries (MAX(ts), then COUNT(*)) --
+    dispatch on which one a call is by sniffing the compiled SQL text, the
+    same trick the endpoint's own SELECTs are named for.
+    """
+
+    def _read_sql(query, engine, params=None):
+        sql = str(query)
+        if "MAX(ts)" in sql:
+            return pd.DataFrame([{"latest_ts": latest_ts}])
+        if "COUNT(*)" in sql:
+            return pd.DataFrame([{"n": count_last_hour}])
+        raise AssertionError(f"Unexpected query in ingestion_status test: {sql}")
+
+    return _read_sql
+
+
+def test_news_ingestion_status_reports_seconds_since_latest_headline(monkeypatch, client):
+    latest_ts = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=5)
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", _fake_read_sql_for_ingestion_status(latest_ts, 12))
+
+    resp = client.get("/api/news/ingestion_status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count_last_hour"] == 12
+    assert 250 < body["seconds_since_latest"] < 350  # ~5 minutes, allowing for test runtime
+
+
+def test_news_ingestion_status_null_when_no_news_ever_ingested(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", _fake_read_sql_for_ingestion_status(pd.NaT, 0))
+
+    resp = client.get("/api/news/ingestion_status")
+
+    body = resp.json()
+    assert body["latest_ts"] is None
+    assert body["seconds_since_latest"] is None
+    assert body["count_last_hour"] == 0
+
+
+class _FakeClockBroker:
+    def __init__(self, clock: dict):
+        self._clock = clock
+
+    def get_clock(self):
+        return self._clock
+
+
+def test_market_clock_passes_through_broker_response_when_open(monkeypatch, client):
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeClockBroker(
+            {"is_open": True, "timestamp": "2026-08-25T14:00:00+00:00",
+             "next_open": "2026-08-26T13:30:00+00:00", "next_close": "2026-08-25T20:00:00+00:00", "source": "alpaca"}
+        ),
+    )
+
+    resp = client.get("/api/market_clock")
+
+    assert resp.status_code == 200
+    assert resp.json()["is_open"] is True
+
+
+def test_market_clock_passes_through_broker_response_when_closed(monkeypatch, client):
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeClockBroker(
+            {"is_open": False, "timestamp": "2026-08-29T14:00:00+00:00",
+             "next_open": "2026-08-31T13:30:00+00:00", "next_close": "2026-08-31T20:00:00+00:00",
+             "source": "computed_no_holiday_calendar"}
+        ),
+    )
+
+    resp = client.get("/api/market_clock")
+
+    body = resp.json()
+    assert body["is_open"] is False
+    assert body["next_open"] == "2026-08-31T13:30:00+00:00"

@@ -606,6 +606,61 @@ def get_positions_news(limit_per_symbol: int = 8) -> dict[str, list[dict]]:
     return result
 
 
+@app.get("/api/news/ingestion_status")
+def get_news_ingestion_status() -> dict:
+    """
+    Backs the dashboard's "news ingestion is live" indicator. Deliberately
+    separate from market hours: data/ingest/news_stream.py's websocket runs
+    continuously (see its module docstring) and Benzinga/Alpaca news
+    publishes outside NYSE regular trading hours too, so this must never be
+    read as "closed" just because /api/market_clock says the market isn't
+    open.
+
+    Reports both the most recent headline's timestamp AND how many
+    headlines landed in the last hour, rather than a single row — one
+    stray old row can't read as "live", and a quiet-but-connected stretch
+    (overnight, weekend, a slow news day) doesn't read as "broken" off one
+    data point alone. The dashboard is left to apply its own staleness
+    thresholds to seconds_since_latest; this endpoint just reports facts.
+    """
+    engine = get_engine()
+    latest = pd.read_sql(text("SELECT MAX(ts) AS latest_ts FROM news_events"), engine)
+    latest_ts = latest["latest_ts"].iloc[0] if not latest.empty else None
+    now = dt.datetime.now(tz=dt.UTC)
+
+    count_last_hour = pd.read_sql(
+        text("SELECT COUNT(*) AS n FROM news_events WHERE ts >= :cutoff"),
+        engine,
+        params={"cutoff": now - dt.timedelta(hours=1)},
+    )["n"].iloc[0]
+
+    seconds_since_latest = None
+    latest_ts_iso = None
+    if latest_ts is not None and not pd.isna(latest_ts):
+        ts = latest_ts if latest_ts.tzinfo is not None else latest_ts.tz_localize("UTC")
+        seconds_since_latest = (now - ts).total_seconds()
+        latest_ts_iso = ts.isoformat()
+
+    return {
+        "latest_ts": latest_ts_iso,
+        "seconds_since_latest": seconds_since_latest,
+        "count_last_hour": int(count_last_hour),
+        "checked_at": now.isoformat(),
+    }
+
+
+@app.get("/api/market_clock")
+def get_market_clock() -> dict:
+    """
+    NYSE regular-trading-hours clock for the dashboard's market-hours
+    label — separate from /api/news/ingestion_status on purpose, since
+    news ingestion runs regardless of this. See AlpacaBroker.get_clock /
+    IBKRBroker.get_clock for which source answers this depending on
+    BROKER.
+    """
+    return get_broker().get_clock()
+
+
 @app.get("/api/news/live")
 def get_live_news(limit: int = Query(default=150, le=1000)) -> list[dict]:
     """

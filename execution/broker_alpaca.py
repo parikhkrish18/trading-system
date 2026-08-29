@@ -63,6 +63,24 @@ class AlpacaBroker:
         account = self.client.get_account()
         return account.model_dump()
 
+    def get_clock(self) -> dict:
+        """
+        Alpaca's own market clock: whether NYSE regular trading hours are
+        open right now, and the next open/close boundary either way —
+        Alpaca accounts for market holidays and early closes here, so this
+        is preferred over the computed fallback in market_hours.py
+        (broker_ibkr.py uses that one instead, since ib_insync has no
+        equivalent single call). Backs the dashboard's market-hours label.
+        """
+        clock = self.client.get_clock()
+        return {
+            "is_open": clock.is_open,
+            "timestamp": clock.timestamp.isoformat(),
+            "next_open": clock.next_open.isoformat(),
+            "next_close": clock.next_close.isoformat(),
+            "source": "alpaca",
+        }
+
     def get_positions(self) -> dict[str, float]:
         positions = self.client.get_all_positions()
         return {p.symbol: float(p.qty) for p in positions}
