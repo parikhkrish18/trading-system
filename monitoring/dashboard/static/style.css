@@ -271,7 +271,10 @@ tbody tr:hover { background: var(--bg-elevated); }
 .news-card-symbols { display: flex; flex-wrap: wrap; gap: 6px; }
 /* Same filled-tint convention as .side-badge (LONG/SHORT) rather than an
    outlined chip, so a sentiment tag reads as the same kind of thing as
-   every other colored tag in the dashboard. */
+   every other colored tag in the dashboard. Now a real <button> (click to
+   reveal why that ticker was affected — see .news-card-reasons below), so
+   border/font/cursor are reset back to looking like the plain span it used
+   to be, plus a hover/focus cue that it's actually clickable. */
 .news-symbol-pill {
   font-size: 12px;
   font-weight: 600;
@@ -279,9 +282,28 @@ tbody tr:hover { background: var(--bg-elevated); }
   border-radius: 999px;
   background: var(--bg-elevated);
   color: var(--text-muted);
+  border: none;
+  font-family: inherit;
+  cursor: pointer;
 }
+.news-symbol-pill:hover, .news-symbol-pill:focus-visible { filter: brightness(1.15); outline: none; }
 .news-symbol-pill.pl-pos { background: rgba(38,166,91,0.15); color: var(--green); }
 .news-symbol-pill.pl-neg { background: rgba(229,72,77,0.15); color: var(--red); }
+
+/* One line per symbol, revealed on click of its pill above — "why this
+   ticker was affected by this headline," not just the Positive/Negative
+   label. Hidden ones ([hidden]) take up no space, so the card only grows
+   when a reason is actually open. */
+.news-card-reasons { margin-top: 6px; }
+.news-symbol-reason {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-top: 4px;
+}
+.news-symbol-reason strong { color: var(--text); }
 
 .feature-freq-list {
   background: var(--bg-card);

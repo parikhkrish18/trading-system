@@ -483,6 +483,36 @@ def test_positions_news_groups_headlines_by_symbol(monkeypatch, client):
     assert body["AAPL"][0]["headline"] == "AAPL beats earnings"
 
 
+def test_positions_news_carries_sentiment_reason_through(monkeypatch, client):
+    """The per-position news feed also needs the "why" text, same as /api/news/live -- the
+    dashboard's held-positions view is exactly where a reader most wants to click a ticker
+    and see why it moved."""
+
+    class _HeldBroker:
+        def get_positions(self):
+            return {"AAPL": 10.0}
+
+    monkeypatch.setattr(server, "get_broker", lambda: _HeldBroker())
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    news = pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "ts": pd.Timestamp("2026-07-29T00:00:00Z"),
+                "headline": "AAPL beats earnings",
+                "sentiment": 0.6,
+                "sentiment_reason": "EPS beat estimates by a wide margin",
+                "source": "polygon",
+            }
+        ]
+    )
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: news)
+
+    resp = client.get("/api/positions/news")
+    body = resp.json()
+    assert body["AAPL"][0]["sentiment_reason"] == "EPS beat estimates by a wide margin"
+
+
 def test_regime_history_returns_empty_with_insufficient_data(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["ts", "high", "low", "close"]))
@@ -836,7 +866,9 @@ def test_changing_the_password_invalidates_outstanding_sessions(monkeypatch):
 
 def test_live_news_empty_when_no_articles(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "headline", "source", "sentiment"]))
+    monkeypatch.setattr(
+        server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["symbol", "ts", "headline", "source", "sentiment", "sentiment_reason"])
+    )
 
     resp = client.get("/api/news/live")
 
@@ -849,8 +881,22 @@ def test_live_news_groups_multiple_symbols_under_the_same_story(monkeypatch, cli
     ts = pd.Timestamp("2026-08-28T14:30:00Z")
     df = pd.DataFrame(
         [
-            {"symbol": "AAPL", "ts": ts, "headline": "Fed holds rates steady", "source": "alpaca_stream", "sentiment": 0.2},
-            {"symbol": "MSFT", "ts": ts, "headline": "Fed holds rates steady", "source": "alpaca_stream", "sentiment": -0.1},
+            {
+                "symbol": "AAPL",
+                "ts": ts,
+                "headline": "Fed holds rates steady",
+                "source": "alpaca_stream",
+                "sentiment": 0.2,
+                "sentiment_reason": "Lower-for-longer rate path eases AAPL's borrowing costs",
+            },
+            {
+                "symbol": "MSFT",
+                "ts": ts,
+                "headline": "Fed holds rates steady",
+                "source": "alpaca_stream",
+                "sentiment": -0.1,
+                "sentiment_reason": "No rate cut removes a near-term tailwind priced into MSFT",
+            },
         ]
     )
     monkeypatch.setattr(server, "get_engine", lambda: None)
@@ -864,13 +910,32 @@ def test_live_news_groups_multiple_symbols_under_the_same_story(monkeypatch, cli
     assert body[0]["headline"] == "Fed holds rates steady"
     symbols = {s["symbol"]: s["sentiment"] for s in body[0]["symbols"]}
     assert symbols == {"AAPL": pytest.approx(0.2), "MSFT": pytest.approx(-0.1)}
+    reasons = {s["symbol"]: s["sentiment_reason"] for s in body[0]["symbols"]}
+    assert reasons == {
+        "AAPL": "Lower-for-longer rate path eases AAPL's borrowing costs",
+        "MSFT": "No rate cut removes a near-term tailwind priced into MSFT",
+    }
 
 
 def test_live_news_separate_headlines_stay_separate(monkeypatch, client):
     df = pd.DataFrame(
         [
-            {"symbol": "AAPL", "ts": pd.Timestamp("2026-08-28T14:30:00Z"), "headline": "AAPL beats earnings", "source": "polygon", "sentiment": 0.6},
-            {"symbol": "TSLA", "ts": pd.Timestamp("2026-08-28T15:00:00Z"), "headline": "TSLA recalls vehicles", "source": "polygon", "sentiment": -0.5},
+            {
+                "symbol": "AAPL",
+                "ts": pd.Timestamp("2026-08-28T14:30:00Z"),
+                "headline": "AAPL beats earnings",
+                "source": "polygon",
+                "sentiment": 0.6,
+                "sentiment_reason": "EPS beat estimates by a wide margin",
+            },
+            {
+                "symbol": "TSLA",
+                "ts": pd.Timestamp("2026-08-28T15:00:00Z"),
+                "headline": "TSLA recalls vehicles",
+                "source": "polygon",
+                "sentiment": -0.5,
+                "sentiment_reason": "Recall raises near-term cost and reputational risk",
+            },
         ]
     )
     monkeypatch.setattr(server, "get_engine", lambda: None)
@@ -883,17 +948,29 @@ def test_live_news_separate_headlines_stay_separate(monkeypatch, client):
     assert body[0]["headline"] == "AAPL beats earnings"  # newest (ORDER BY ts DESC from the query) first
 
 
-def test_live_news_leaves_sentiment_null_when_not_yet_scored(monkeypatch, client):
-    """A freshly streamed article (see data/ingest/news_stream.py) has sentiment=NaN until the hourly scoring pass reaches it."""
+def test_live_news_leaves_sentiment_and_reason_null_when_not_yet_scored(monkeypatch, client):
+    """A freshly streamed article (see data/ingest/news_stream.py) has sentiment=NaN and sentiment_reason=NaN
+    until the hourly scoring pass reaches it."""
     df = pd.DataFrame(
-        [{"symbol": "NVDA", "ts": pd.Timestamp("2026-08-28T16:00:00Z"), "headline": "NVDA announces new chip", "source": "alpaca_stream", "sentiment": float("nan")}]
+        [
+            {
+                "symbol": "NVDA",
+                "ts": pd.Timestamp("2026-08-28T16:00:00Z"),
+                "headline": "NVDA announces new chip",
+                "source": "alpaca_stream",
+                "sentiment": float("nan"),
+                "sentiment_reason": None,
+            }
+        ]
     )
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
 
     resp = client.get("/api/news/live")
 
-    assert resp.json()[0]["symbols"][0]["sentiment"] is None
+    symbol = resp.json()[0]["symbols"][0]
+    assert symbol["sentiment"] is None
+    assert symbol["sentiment_reason"] is None
 
 
 # --------------------------------------------------------------------------

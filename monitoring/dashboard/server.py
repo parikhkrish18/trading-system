@@ -553,7 +553,7 @@ def get_positions_news(limit_per_symbol: int = 8) -> dict[str, list[dict]]:
     engine = get_engine()
     symbol_list = symbol_in_clause(symbols)
     df = pd.read_sql(
-        "SELECT symbol, ts, headline, sentiment, source FROM news_events "  # noqa: S608 — symbols validated via symbol_in_clause
+        "SELECT symbol, ts, headline, sentiment, sentiment_reason, source FROM news_events "  # noqa: S608 — symbols validated via symbol_in_clause
         f"WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts DESC",
         engine,
     )
@@ -632,17 +632,17 @@ def get_live_news(limit: int = Query(default=150, le=1000)) -> list[dict]:
     into "one story, these symbols, this sentiment each" instead of making
     that story read as five unrelated news items on the dashboard.
 
-    Sentiment can be null for a little while: the real-time stream writes
-    headlines to news_events immediately, but the LLM sentiment pass
-    (features/qualitative/sentiment.py::backfill_unscored_news) only runs
-    piggybacked on the hourly contradiction monitor and the weekly cycle —
-    a very fresh headline can show "not yet scored" for up to about an hour
-    during market hours.
+    Sentiment (and its accompanying reason) can be null for a little while:
+    the real-time stream writes headlines to news_events immediately, but
+    the LLM sentiment pass (features/qualitative/sentiment.py::
+    backfill_unscored_news) only runs piggybacked on the hourly
+    contradiction monitor and the weekly cycle — a very fresh headline can
+    show "not yet scored" for up to about an hour during market hours.
     """
     engine = get_engine()
     df = pd.read_sql(
         text(
-            "SELECT symbol, ts, headline, source, sentiment FROM news_events "
+            "SELECT symbol, ts, headline, source, sentiment, sentiment_reason FROM news_events "
             "WHERE headline IS NOT NULL AND headline != '' ORDER BY ts DESC LIMIT :limit"
         ),
         engine,
@@ -661,8 +661,13 @@ def get_live_news(limit: int = Query(default=150, le=1000)) -> list[dict]:
             grouped[key] = {"headline": row["headline"], "ts": ts_key, "source": row["source"], "symbols": []}
             order.append(key)
         sentiment = row["sentiment"]
+        reason = row["sentiment_reason"]
         grouped[key]["symbols"].append(
-            {"symbol": row["symbol"], "sentiment": None if pd.isna(sentiment) else float(sentiment)}
+            {
+                "symbol": row["symbol"],
+                "sentiment": None if pd.isna(sentiment) else float(sentiment),
+                "sentiment_reason": None if pd.isna(reason) else reason,
+            }
         )
     return [grouped[k] for k in order]
 

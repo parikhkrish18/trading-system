@@ -7,6 +7,15 @@ const fmt = {
   time: (v) => (v ? new Date(v).toLocaleString() : "—"),
 };
 
+// Headlines, sources and LLM-generated sentiment reasons are all external
+// text (news vendors, Claude's own output) getting dropped straight into
+// innerHTML below — escape it rather than trust it.
+function escapeHTML(s) {
+  const div = document.createElement("div");
+  div.textContent = s ?? "";
+  return div.innerHTML;
+}
+
 // ---------- Auth ----------
 // A single dashboard password gates everything now (see
 // monitoring/dashboard/server.py) — the session cookie /login sets is sent
@@ -645,18 +654,38 @@ function sentimentLabel(score) {
   return { text: `${strength}${direction}`, cls: score > 0 ? "pl-pos" : "pl-neg" };
 }
 
+// A headline not yet reached by the hourly LLM scoring pass (see
+// /api/news/live's docstring) has both sentiment and sentiment_reason as
+// null — same "not yet scored" story applies to the reason as to the label.
+const _NOT_YET_SCORED_REASON = "Not yet scored — the hourly scoring pass hasn't reached this headline yet.";
+
 function newsCardHTML(item) {
   const pills = item.symbols
-    .map((s) => {
+    .map((s, i) => {
       const label = sentimentLabel(s.sentiment);
-      return `<span class="news-symbol-pill ${label.cls}"><strong>${s.symbol}</strong> — ${label.text}</span>`;
+      const reasonId = `reason-${item._key}-${i}`;
+      return `
+        <button type="button" class="news-symbol-pill ${label.cls}" aria-expanded="false" aria-controls="${reasonId}">
+          <strong>${escapeHTML(s.symbol)}</strong> — ${label.text}
+        </button>`;
+    })
+    .join("");
+  // Reasons render below the pill row, full card width, one per symbol,
+  // each independently toggled — rather than nested inside the wrapping
+  // pill row, where a per-pill box would be squeezed to that pill's own
+  // (often narrow) width once several pills wrap onto one line.
+  const reasons = item.symbols
+    .map((s, i) => {
+      const reason = s.sentiment_reason || _NOT_YET_SCORED_REASON;
+      return `<div class="news-symbol-reason" id="reason-${item._key}-${i}" hidden><strong>${escapeHTML(s.symbol)}:</strong> ${escapeHTML(reason)}</div>`;
     })
     .join("");
   return `
     <div class="news-card">
-      <div class="news-card-headline">${item.headline}</div>
-      <div class="news-card-meta">${fmt.time(item.ts)} · ${item.source || ""}</div>
+      <div class="news-card-headline">${escapeHTML(item.headline)}</div>
+      <div class="news-card-meta">${fmt.time(item.ts)} · ${escapeHTML(item.source || "")}</div>
       <div class="news-card-symbols">${pills}</div>
+      <div class="news-card-reasons">${reasons}</div>
     </div>`;
 }
 
@@ -677,8 +706,29 @@ async function loadLiveNews(symbolFilter) {
     list.innerHTML = '<div class="empty-state">No recent news found.</div>';
     return;
   }
+  // A stable per-card key ties each pill's toggle button to its own reason
+  // div via id/aria-controls (headline+ts is already this app's grouping
+  // key for "one story" — see /api/news/live — so it's unique per card).
+  items.forEach((item, idx) => {
+    item._key = `${idx}-${item.ts}`;
+  });
   list.innerHTML = items.map(newsCardHTML).join("");
 }
+
+// One delegated listener rather than one per pill: loadLiveNews() replaces
+// the whole list's innerHTML on every refresh, so per-element listeners
+// would just leak. Click toggles that one pill's reason; Enter/Space does
+// too, since these are real <button>s but keyboard activation needs no
+// extra help beyond what delegation already gives the click case.
+document.getElementById("live-news-list").addEventListener("click", (e) => {
+  const btn = e.target.closest(".news-symbol-pill");
+  if (!btn) return;
+  const reasonEl = document.getElementById(btn.getAttribute("aria-controls"));
+  if (!reasonEl) return;
+  const nowHidden = !reasonEl.hidden;
+  reasonEl.hidden = nowHidden;
+  btn.setAttribute("aria-expanded", String(!nowHidden));
+});
 
 function currentNewsFilter() {
   return document.getElementById("news-symbol-filter").value.trim();
