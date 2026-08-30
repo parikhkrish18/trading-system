@@ -76,6 +76,30 @@ class Settings(BaseSettings):
     # empty the dashboard only serves on loopback.
     dashboard_password: str = Field(default="", alias="DASHBOARD_PASSWORD")
 
+    # --- Client accounts (execution/client_fanout.py, execution/client_crypto.py) ---
+    # Fernet key (44-char urlsafe-base64, `Fernet.generate_key()`) encrypting
+    # every client's Alpaca API key/secret at rest in the `clients` table.
+    # Deliberately never derived from another setting: DASHBOARD_PASSWORD or
+    # DB_PASSWORD leaking doesn't also hand over every client's brokerage
+    # credentials this way. No default — client_crypto.py refuses to
+    # encrypt/decrypt anything with this unset rather than silently using a
+    # weak or predictable key.
+    client_key_encryption_key: str = Field(default="", alias="CLIENT_KEY_ENCRYPTION_KEY")
+    # Nothing else in this repo ever passes confirm_live=True for the master
+    # account — trading_loop.py and contradiction_monitor.py are both
+    # hard-coded paper-only, deliberately, so going live requires a human to
+    # edit the file itself rather than flip an env var (see their module
+    # docstrings). execution/client_fanout.py is the first code path that
+    # ever does, because a client's own funded Alpaca account has no paper
+    # equivalent to fall back to. This flag is that same "a human meant
+    # this" friction, just expressed as a switch instead of a code edit,
+    # since client fan-out has to be reachable from the dashboard rather
+    # than from a file only a developer touches. Off by default — every
+    # add-client/rebalance/close is a real order in a real client account
+    # the moment this is true, so flip it deliberately, not as part of a
+    # deploy that happens to also touch something else.
+    client_trading_enabled: bool = Field(default=False, alias="CLIENT_TRADING_ENABLED")
+
     # --- Feature set ---
     # Which feature set scripts/init_database.py builds when no
     # --feature-set-id is passed explicitly. Other CLI entry points

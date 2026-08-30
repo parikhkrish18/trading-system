@@ -276,3 +276,32 @@ def test_get_clock_maps_alpaca_clock_fields(monkeypatch):
 def test_get_clock_reflects_closed_market(monkeypatch):
     broker, _ = _make_broker(monkeypatch, is_open=False)
     assert broker.get_clock()["is_open"] is False
+
+
+def test_explicit_credentials_override_settings_and_are_passed_to_the_sdk(monkeypatch):
+    """execution/client_fanout.py trades a client's own Alpaca account through
+    their own credentials, not the operator's -- api_key/secret_key passed
+    explicitly must bypass config/settings.py entirely, even when it holds
+    different (or no) values."""
+    monkeypatch.setattr("execution.broker_alpaca.settings.alpaca_live_api_key", "operators-own-key")
+    monkeypatch.setattr("execution.broker_alpaca.settings.alpaca_live_secret_key", "operators-own-secret")
+
+    captured = {}
+
+    def fake_trading_client(api_key, secret_key, paper):
+        captured["api_key"] = api_key
+        captured["secret_key"] = secret_key
+        captured["paper"] = paper
+        return _FakeTradingClient()
+
+    monkeypatch.setattr("execution.broker_alpaca.TradingClient", fake_trading_client)
+    monkeypatch.setattr("execution.broker_alpaca.StockHistoricalDataClient", lambda *a, **k: _FakeDataClient())
+
+    AlpacaBroker(mode="live", confirm_live=True, api_key="clients-own-key", secret_key="clients-own-secret")
+
+    assert captured == {"api_key": "clients-own-key", "secret_key": "clients-own-secret", "paper": False}
+
+
+def test_explicit_credentials_still_require_confirm_live_for_live_mode():
+    with pytest.raises(RuntimeError, match="confirm_live"):
+        AlpacaBroker(mode="live", api_key="clients-own-key", secret_key="clients-own-secret")

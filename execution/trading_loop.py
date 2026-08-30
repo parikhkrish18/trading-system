@@ -30,6 +30,7 @@ from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
 from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.broker import get_broker
+from execution.client_fanout import replicate_to_clients
 from execution.hold_rules import evaluate_holds, load_exit_levels, load_missed_cycles, store_missed_cycles
 from execution.reconciliation import reconcile_positions, summarize
 from features.quant.momentum import adx
@@ -683,6 +684,22 @@ def run_cycle(
                 submitted_orders[c.symbol] = order
         except Exception:
             logger.exception("Order failed for %s — continuing with the rest of the cycle.", c.symbol)
+
+    # Replicate the same opens/closes onto every client's own Alpaca
+    # account, sized as the same percentage of THEIR capital (see
+    # execution/client_fanout.py) — same symbols and target_position_pct
+    # already computed for the master account above, just resized per
+    # client. Reuses `prices` fetched for the master account's own orders
+    # rather than re-quoting. Never allowed to affect the master cycle's
+    # own outcome: a total failure here is logged and swallowed, since the
+    # master account's trades are already placed by this point regardless.
+    try:
+        client_target_positions = dict.fromkeys(approved_close_symbols, 0.0)
+        client_target_positions.update({c.symbol: c.target_position_pct or 0.0 for c in approved_candidates})
+        if client_target_positions:
+            replicate_to_clients(client_target_positions, prices, engine)
+    except Exception:
+        logger.exception("Client fan-out failed for this cycle — the master account's own trades above are unaffected.")
 
     order_type = _order_type(broker)
     execution_summaries = [f"{s}: closed" for s in approved_close_symbols]

@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import hmac
+import html
 import json
 import logging
 from pathlib import Path
@@ -26,11 +27,15 @@ import pandas as pd
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from execution.broker import get_broker
+from execution.broker_alpaca import AlpacaBroker
+from execution.client_crypto import decrypt_credential, encrypt_credential, hash_password, verify_password
+from execution.client_fanout import onboard_client
 from execution.hold_rules import load_exit_levels
 from features.quant.momentum import adx as compute_adx
 from models.regime.trend_chop_classifier import RuleBasedRegime
@@ -180,6 +185,13 @@ def _check_dashboard_auth(request: Request) -> PlainTextResponse | JSONResponse 
       fetch wrapper sends the browser to /login on that, rather than a
       fetch() silently following a redirect into an HTML page.
     """
+    # The client portal (/portal*, /api/portal/*) is gated by its own
+    # per-client password, not the operator's DASHBOARD_PASSWORD — a client
+    # has no reason to know that password, and shouldn't need it to see
+    # their own account. See _require_client below for that gate.
+    if request.url.path == "/portal" or request.url.path.startswith(("/portal/", "/api/portal/")):
+        return None
+
     password = settings.dashboard_password
     server_host = (request.scope.get("server") or ("", 0))[0]
     if not password:
@@ -749,6 +761,515 @@ def get_feature_frequency(limit: int = 200) -> list[dict]:
     ]
     result.sort(key=lambda r: r["times_in_top5"], reverse=True)
     return result
+
+
+########################################################################
+# Client accounts — operator-side management (admin-gated, above) and the
+# client-facing read-only portal (its own password, see _require_client).
+# See execution/client_fanout.py and execution/client_crypto.py for the
+# trading and encryption logic this UI drives; CLIENT_TRADING_ENABLED
+# (config/settings.py) is the separate kill switch that has to be on
+# before any of this can place a real order.
+########################################################################
+
+
+class _NewClientRequest(BaseModel):
+    name: str
+    alpaca_api_key: str
+    alpaca_api_secret: str
+    margin_enabled: bool = False
+    password: str
+
+
+class _ResetPasswordRequest(BaseModel):
+    new_password: str
+
+
+def _mask_key(api_key: str) -> str:
+    if len(api_key) <= 8:
+        return "•" * len(api_key)
+    return f"{api_key[:4]}…{api_key[-4:]}"
+
+
+@app.get("/api/clients/trading_status")
+def get_client_trading_status() -> dict:
+    """Whether CLIENT_TRADING_ENABLED is on — the dashboard's Clients tab shows this plainly,
+    since adding a client is otherwise silent about whether it actually did anything yet."""
+    return {"enabled": settings.client_trading_enabled}
+
+
+@app.post("/api/clients")
+def create_client(body: _NewClientRequest) -> dict:
+    """
+    Adds a client: verifies the Alpaca credentials actually work (a
+    read-only get_account() call — this happens even if CLIENT_TRADING_ENABLED
+    is still off, so a typo'd key is caught at add-time, not at the next
+    fan-out), encrypts them at rest, hashes the portal password, and — if
+    trading is enabled — immediately buys the client into whatever the
+    master account currently holds (the "buy in right away" decision).
+    """
+    if not body.name.strip() or not body.password:
+        return JSONResponse({"detail": "Name and password are required."}, status_code=400)
+
+    try:
+        verify_broker = AlpacaBroker(
+            mode="live", confirm_live=True, api_key=body.alpaca_api_key, secret_key=body.alpaca_api_secret
+        )
+        verify_broker.get_account()
+    except Exception as e:
+        return JSONResponse({"detail": f"Could not connect to this Alpaca account: {e}"}, status_code=400)
+
+    engine = get_engine()
+    try:
+        with engine.begin() as conn:
+            result = conn.exec_driver_sql(
+                "INSERT INTO clients (name, alpaca_api_key_encrypted, alpaca_api_secret_encrypted, margin_enabled, password_hash) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (
+                    body.name.strip(),
+                    encrypt_credential(body.alpaca_api_key),
+                    encrypt_credential(body.alpaca_api_secret),
+                    body.margin_enabled,
+                    hash_password(body.password),
+                ),
+            )
+            client_id = result.scalar_one()
+    except Exception as e:
+        # Most likely the UNIQUE(name) constraint — surfaced as 400, not 500,
+        # since it's a caller mistake (a duplicate name), not a server fault.
+        return JSONResponse({"detail": f"Could not create client: {e}"}, status_code=400)
+
+    buy_in_note = "Client trading is off (CLIENT_TRADING_ENABLED) — added but not yet buying in."
+    if settings.client_trading_enabled:
+        try:
+            master_broker = get_broker()  # never passes confirm_live=True — paper-only by construction
+            onboard_client(client_id, master_broker, engine)
+            buy_in_note = "Buy-in submitted against the master account's current holdings."
+        except Exception as e:
+            logger.exception("Onboarding buy-in failed for new client %s", client_id)
+            buy_in_note = f"Client added, but the immediate buy-in failed: {e}. Retry manually if needed."
+
+    return {
+        "id": client_id, "name": body.name.strip(), "margin_enabled": body.margin_enabled,
+        "active": True, "buy_in": buy_in_note,
+    }
+
+
+@app.get("/api/clients")
+def list_clients() -> list[dict]:
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT id, name, alpaca_api_key_encrypted, margin_enabled, active, created_at FROM clients ORDER BY created_at DESC",
+        engine,
+    )
+    clients = []
+    for _, row in df.iterrows():
+        try:
+            key_preview = _mask_key(decrypt_credential(row["alpaca_api_key_encrypted"]))
+        except Exception:
+            key_preview = "(could not decrypt)"
+        clients.append(
+            {
+                "id": int(row["id"]),
+                "name": row["name"],
+                "api_key_preview": key_preview,
+                "margin_enabled": bool(row["margin_enabled"]),
+                "active": bool(row["active"]),
+                "created_at": row["created_at"].isoformat() if pd.notna(row["created_at"]) else None,
+            }
+        )
+    return clients
+
+
+@app.post("/api/clients/{client_id}/deactivate")
+def deactivate_client(client_id: int) -> dict:
+    """
+    Takes a client out of every future fan-out (new trades, rebalances,
+    closes) without touching whatever they currently hold — deactivating is
+    not liquidating. Their existing positions stay exactly as they are
+    until the client or operator acts on them directly.
+    """
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.exec_driver_sql("UPDATE clients SET active = FALSE WHERE id = %s", (client_id,))
+    return {"id": client_id, "active": False}
+
+
+@app.post("/api/clients/{client_id}/reactivate")
+def reactivate_client(client_id: int) -> dict:
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.exec_driver_sql("UPDATE clients SET active = TRUE WHERE id = %s", (client_id,))
+    return {"id": client_id, "active": True}
+
+
+@app.post("/api/clients/{client_id}/reset_password")
+def reset_client_password(client_id: int, body: _ResetPasswordRequest) -> dict:
+    if not body.new_password:
+        return JSONResponse({"detail": "new_password is required."}, status_code=400)
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE clients SET password_hash = %s WHERE id = %s", (hash_password(body.new_password), client_id)
+        )
+    return {"id": client_id, "password_reset": True}
+
+
+@app.get("/api/clients/{client_id}/orders")
+def get_client_orders(client_id: int, limit: int = 100) -> list[dict]:
+    """The operator's view of one client's fan-out history — same table the client's own portal reads."""
+    engine = get_engine()
+    df = pd.read_sql(
+        text(
+            "SELECT symbol, side, target_position_pct, target_shares, status, alpaca_order_id, error_message, ts "
+            "FROM client_orders WHERE client_id = :client_id ORDER BY ts DESC LIMIT :limit"
+        ),
+        engine,
+        params={"client_id": client_id, "limit": limit},
+    )
+    return _clean_records(df)
+
+
+########################################################################
+# Client portal — a separate login (client name + their own password, see
+# execution/client_crypto.py) gating a read-only view of just that
+# client's own positions, account, and trade history. Deliberately does
+# NOT expose the model's reasoning, forecasts, or sentiment/news feed (the
+# "results only" decision) — a client sees what happened to their money,
+# not the strategy behind it.
+########################################################################
+
+_CLIENT_SESSION_COOKIE = "client_portal_session"
+_CLIENT_SESSION_MAX_AGE_S = 30 * 24 * 3600
+
+
+def _client_session_token(password_hash: str) -> str:
+    """
+    Self-invalidating exactly like the operator session (_session_token
+    above): the token is an HMAC keyed by the client's OWN password hash,
+    so resetting a client's password invalidates their outstanding cookie
+    without a separate server-side session store.
+    """
+    return hmac.new(password_hash.encode(), b"client-portal-session", hashlib.sha256).hexdigest()
+
+
+def _require_client(request: Request) -> dict | None:
+    """Returns {id, name} for a valid client session cookie, or None."""
+    cookie = request.cookies.get(_CLIENT_SESSION_COOKIE, "")
+    if "." not in cookie:
+        return None
+    client_id_s, token = cookie.split(".", 1)
+    try:
+        client_id = int(client_id_s)
+    except ValueError:
+        return None
+    engine = get_engine()
+    df = pd.read_sql(
+        text("SELECT id, name, password_hash, active FROM clients WHERE id = :id"),
+        engine,
+        params={"id": client_id},
+    )
+    if df.empty or not bool(df.iloc[0]["active"]):
+        return None
+    row = df.iloc[0]
+    if not hmac.compare_digest(token, _client_session_token(row["password_hash"])):
+        return None
+    return {"id": int(row["id"]), "name": row["name"]}
+
+
+_CLIENT_LOGIN_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Client Portal — Log in</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0b0e14; color: #e6e9f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }}
+  form {{
+    background: #161b26; border: 1px solid #262c3b; border-radius: 10px;
+    padding: 32px 28px; width: 280px; text-align: center;
+  }}
+  h1 {{ font-size: 16px; margin: 0 0 20px; }}
+  input {{
+    width: 100%; padding: 9px 12px; margin-bottom: 12px; border-radius: 6px;
+    border: 1px solid #262c3b; background: #131722; color: #e6e9f0; font-size: 14px; box-sizing: border-box;
+  }}
+  button {{
+    width: 100%; padding: 9px 12px; border-radius: 6px; border: 1px solid #5b8cff;
+    background: #5b8cff; color: white; font-size: 14px; font-weight: 600; cursor: pointer;
+  }}
+  .error {{ color: #e5484d; font-size: 12px; margin: -6px 0 14px; }}
+</style>
+</head>
+<body>
+  <form method="post" action="/portal/login">
+    <h1>Client Portal</h1>
+    {error_html}
+    <input type="text" name="name" placeholder="Name" autofocus autocomplete="username" />
+    <input type="password" name="password" placeholder="Password" autocomplete="current-password" />
+    <button type="submit">Log in</button>
+  </form>
+</body>
+</html>"""
+
+
+# Self-contained (inline CSS + JS), same as _CLIENT_LOGIN_PAGE above, rather
+# than a separate static/portal.js file — a portal.js served through the
+# root StaticFiles mount would hit the OPERATOR'S auth gate (it doesn't
+# start with /portal/), locking every client out of their own page. Built
+# with str.replace() rather than .format(): the JS below is full of literal
+# { } that .format() would otherwise treat as fields.
+_CLIENT_PORTAL_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Client Portal</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b0e14; color: #e6e9f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 20px; border-bottom: 1px solid #262c3b; background: #12151f;
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header a { color: #9aa4b8; font-size: 13px; text-decoration: none; }
+  main { max-width: 900px; margin: 0 auto; padding: 20px; }
+  section { margin-bottom: 28px; }
+  h2 { font-size: 14px; color: #9aa4b8; text-transform: uppercase; letter-spacing: 0.03em; margin: 0 0 10px; }
+  .summary-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .stat-card {
+    background: #161b26; border: 1px solid #262c3b; border-radius: 10px;
+    padding: 12px 16px; min-width: 140px;
+  }
+  .stat-card .label { font-size: 11px; color: #9aa4b8; text-transform: uppercase; }
+  .stat-card .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
+  .table-wrap { background: #161b26; border: 1px solid #262c3b; border-radius: 10px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #262c3b; white-space: nowrap; }
+  th { color: #9aa4b8; font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  tbody tr:last-child td { border-bottom: none; }
+  .empty-state { color: #9aa4b8; font-size: 13px; padding: 16px 0; }
+  .long { color: #3ecf8e; } .short { color: #e5484d; }
+  .status-submitted { color: #3ecf8e; } .status-failed { color: #e5484d; }
+  .status-skipped_no_margin, .status-no_price, .status-no_change { color: #9aa4b8; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>__CLIENT_NAME__'s Portfolio</h1>
+    <a href="/portal/logout">Log out</a>
+  </header>
+  <main>
+    <section>
+      <h2>Account</h2>
+      <div id="account-summary" class="summary-row"></div>
+    </section>
+    <section>
+      <h2>Positions</h2>
+      <div class="table-wrap">
+        <table id="positions-table">
+          <thead><tr><th>Symbol</th><th>Side</th><th>Shares</th><th>Value</th><th>Unrealized P/L</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <h2>Trade History</h2>
+      <div class="table-wrap">
+        <table id="trades-table">
+          <thead><tr><th>When</th><th>Symbol</th><th>Side</th><th>Target</th><th>Shares</th><th>Status</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    function esc(s) {
+      const div = document.createElement("div");
+      div.textContent = s ?? "";
+      return div.innerHTML;
+    }
+    function fmtMoney(n) {
+      return n == null ? "—" : n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+    }
+    async function fetchJSON(url) {
+      const res = await fetch(url);
+      if (res.status === 401) {
+        window.location.href = "/portal";
+        throw new Error("not authenticated");
+      }
+      if (!res.ok) throw new Error(url + " -> " + res.status);
+      return res.json();
+    }
+    async function loadAccount() {
+      const el = document.getElementById("account-summary");
+      try {
+        const a = await fetchJSON("/api/portal/account");
+        el.innerHTML =
+          '<div class="stat-card"><div class="label">Equity</div><div class="value">' + fmtMoney(a.equity) + '</div></div>' +
+          '<div class="stat-card"><div class="label">Cash</div><div class="value">' + fmtMoney(a.cash) + '</div></div>' +
+          '<div class="stat-card"><div class="label">Buying power</div><div class="value">' + fmtMoney(a.buying_power) + '</div></div>';
+      } catch {
+        el.innerHTML = '<div class="empty-state">Could not load your account right now.</div>';
+      }
+    }
+    async function loadPositions() {
+      const tbody = document.querySelector("#positions-table tbody");
+      try {
+        const rows = await fetchJSON("/api/portal/positions");
+        tbody.innerHTML = rows.length ? rows.map((p) => {
+          const sideClass = p.side === "short" ? "short" : "long";
+          return '<tr><td>' + esc(p.symbol) + '</td><td class="' + sideClass + '">' + esc(p.side) + '</td>' +
+            '<td>' + Number(p.qty).toLocaleString() + '</td><td>' + fmtMoney(p.market_value) + '</td>' +
+            '<td class="' + (p.unrealized_pl >= 0 ? "long" : "short") + '">' + fmtMoney(p.unrealized_pl) + '</td></tr>';
+        }).join("") : '<tr><td colspan="5" class="empty-state">No open positions.</td></tr>';
+      } catch {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty-state">Could not load positions right now.</td></tr>';
+      }
+    }
+    async function loadTrades() {
+      const tbody = document.querySelector("#trades-table tbody");
+      try {
+        const rows = await fetchJSON("/api/portal/trades");
+        tbody.innerHTML = rows.length ? rows.map((t) => {
+          const pct = t.target_position_pct == null ? "—" : (t.target_position_pct * 100).toFixed(1) + "%";
+          const shares = t.target_shares == null ? "—" : Number(t.target_shares).toLocaleString();
+          return '<tr><td>' + new Date(t.ts).toLocaleString() + '</td><td>' + esc(t.symbol) + '</td>' +
+            '<td>' + esc(t.side || "") + '</td><td>' + pct + '</td><td>' + shares + '</td>' +
+            '<td class="status-' + esc(t.status) + '">' + esc(t.status) + '</td></tr>';
+        }).join("") : '<tr><td colspan="6" class="empty-state">No trades yet.</td></tr>';
+      } catch {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Could not load trade history right now.</td></tr>';
+      }
+    }
+    loadAccount();
+    loadPositions();
+    loadTrades();
+    setInterval(() => { loadAccount(); loadPositions(); }, 60000);
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/portal", include_in_schema=False)
+def portal_page(request: Request) -> Response:
+    client = _require_client(request)
+    if not client:
+        return HTMLResponse(_CLIENT_LOGIN_PAGE.format(error_html=""))
+    # html.escape: the client name is operator-entered (not the client's own
+    # self-registration), but it's still external text landing in markup —
+    # same discipline as escapeHTML() on the JS side for headlines/reasons.
+    safe_name = html.escape(client["name"])
+    page = _CLIENT_PORTAL_PAGE.replace("__CLIENT_NAME__", safe_name)
+    return HTMLResponse(page)
+
+
+@app.post("/portal/login", include_in_schema=False)
+async def portal_login(request: Request) -> Response:
+    body = await request.body()
+    parsed = parse_qs(body.decode("utf-8"))
+    name = (parsed.get("name") or [""])[0]
+    password = (parsed.get("password") or [""])[0]
+
+    engine = get_engine()
+    df = pd.read_sql(text("SELECT id, password_hash, active FROM clients WHERE name = :name"), engine, params={"name": name})
+    if df.empty or not bool(df.iloc[0]["active"]) or not verify_password(password, df.iloc[0]["password_hash"]):
+        return HTMLResponse(_CLIENT_LOGIN_PAGE.format(error_html='<div class="error">Wrong name or password.</div>'), status_code=401)
+
+    row = df.iloc[0]
+    resp = RedirectResponse("/portal", status_code=303)
+    server_host = (request.scope.get("server") or ("", 0))[0]
+    resp.set_cookie(
+        _CLIENT_SESSION_COOKIE,
+        f"{int(row['id'])}.{_client_session_token(row['password_hash'])}",
+        max_age=_CLIENT_SESSION_MAX_AGE_S,
+        httponly=True,
+        samesite="lax",
+        secure=server_host not in _LOOPBACK_HOSTS,
+    )
+    return resp
+
+
+@app.get("/portal/logout", include_in_schema=False)
+def portal_logout() -> Response:
+    resp = RedirectResponse("/portal")
+    resp.delete_cookie(_CLIENT_SESSION_COOKIE)
+    return resp
+
+
+def _client_broker(client_id: int) -> AlpacaBroker:
+    engine = get_engine()
+    df = pd.read_sql(
+        text("SELECT alpaca_api_key_encrypted, alpaca_api_secret_encrypted FROM clients WHERE id = :id"),
+        engine,
+        params={"id": client_id},
+    )
+    row = df.iloc[0]
+    return AlpacaBroker(
+        mode="live",
+        confirm_live=True,
+        api_key=decrypt_credential(row["alpaca_api_key_encrypted"]),
+        secret_key=decrypt_credential(row["alpaca_api_secret_encrypted"]),
+    )
+
+
+@app.get("/api/portal/positions", response_model=None)
+def portal_positions(request: Request) -> list[dict] | JSONResponse:
+    client = _require_client(request)
+    if not client:
+        return JSONResponse({"detail": "Not authenticated."}, status_code=401)
+    try:
+        return _client_broker(client["id"]).get_positions_detailed()
+    except Exception as e:
+        return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+
+
+@app.get("/api/portal/account", response_model=None)
+def portal_account(request: Request) -> dict | JSONResponse:
+    client = _require_client(request)
+    if not client:
+        return JSONResponse({"detail": "Not authenticated."}, status_code=401)
+    try:
+        account = _client_broker(client["id"]).get_account()
+    except Exception as e:
+        return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+    return {
+        "equity": float(account.get("equity", 0) or 0),
+        "cash": float(account.get("cash", 0) or 0),
+        "buying_power": float(account.get("buying_power", 0) or 0),
+    }
+
+
+@app.get("/api/portal/trades", response_model=None)
+def portal_trades(request: Request, limit: int = 100) -> list[dict] | JSONResponse:
+    """
+    This client's own fan-out history — deliberately just symbol/side/size/
+    status/timestamp, nothing about why the model picked it (no reasoning,
+    no sentiment, no forecast) per the results-only decision.
+    """
+    client = _require_client(request)
+    if not client:
+        return JSONResponse({"detail": "Not authenticated."}, status_code=401)
+    engine = get_engine()
+    df = pd.read_sql(
+        text(
+            "SELECT symbol, side, target_position_pct, target_shares, status, ts "
+            "FROM client_orders WHERE client_id = :client_id ORDER BY ts DESC LIMIT :limit"
+        ),
+        engine,
+        params={"client_id": client["id"], "limit": limit},
+    )
+    return _clean_records(df)
 
 
 # Static frontend, mounted last so it doesn't shadow /api/* routes. A mount

@@ -734,6 +734,99 @@ function currentNewsFilter() {
   return document.getElementById("news-symbol-filter").value.trim();
 }
 
+// ---------- Clients ----------
+async function loadClientTradingBadge() {
+  try {
+    const status = await fetchJSON("/api/clients/trading_status");
+    const el = document.getElementById("client-trading-badge");
+    el.textContent = status.enabled ? "(client trading is ON — orders are real)" : "(client trading is OFF — CLIENT_TRADING_ENABLED not set)";
+    el.style.color = status.enabled ? "var(--red)" : "var(--text-muted)";
+  } catch {
+    document.getElementById("client-trading-badge").textContent = "";
+  }
+}
+
+function clientRowHTML(c) {
+  const statusLabel = c.active ? "Active" : "Deactivated";
+  const toggleLabel = c.active ? "Deactivate" : "Reactivate";
+  const toggleAction = c.active ? "deactivate" : "reactivate";
+  return `
+    <tr data-client-id="${c.id}">
+      <td>${escapeHTML(c.name)}</td>
+      <td><code>${escapeHTML(c.api_key_preview)}</code></td>
+      <td>${c.margin_enabled ? "Yes" : "No"}</td>
+      <td>${statusLabel}</td>
+      <td>${c.created_at ? new Date(c.created_at).toLocaleDateString() : ""}</td>
+      <td>
+        <button class="btn btn-secondary client-toggle-btn" data-action="${toggleAction}" data-id="${c.id}">${toggleLabel}</button>
+        <button class="btn btn-secondary client-reset-btn" data-id="${c.id}">Reset password</button>
+      </td>
+    </tr>`;
+}
+
+async function loadClients() {
+  loadClientTradingBadge();
+  const tbody = document.querySelector("#clients-table tbody");
+  try {
+    const clients = await fetchJSON("/api/clients");
+    document.getElementById("clients-count").textContent = `(${clients.length})`;
+    tbody.innerHTML = clients.length
+      ? clients.map(clientRowHTML).join("")
+      : '<tr><td colspan="6" class="empty-state">No clients yet.</td></tr>';
+  } catch {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Could not load clients.</td></tr>';
+  }
+}
+
+document.getElementById("add-client-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const statusEl = document.getElementById("add-client-status");
+  statusEl.textContent = "Adding client and verifying Alpaca credentials…";
+  const body = {
+    name: document.getElementById("client-name").value.trim(),
+    alpaca_api_key: document.getElementById("client-alpaca-key").value.trim(),
+    alpaca_api_secret: document.getElementById("client-alpaca-secret").value.trim(),
+    margin_enabled: document.getElementById("client-margin").checked,
+    password: document.getElementById("client-password").value,
+  };
+  try {
+    const res = await fetch("/api/clients", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      statusEl.textContent = `Error: ${data.detail || res.status}`;
+      return;
+    }
+    statusEl.textContent = `Added ${data.name}. ${data.buy_in || ""}`;
+    document.getElementById("add-client-form").reset();
+    loadClients();
+  } catch (err) {
+    statusEl.textContent = `Error: ${err}`;
+  }
+});
+
+document.querySelector("#clients-table tbody").addEventListener("click", async (e) => {
+  const toggleBtn = e.target.closest(".client-toggle-btn");
+  const resetBtn = e.target.closest(".client-reset-btn");
+  if (toggleBtn) {
+    const id = toggleBtn.dataset.id;
+    await fetch(`/api/clients/${id}/${toggleBtn.dataset.action}`, { method: "POST" });
+    loadClients();
+  } else if (resetBtn) {
+    const newPassword = prompt("New portal password for this client:");
+    if (!newPassword) return;
+    await fetch(`/api/clients/${resetBtn.dataset.id}/reset_password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_password: newPassword }),
+    });
+    alert("Password reset.");
+  }
+});
+
 // ---------- Tabs ----------
 let activeTab = "overview";
 
@@ -755,6 +848,9 @@ function switchTab(name) {
   // what's actually in the database at that moment.
   if (name === "news") {
     loadLiveNews(currentNewsFilter());
+  }
+  if (name === "clients") {
+    loadClients();
   }
 }
 

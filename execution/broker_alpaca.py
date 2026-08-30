@@ -34,7 +34,22 @@ _EXTENDED_HOURS_LIMIT_BUFFER_PCT = 0.005
 
 
 class AlpacaBroker:
-    def __init__(self, mode: str | None = None, confirm_live: bool = False):
+    def __init__(
+        self,
+        mode: str | None = None,
+        confirm_live: bool = False,
+        api_key: str | None = None,
+        secret_key: str | None = None,
+    ):
+        """
+        api_key/secret_key are optional overrides of the credentials in
+        config/settings.py — execution/client_fanout.py uses this to trade a
+        client's own Alpaca account through their own credentials (decrypted
+        just-in-time from `clients`, see execution/client_crypto.py) rather
+        than the operator's. The mode/confirm_live gate below still applies
+        either way: a client's own account is real money exactly like the
+        operator's live account is, so it gets no less friction.
+        """
         mode = mode or settings.trading_mode
         if mode not in ("paper", "live"):
             raise ValueError(f"mode must be 'paper' or 'live', got {mode!r}")
@@ -47,10 +62,11 @@ class AlpacaBroker:
             )
 
         self.mode = mode
-        if mode == "paper":
-            api_key, secret_key = settings.alpaca_paper_api_key, settings.alpaca_paper_secret_key
-        else:
-            api_key, secret_key = settings.alpaca_live_api_key, settings.alpaca_live_secret_key
+        if api_key is None and secret_key is None:
+            if mode == "paper":
+                api_key, secret_key = settings.alpaca_paper_api_key, settings.alpaca_paper_secret_key
+            else:
+                api_key, secret_key = settings.alpaca_live_api_key, settings.alpaca_live_secret_key
 
         if not api_key or not secret_key:
             raise RuntimeError(f"Alpaca {mode} API credentials are not set in the environment.")

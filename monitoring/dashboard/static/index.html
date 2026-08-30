@@ -31,6 +31,7 @@
     <button class="tab-btn active" data-tab="overview">Overview</button>
     <button class="tab-btn" data-tab="model">Model</button>
     <button class="tab-btn" data-tab="news">Live News</button>
+    <button class="tab-btn" data-tab="clients">Clients</button>
   </nav>
 
   <main>
@@ -148,6 +149,37 @@
           <button id="news-refresh-btn" class="btn btn-secondary">Refresh</button>
         </div>
         <div id="live-news-list" class="news-feed-list"></div>
+      </section>
+    </div>
+
+    <div id="tab-clients" class="tab-panel" hidden>
+      <section id="add-client-section">
+        <h2>Add Client <span class="muted" id="client-trading-badge"></span></h2>
+        <form id="add-client-form" class="filter-row" style="flex-wrap: wrap;">
+          <input id="client-name" placeholder="Client name" required />
+          <input id="client-alpaca-key" placeholder="Alpaca API key" required />
+          <input id="client-alpaca-secret" placeholder="Alpaca API secret" type="password" required />
+          <input id="client-password" placeholder="Portal password" type="password" required />
+          <label class="client-margin-label">
+            <input id="client-margin" type="checkbox" style="min-width: auto; width: auto;" /> Margin-enabled account
+          </label>
+          <button type="submit" class="btn">Add client</button>
+        </form>
+        <div id="add-client-status" class="muted"></div>
+      </section>
+
+      <section id="clients-section">
+        <h2>Clients <span class="muted" id="clients-count"></span></h2>
+        <div class="table-wrap">
+          <table id="clients-table">
+            <thead>
+              <tr>
+                <th>Name</th><th>API key</th><th>Margin</th><th>Status</th><th>Added</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </section>
     </div>
   </main>

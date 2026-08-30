@@ -12,6 +12,7 @@ pydantic-settings==2.14.2
 python-dotenv==1.2.2
 SQLAlchemy==2.0.51
 psycopg2-binary==2.9.12
+cryptography==48.0.1   # encrypts client Alpaca credentials at rest, see execution/client_crypto.py
 
 # --- modeling ---
 lightgbm==4.7.0

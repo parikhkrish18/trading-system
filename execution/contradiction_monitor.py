@@ -44,6 +44,7 @@ from data.ingest.universe import load_active_universe
 from execution import hold_rules
 from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.broker import get_broker
+from execution.client_fanout import replicate_to_clients
 from execution.exit_levels import ExitLevels
 from execution.trading_loop import (
     _allocation_confirmation,
@@ -426,6 +427,7 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
     prices = _latest_prices(engine, [c.symbol for c in candidates])
 
     reopened: list[str] = []
+    reopened_target_pct: dict[str, float] = {}
     for c in candidates:
         price = prices.get(c.symbol)
         if not price:
@@ -445,6 +447,16 @@ def _attempt_reactivation(broker, engine, request_fn=None) -> None:
         executed = broker.get_positions().get(c.symbol, 0.0)
         _log_reactivation(c, executed, broker.mode, target_shares, approval_status=status_by_symbol.get(c.symbol) or "approved")
         reopened.append(f"{c.symbol} {target_shares:+,.2f} sh")
+        reopened_target_pct[c.symbol] = c.target_position_pct or 0.0
+
+    if reopened_target_pct:
+        # Same reactivation onto every client's own account, sized to
+        # their own capital (execution/client_fanout.py) — never allowed
+        # to affect the master account's own outcome above.
+        try:
+            replicate_to_clients(reopened_target_pct, prices, engine)
+        except Exception:
+            logger.exception("Client fan-out failed for this reactivation — the master account's own trades above are unaffected.")
 
     if reopened:
         message = f"♻️ Freed capital redeployed: {', '.join(reopened)}"
@@ -558,6 +570,14 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         executed = broker.get_positions().get(result.symbol, 0.0)
         _log_closure(result, broker.mode, executed, approval_status=status or "approved")
         closed.append(result.symbol)
+
+        # Every client holding this symbol exits it too, on their own
+        # account (execution/client_fanout.py) — never allowed to affect
+        # the master account's own close above, which already happened.
+        try:
+            replicate_to_clients({result.symbol: 0.0}, {}, engine)
+        except Exception:
+            logger.exception("Client fan-out failed closing %s — the master account's own close above is unaffected.", result.symbol)
 
     parts = []
     if closed:
