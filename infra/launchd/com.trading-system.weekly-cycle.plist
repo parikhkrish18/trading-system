@@ -24,19 +24,31 @@
     <string>/Users/kp/Downloads/trading-system/logs/weekly-cycle.error.log</string>
 
     <!--
-      Monday 19:30 IST. US market open (9:30am ET) sits at 19:00-20:00 IST
-      depending on US daylight saving (IST itself has no DST) — this is a
-      fixed midpoint, off by up to ~30min either side of open across the
-      year. Fine for a weekly/biweekly, non-intraday rebalance; nudge Hour
-      by +/-1 around US DST transitions (second Sunday in March / first
-      Sunday in November) if you want it tighter to the open.
+      Sunday 11:30 IST -- the day BEFORE the Monday US market open this
+      cycle trades at (9:30am ET), not a time-of-day near the open itself.
+      The pipeline this launches (universe refresh, price/fundamentals/news
+      ingestion -- fundamentals+news alone run "roughly two hours" on
+      Polygon's free tier, per scripts/run_weekly_cycle.py's own docstring
+      -- sentiment scoring, feature build, then the actual screen-and-trade
+      cycle) is genuinely multi-hour, so starting it a few hours before
+      Monday's open risks the queued DAY orders (see
+      execution/broker_alpaca.py) landing after 9:30am ET instead of at it.
+      Saturday and Sunday have no new trading data either way -- Friday's
+      close is the freshest bar available no matter which of those two days
+      this runs on -- so running Sunday costs nothing in data freshness and
+      buys roughly a day of slack for a slow vendor or a retry. IST has no
+      DST of its own, but this is still off by up to ~1hr in IST-clock-time
+      terms across US DST transitions (second Sunday in March / first
+      Sunday in November) since it's pinned to IST, not to a fixed offset
+      from the US market's own clock -- irrelevant here given the day of
+      slack, unlike the old near-the-open timing this replaced.
     -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Weekday</key>
-        <integer>1</integer>
+        <integer>0</integer>
         <key>Hour</key>
-        <integer>19</integer>
+        <integer>11</integer>
         <key>Minute</key>
         <integer>30</integer>
     </dict>

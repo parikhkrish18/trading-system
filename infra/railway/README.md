@@ -9,15 +9,51 @@ byte-for-byte the process the dashboard reports on.
 | Service | Start command | Schedule | Restart policy |
 |---|---|---|---|
 | `dashboard` | *(leave blank — the image's own `CMD`)* | none, always on | On failure |
-| `weekly-cycle` | `python -m scripts.run_weekly_cycle --feature-set-id v4` | `0 22 * * 1` | Never |
+| `weekly-cycle` | `python -m scripts.run_weekly_cycle --feature-set-id v4` | `0 6 * * 0` | Never |
 | `contradiction-monitor` | `python -m execution.contradiction_monitor` | `0 14-20 * * 1-5` | Never |
 
-Cron times are **UTC** — Railway has no timezone setting. `0 22 * * 1` is
-Monday 18:00 US/Eastern in summer and 17:00 in winter; both are after the
-16:00 close, which is what matters. The monitor window covers roughly the
-market session (13:30–20:00 UTC in summer). Daylight saving shifts the
-local time by an hour twice a year and nothing else — do not "fix" it by
-editing the cron unless the run drifts across the close.
+Cron times are **UTC** — Railway has no timezone setting.
+
+`weekly-cycle`'s `0 6 * * 0` is Sunday 06:00 UTC — deliberately the day
+*before* the day it trades, not Monday itself. The point is to have
+orders queued (as DAY market orders, see execution/broker_alpaca.py) well
+before Monday's 9:30am US/Eastern open, and the full pipeline (universe
+refresh, price/fundamentals/news ingestion — fundamentals+news alone run
+"roughly two hours" on Polygon's free tier per scripts/run_weekly_cycle.py
+— sentiment scoring, feature build, then the actual screen-and-trade
+cycle) is genuinely multi-hour, not a quick script. Starting it Sunday
+morning instead of a few hours before Monday's open isn't about extra
+safety margin for its own sake: Saturday and Sunday have no new trading
+data either way (Friday's close is still the freshest bar available no
+matter which of those two days the cycle runs on), so there is no
+freshness cost to running earlier, only upside — a multi-hour runtime, a
+slow vendor, or a retry can eat into a tight pre-open window in a way that
+either misses the open (order submitted after 9:30am ET becomes a regular
+market order at whatever price it fills at, not what was intended) or, at
+the extreme, threatens to bleed into Monday's regular trading-hours
+window this same schedule is trying to trade *at* the start of. Sunday
+06:00 UTC leaves about a day of slack either way, and — since
+`APPROVAL_MODE` defaults to `auto` and neither `weekly-cycle` nor
+`contradiction-monitor` override it (see "What hosting does not change"
+below) — the whole thing runs unattended; no one needs to be awake to
+approve anything, in any timezone.
+
+`0 14-20 * * 1-5` (contradiction-monitor) fires hourly, on the hour, at
+UTC 14:00 through 20:00. Neither cron expression moves for daylight saving
+— that's expected for `weekly-cycle` given how much slack it has either
+side, but it does shift `contradiction-monitor`'s actual coverage of the
+US/Eastern session (9:30am–4:00pm) twice a year:
+
+- **Summer (EDT, UTC-4):** firings land at 10am–4pm ET — misses the first
+  30 minutes after the open, catches the close.
+- **Winter (EST, UTC-5):** firings land at 9am–3pm ET — covers the open
+  (and the 30 minutes before it), but misses the last hour before the
+  close.
+
+That's a pre-existing gap in contradiction-monitor's own schedule, not
+something this change touches — worth knowing about if a position that
+should have been closed late in a winter trading day wasn't caught until
+the next hourly check.
 
 The scheduled services must have their restart policy set to **Never**. A
 cron job is supposed to exit; "On failure" would restart the weekly cycle
