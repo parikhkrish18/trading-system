@@ -26,6 +26,17 @@ from data.validators.checks import run_all_validators
 def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
     import yfinance as yf
 
+    # yfinance's default tz cache lives at ~/.cache/py-yfinance and is
+    # initialized lazily, per-thread, the first time it's touched — with
+    # yf.download()'s internal multi-ticker threading, two threads can race
+    # to create that directory at once. yfinance already catches this itself
+    # (logs "TzCache will not be used" and carries on, cache just disabled —
+    # it never fails the actual price fetch), so this was cosmetic noise,
+    # not a real failure. Pointing it at a container-local /tmp path instead
+    # of the shared/root cache sidesteps the race entirely rather than just
+    # tolerating the warning.
+    yf.set_tz_cache_location("/tmp/py-yfinance-cache")
+
     # yfinance expects dual-class tickers with a dash (BRK-B), but our
     # canonical symbol everywhere else — Wikipedia's universe scrape,
     # Polygon, Alpaca — uses a dot (BRK.B), matching the SEC's own
