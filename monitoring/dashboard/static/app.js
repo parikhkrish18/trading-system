@@ -852,6 +852,13 @@ function switchTab(name) {
   if (name === "clients") {
     loadClients();
   }
+  // Same "always fresh on switch" reasoning as News: coming back to
+  // Overview from another tab shouldn't show whatever price was on screen
+  // up to 10s ago (the loadPositions() timer's own interval) -- show
+  // current data the moment someone's actually looking at it.
+  if (name === "overview") {
+    loadPositions();
+  }
 }
 
 document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -890,20 +897,34 @@ document.getElementById("news-symbol-filter").addEventListener("keydown", (e) =>
 // point of a liveness indicator. Same reasoning now covers the news list
 // itself: if someone leaves the News tab open to watch headlines arrive,
 // it should actually update on its own rather than freezing at whatever
-// was on screen when they switched to it. Positions and portfolio value are
-// the same story -- those used to only refresh on page load or a manual
-// Refresh click, so a tab left open showed stale market value and P&L
-// indefinitely even while the market was moving. Gated to the Overview tab
-// like News is gated to itself, so a background tab (e.g. Clients) isn't
-// silently polling data nobody's looking at.
+// was on screen when they switched to it. loadEquity() (the equity curve /
+// drawdown chart) is a much slower-moving, once-per-cycle-ish series, so it
+// rides this same 60s tick rather than needing its own.
 setInterval(() => {
   loadNewsStatus();
   loadMarketStatus();
   if (activeTab === "news") loadLiveNews(currentNewsFilter());
-  if (activeTab === "overview") {
-    loadPositions();
-    loadEquity();
-  }
+  if (activeTab === "overview") loadEquity();
 }, 60_000);
+
+// Current price and unrealized P/L (loadPositions()) get their own, much
+// tighter timer -- these are the numbers someone is actually watching move
+// while a position is open, and 60s reads as "stuck" for that. Alpaca's
+// quote/position data itself only updates on trades, not sub-second, so
+// polling faster than this buys nothing; 10s is comfortably fast enough to
+// read as live without hammering the API. Gated the same two ways as the
+// slower timer -- only the Overview tab (nothing else shows a price) and
+// only while the tab is actually visible, via the Page Visibility API, so a
+// dashboard left open in a background tab isn't burning API calls (and
+// Alpaca rate limit) on numbers nobody's looking at. Also fires once
+// immediately on returning to the tab, so switching back doesn't sit on a
+// stale number for up to 10s before the next tick.
+setInterval(() => {
+  if (activeTab === "overview" && document.visibilityState === "visible") loadPositions();
+}, 10_000);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && activeTab === "overview") loadPositions();
+});
 
 loadAll();
