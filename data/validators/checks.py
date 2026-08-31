@@ -69,6 +69,38 @@ def check_staleness(df: pd.DataFrame, symbol_col: str = "symbol", ts_col: str = 
     return issues
 
 
+def check_nonpositive_prices(df: pd.DataFrame, price_cols: tuple[str, ...] = ("open", "high", "low", "close")) -> list[str]:
+    """
+    Flag any bar with a zero, negative, or missing OHLC value.
+
+    A stock's price is a physical impossibility below zero, but nothing
+    upstream of this enforced that — a bad vendor row (a decimal-shift glitch,
+    a placeholder 0.0, a corporate-action mixup) could reach `close` unchecked
+    and, through rolling_return()'s simple pct_change, an already-impossible
+    close (say 0 or negative against a positive prior close) shows up
+    downstream as a return below -100% -- e.g. a reported "-118.7% in 5
+    days," which cannot happen to a real security no matter how bad the week
+    was. Existing checks here (duplicates/gaps/staleness/nulls) never caught
+    this because none of them look at the price values themselves. Symbols
+    are returned present-in-the-issue so the caller can identify and drop
+    just the bad rows rather than the whole batch.
+    """
+    issues = []
+    cols = [c for c in price_cols if c in df.columns]
+    if not cols:
+        return issues
+    bad_mask = (df[cols] <= 0).any(axis=1) | df[cols].isna().any(axis=1)
+    if bad_mask.any():
+        bad = df.loc[bad_mask]
+        symbol_col = "symbol" if "symbol" in df.columns else None
+        ts_col = "ts" if "ts" in df.columns else None
+        for _, row in bad.iterrows():
+            where = f"{row[symbol_col]} on {row[ts_col]}" if symbol_col and ts_col else "a row"
+            values = {c: row[c] for c in cols}
+            issues.append(f"non-positive or missing price: {where} — {values}")
+    return issues
+
+
 def check_nulls(df: pd.DataFrame, required_cols: list[str]) -> list[str]:
     issues = []
     for col in required_cols:
@@ -91,6 +123,7 @@ def run_all_validators(
     """Run the full validator suite and return a flat list of human-readable issues."""
     issues: list[str] = []
     issues += check_duplicates(df, key_cols)
+    issues += check_nonpositive_prices(df)
     if expect_daily:
         issues += check_gaps(df, expect_daily=True)
         issues += check_staleness(df, max_age_days=max_age_days)

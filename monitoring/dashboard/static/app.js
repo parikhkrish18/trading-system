@@ -890,11 +890,20 @@ document.getElementById("news-symbol-filter").addEventListener("keydown", (e) =>
 // point of a liveness indicator. Same reasoning now covers the news list
 // itself: if someone leaves the News tab open to watch headlines arrive,
 // it should actually update on its own rather than freezing at whatever
-// was on screen when they switched to it.
+// was on screen when they switched to it. Positions and portfolio value are
+// the same story -- those used to only refresh on page load or a manual
+// Refresh click, so a tab left open showed stale market value and P&L
+// indefinitely even while the market was moving. Gated to the Overview tab
+// like News is gated to itself, so a background tab (e.g. Clients) isn't
+// silently polling data nobody's looking at.
 setInterval(() => {
   loadNewsStatus();
   loadMarketStatus();
   if (activeTab === "news") loadLiveNews(currentNewsFilter());
+  if (activeTab === "overview") {
+    loadPositions();
+    loadEquity();
+  }
 }, 60_000);
 
 loadAll();

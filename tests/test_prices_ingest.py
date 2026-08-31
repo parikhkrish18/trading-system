@@ -1,6 +1,7 @@
 import pandas as pd
 
-from data.ingest.prices import _fetch_yfinance
+from data.ingest import prices
+from data.ingest.prices import _fetch_yfinance, ingest_prices
 
 
 def _fake_multi_symbol_frame():
@@ -104,3 +105,40 @@ def test_fetch_yfinance_single_symbol_with_multiindex_columns(monkeypatch):
 
     assert set(df["symbol"]) == {"SPY"}
     assert len(df) == 3
+
+
+def test_ingest_prices_drops_nonpositive_price_rows_before_writing(monkeypatch):
+    """
+    Regression test for the "-118.7% in 5 days" bug: a vendor row with a
+    zero/negative close previously reached `prices` unfiltered (only NaN was
+    dropped, in _fetch_yfinance) and, via rolling_return()'s pct_change(),
+    turned into a physically-impossible return once mom_ret_5d picked it up.
+    """
+    df = pd.DataFrame(
+        {
+            "symbol": ["SPY", "BADCO", "BADCO"],
+            "ts": pd.to_datetime(["2026-01-02", "2026-01-02", "2026-01-03"], utc=True),
+            "open": [500.0, 10.0, 11.0], "high": [505.0, 10.0, 11.0],
+            "low": [495.0, 10.0, 11.0], "close": [502.0, 0.0, 11.0],
+            "volume": [1000, 100, 100], "source": ["yfinance"] * 3,
+        }
+    )
+    monkeypatch.setattr(prices, "_fetch_yfinance", lambda *a, **k: df)
+
+    captured = {}
+
+    def fake_upsert(written_df, table, conflict_cols):
+        captured["df"] = written_df
+        return len(written_df)
+
+    monkeypatch.setattr(prices, "upsert_dataframe", fake_upsert)
+
+    alerted = []
+    monkeypatch.setattr(prices, "alert_pipeline_failure", lambda job, detail: alerted.append((job, detail)))
+
+    n = ingest_prices(["SPY", "BADCO"], pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-05").date())
+
+    assert n == 2  # SPY row + BADCO's valid second row; the zero-close row dropped
+    assert (captured["df"]["close"] <= 0).sum() == 0
+    assert len(alerted) == 1
+    assert alerted[0][0] == "price_ingest"

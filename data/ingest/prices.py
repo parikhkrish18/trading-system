@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
 from data.ingest.universe import resolve_symbols
-from data.validators.checks import run_all_validators
+from data.validators.checks import check_nonpositive_prices, run_all_validators
+from monitoring.alerts import alert_pipeline_failure
 
 
 def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
@@ -35,7 +38,7 @@ def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.Data
     # not a real failure. Pointing it at a container-local /tmp path instead
     # of the shared/root cache sidesteps the race entirely rather than just
     # tolerating the warning.
-    yf.set_tz_cache_location("/tmp/py-yfinance-cache")
+    yf.set_tz_cache_location(str(Path(tempfile.gettempdir()) / "py-yfinance-cache"))
 
     # yfinance expects dual-class tickers with a dash (BRK-B), but our
     # canonical symbol everywhere else — Wikipedia's universe scrape,
@@ -111,6 +114,25 @@ def ingest_prices(symbols: list[str], start: dt.date, end: dt.date, source: str 
         return 0
 
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
+
+    # Checked and dropped *before* the write, not just reported after: a
+    # non-positive/missing price is a physical impossibility (see
+    # check_nonpositive_prices' docstring for why this matters -- it's what
+    # turns into e.g. an "impossible" -118.7% 5-day return once it reaches
+    # rolling_return()), so a bad row here must never reach `prices` at all,
+    # let alone the features/reasoning built on top of it.
+    price_issues = check_nonpositive_prices(df)
+    if price_issues:
+        price_cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
+        bad_mask = (df[price_cols] <= 0).any(axis=1) | df[price_cols].isna().any(axis=1)
+        detail = f"{int(bad_mask.sum())} row(s) with a non-positive or missing price, dropped before write: " + "; ".join(price_issues)
+        print(f"[validator] {detail}")
+        alert_pipeline_failure("price_ingest", detail)
+        df = df.loc[~bad_mask].reset_index(drop=True)
+        if df.empty:
+            print("Every fetched row failed the price sanity check — nothing written.")
+            return 0
+
     n = upsert_dataframe(df, table="prices", conflict_cols=["symbol", "ts"])
 
     issues = run_all_validators(df, key_cols=["symbol", "ts"], expect_daily=True)
