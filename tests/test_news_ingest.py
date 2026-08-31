@@ -61,6 +61,32 @@ def test_fetch_news_shapes_polygon_response(monkeypatch):
     assert pd.api.types.is_datetime64_any_dtype(df["ts"])
 
 
+def test_fetch_news_decodes_html_entities_in_the_title(monkeypatch):
+    """Polygon (like Benzinga via the news stream) sometimes hands back
+    title text with literal HTML entities in it -- an apostrophe as "&#39;"
+    rather than an actual apostrophe -- which must be decoded at ingest."""
+
+    def fake_get(url, params=None, timeout=None):
+        return _FakeResponse(
+            {
+                "results": [
+                    {
+                        "id": "article-entities-1",
+                        "published_utc": "2026-08-30T12:00:00Z",
+                        "title": "Designates ChatGPT As &#39;Very Large Online Search Engine&#39;",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(news, "polygon_get", fake_get)
+    monkeypatch.setattr(news.settings, "polygon_api_key", "test-key")
+
+    df = news.fetch_news(["SPY"], since_hours=24)
+
+    assert df.iloc[0]["headline"] == "Designates ChatGPT As 'Very Large Online Search Engine'"
+
+
 def test_fetch_news_same_article_shared_across_symbols_produces_two_rows(monkeypatch):
     """Regression test: a story tagged to two tickers must not collide on (id, ts)."""
 

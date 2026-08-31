@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import logging
 import time
 from typing import Any
@@ -96,7 +97,12 @@ def article_to_rows(article: Any) -> list[dict]:
     symbols = _get("symbols") or []
     article_id = _get("id")
     created_at = _get("created_at")
-    headline = _get("headline") or ""
+    # Benzinga's content (delivered via this stream) sometimes comes through
+    # with literal HTML entities in the headline text -- e.g. an apostrophe
+    # as "&#39;" rather than "'" -- left over from wherever Benzinga last
+    # rendered it as HTML. Decode once here, at ingest, rather than leaving
+    # every reader (the dashboard, sentiment scoring) to notice and handle it.
+    headline = html.unescape(_get("headline") or "")
     if not symbols or article_id is None or created_at is None:
         return []
 

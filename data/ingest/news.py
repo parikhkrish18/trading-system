@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import html
 import logging
 import time
 
@@ -99,7 +100,13 @@ def fetch_news(symbols: list[str], since_hours: int, sleep_seconds: float = DEFA
                 "id": _stable_id(article["id"], symbol),
                 "symbol": symbol,
                 "ts": article["published_utc"],
-                "headline": article.get("title", ""),
+                # Polygon (like Benzinga via Alpaca's stream, see
+                # news_stream.py's article_to_rows) sometimes hands back
+                # title text with literal HTML entities in it (an
+                # apostrophe as "&#39;", not "'") -- decode here, once, at
+                # ingest, so nothing downstream (the dashboard, sentiment
+                # scoring reading the headline text) has to know that.
+                "headline": html.unescape(article.get("title") or ""),
                 "source": "polygon",
             }
             for article in resp.json().get("results", [])

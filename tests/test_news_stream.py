@@ -62,6 +62,15 @@ class TestArticleToRows:
         assert all(pd.isna(r["sentiment"]) and pd.isna(r["surprise"]) for r in rows)
         assert all(r["headline"] == "Some Company beats on earnings" for r in rows)
 
+    def test_html_entities_in_the_headline_are_decoded(self):
+        """Benzinga's content sometimes comes through with literal HTML
+        entities in the headline -- an apostrophe as "&#39;" rather than an
+        actual apostrophe -- left over from wherever Benzinga last rendered
+        it as HTML. This must be decoded at ingest, not left for every
+        reader (the dashboard) to handle."""
+        rows = article_to_rows(_article(headline="EU Designates ChatGPT As &#39;Very Large Online Search Engine&#39;"))
+        assert rows[0]["headline"] == "EU Designates ChatGPT As 'Very Large Online Search Engine'"
+
     def test_dict_style_article_is_also_accepted(self):
         """alpaca-py's stream can deliver raw_data=True dicts instead of News objects."""
         article = {
