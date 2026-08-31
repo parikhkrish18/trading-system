@@ -9,34 +9,45 @@ byte-for-byte the process the dashboard reports on.
 | Service | Start command | Schedule | Restart policy |
 |---|---|---|---|
 | `dashboard` | *(leave blank — the image's own `CMD`)* | none, always on | On failure |
-| `weekly-cycle` | `python -m scripts.run_weekly_cycle --feature-set-id v4` | `0 6 * * 0` | Never |
+| `weekly-cycle` | `python -m scripts.run_weekly_cycle --feature-set-id v4` | `0 8 * * 1` | Never |
 | `contradiction-monitor` | `python -m execution.contradiction_monitor` | `0 14-20 * * 1-5` | Never |
 
 Cron times are **UTC** — Railway has no timezone setting.
 
-`weekly-cycle`'s `0 6 * * 0` is Sunday 06:00 UTC — deliberately the day
-*before* the day it trades, not Monday itself. The point is to have
-orders queued (as DAY market orders, see execution/broker_alpaca.py) well
-before Monday's 9:30am US/Eastern open, and the full pipeline (universe
-refresh, price/fundamentals/news ingestion — fundamentals+news alone run
-"roughly two hours" on Polygon's free tier per scripts/run_weekly_cycle.py
-— sentiment scoring, feature build, then the actual screen-and-trade
-cycle) is genuinely multi-hour, not a quick script. Starting it Sunday
-morning instead of a few hours before Monday's open isn't about extra
-safety margin for its own sake: Saturday and Sunday have no new trading
-data either way (Friday's close is still the freshest bar available no
-matter which of those two days the cycle runs on), so there is no
-freshness cost to running earlier, only upside — a multi-hour runtime, a
-slow vendor, or a retry can eat into a tight pre-open window in a way that
-either misses the open (order submitted after 9:30am ET becomes a regular
-market order at whatever price it fills at, not what was intended) or, at
-the extreme, threatens to bleed into Monday's regular trading-hours
-window this same schedule is trying to trade *at* the start of. Sunday
-06:00 UTC leaves about a day of slack either way, and — since
-`APPROVAL_MODE` defaults to `auto` and neither `weekly-cycle` nor
-`contradiction-monitor` override it (see "What hosting does not change"
-below) — the whole thing runs unattended; no one needs to be awake to
-approve anything, in any timezone.
+`weekly-cycle`'s `0 8 * * 1` is Monday 08:00 UTC — 4:00am US/Eastern in
+summer, 3:00am in winter — chosen over running the day before (Sunday) as
+a deliberate tradeoff: Monday morning picks up whatever news broke
+overnight/premarket that a Sunday run would have missed, at the cost of a
+tighter (though still real) buffer before the 9:30am open. The full
+pipeline (universe refresh, price/fundamentals/news ingestion —
+fundamentals+news alone run "roughly two hours" on Polygon's free tier
+per scripts/run_weekly_cycle.py's own docstring — sentiment scoring,
+feature build, then the actual screen-and-trade cycle) is genuinely
+multi-hour, so 08:00 UTC leaves 5.5–6.5 hours depending on the season —
+comfortable for the typical run, not the ~day of slack a Sunday start
+would have had. If it ever does run long enough to still be going at
+9:30am ET, nothing is lost or silently skipped: submit_target_position()
+(execution/broker_alpaca.py) checks the market clock at submit time, not
+once at the start of the cycle, so an order that would have queued as a
+premarket DAY order instead goes out as a regular live market order the
+moment the pipeline reaches it — later in Monday's session rather than
+right at the open, but still Monday, still automatic. Since `APPROVAL_MODE`
+defaults to `auto` and neither `weekly-cycle` nor `contradiction-monitor`
+override it (see "What hosting does not change" below), none of this
+waits on a human reply — no one needs to be awake to approve anything, in
+any timezone, regardless of how long a given week's run takes.
+
+To run a cycle immediately rather than waiting for the next Monday
+trigger — e.g. to catch up after a schedule change made once Monday's
+08:00 UTC tick has already passed for that week — use the "Deploy" action
+on the `weekly-cycle` service in the Railway dashboard (three-dot menu on
+the service, or its Deployments tab). That's the supported way to fire a
+cron-configured Railway service on demand; the public API's `redeploy`
+only rebuilds/re-registers the service's current deployment; it does not
+itself invoke the start command outside of an actual cron tick (confirmed
+empirically — a `redeploy` call and a temporary near-term one-off cron
+value both produced no process output, where a real invocation logs
+immediately on start).
 
 `0 14-20 * * 1-5` (contradiction-monitor) fires hourly, on the hour, at
 UTC 14:00 through 20:00. Neither cron expression moves for daylight saving

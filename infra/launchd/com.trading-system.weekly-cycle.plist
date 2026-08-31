@@ -24,31 +24,34 @@
     <string>/Users/kp/Downloads/trading-system/logs/weekly-cycle.error.log</string>
 
     <!--
-      Sunday 11:30 IST -- the day BEFORE the Monday US market open this
-      cycle trades at (9:30am ET), not a time-of-day near the open itself.
-      The pipeline this launches (universe refresh, price/fundamentals/news
-      ingestion -- fundamentals+news alone run "roughly two hours" on
-      Polygon's free tier, per scripts/run_weekly_cycle.py's own docstring
-      -- sentiment scoring, feature build, then the actual screen-and-trade
-      cycle) is genuinely multi-hour, so starting it a few hours before
-      Monday's open risks the queued DAY orders (see
-      execution/broker_alpaca.py) landing after 9:30am ET instead of at it.
-      Saturday and Sunday have no new trading data either way -- Friday's
-      close is the freshest bar available no matter which of those two days
-      this runs on -- so running Sunday costs nothing in data freshness and
-      buys roughly a day of slack for a slow vendor or a retry. IST has no
-      DST of its own, but this is still off by up to ~1hr in IST-clock-time
-      terms across US DST transitions (second Sunday in March / first
-      Sunday in November) since it's pinned to IST, not to a fixed offset
-      from the US market's own clock -- irrelevant here given the day of
-      slack, unlike the old near-the-open timing this replaced.
+      Monday 13:30 IST = 08:00 UTC = 4:00am ET (summer) / 3:00am ET
+      (winter). Same-day-as-open, not the day before: this trades off some
+      of the safety margin a Sunday run would have for the ability to pick
+      up news that broke overnight/premarket Monday. The pipeline this
+      launches (universe refresh, price/fundamentals/news ingestion --
+      fundamentals+news alone run "roughly two hours" on Polygon's free
+      tier, per scripts/run_weekly_cycle.py's own docstring -- sentiment
+      scoring, feature build, then the actual screen-and-trade cycle) is
+      genuinely multi-hour, so this leaves 5.5-6.5 hours before the
+      9:30am ET open depending on the season -- comfortable for a normal
+      run, not the ~day of slack an earlier Sunday schedule would have.
+      If it's still running at 9:30am ET, nothing is lost: broker order
+      submission checks the market clock per-order, not once at the start,
+      so a slow cycle just places its remaining orders as regular live
+      market orders during the session instead of premarket DAY orders --
+      later than the open, but still that Monday, still automatic (no
+      human approval needed either way -- see APPROVAL_MODE in
+      config/settings.py). IST has no DST of its own, so this drifts by
+      up to ~1hr of IST clock time across US DST transitions (second
+      Sunday in March / first Sunday in November); that's expected, not a
+      bug -- the buffer above absorbs it.
     -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Weekday</key>
-        <integer>0</integer>
+        <integer>1</integer>
         <key>Hour</key>
-        <integer>11</integer>
+        <integer>13</integer>
         <key>Minute</key>
         <integer>30</integer>
     </dict>
