@@ -778,11 +778,36 @@ class _NewClientRequest(BaseModel):
     alpaca_api_key: str
     alpaca_api_secret: str
     margin_enabled: bool = False
+    leverage_multiplier: int = 1
     password: str
 
 
 class _ResetPasswordRequest(BaseModel):
     new_password: str
+
+
+class _LeverageRequest(BaseModel):
+    leverage_multiplier: int
+
+
+# Hard backstop against a fat-fingered input (e.g. "20" meant as "2.0x")
+# wiping out a client's account. Deliberately not settings-driven -- see
+# data/schema/012_client_leverage.sql's comment on this same number for why
+# raising it is meant to be a deliberate two-place code change (this
+# constant AND that migration's CHECK constraint), not an env var someone
+# bumps by accident. The DB constraint is the real backstop; this just gives
+# a clean 400 with a helpful message instead of a raw constraint-violation
+# error surfacing to the operator.
+_MAX_CLIENT_LEVERAGE = 3
+
+
+def _validate_leverage(leverage_multiplier: int, margin_enabled: bool) -> str | None:
+    """Returns an error message if invalid, else None. Shared by create and update so the two paths can't drift."""
+    if not (1 <= leverage_multiplier <= _MAX_CLIENT_LEVERAGE):
+        return f"leverage_multiplier must be between 1 and {_MAX_CLIENT_LEVERAGE}."
+    if leverage_multiplier > 1 and not margin_enabled:
+        return "leverage_multiplier above 1x requires a margin-enabled account."
+    return None
 
 
 def _mask_key(api_key: str) -> str:
@@ -811,6 +836,10 @@ def create_client(body: _NewClientRequest) -> dict:
     if not body.name.strip() or not body.password:
         return JSONResponse({"detail": "Name and password are required."}, status_code=400)
 
+    leverage_error = _validate_leverage(body.leverage_multiplier, body.margin_enabled)
+    if leverage_error:
+        return JSONResponse({"detail": leverage_error}, status_code=400)
+
     try:
         verify_broker = AlpacaBroker(
             mode="live", confirm_live=True, api_key=body.alpaca_api_key, secret_key=body.alpaca_api_secret
@@ -823,13 +852,15 @@ def create_client(body: _NewClientRequest) -> dict:
     try:
         with engine.begin() as conn:
             result = conn.exec_driver_sql(
-                "INSERT INTO clients (name, alpaca_api_key_encrypted, alpaca_api_secret_encrypted, margin_enabled, password_hash) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                "INSERT INTO clients "
+                "(name, alpaca_api_key_encrypted, alpaca_api_secret_encrypted, margin_enabled, leverage_multiplier, password_hash) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
                 (
                     body.name.strip(),
                     encrypt_credential(body.alpaca_api_key),
                     encrypt_credential(body.alpaca_api_secret),
                     body.margin_enabled,
+                    body.leverage_multiplier,
                     hash_password(body.password),
                 ),
             )
@@ -851,7 +882,7 @@ def create_client(body: _NewClientRequest) -> dict:
 
     return {
         "id": client_id, "name": body.name.strip(), "margin_enabled": body.margin_enabled,
-        "active": True, "buy_in": buy_in_note,
+        "leverage_multiplier": body.leverage_multiplier, "active": True, "buy_in": buy_in_note,
     }
 
 
@@ -859,7 +890,9 @@ def create_client(body: _NewClientRequest) -> dict:
 def list_clients() -> list[dict]:
     engine = get_engine()
     df = pd.read_sql(
-        "SELECT id, name, alpaca_api_key_encrypted, margin_enabled, active, created_at FROM clients ORDER BY created_at DESC",
+        "SELECT id, name, alpaca_api_key_encrypted, margin_enabled, leverage_multiplier, active, created_at, "
+        "trading_paused, pause_reason "
+        "FROM clients ORDER BY created_at DESC",
         engine,
     )
     clients = []
@@ -874,11 +907,50 @@ def list_clients() -> list[dict]:
                 "name": row["name"],
                 "api_key_preview": key_preview,
                 "margin_enabled": bool(row["margin_enabled"]),
+                "leverage_multiplier": int(row["leverage_multiplier"]),
                 "active": bool(row["active"]),
+                # Client self-service pause (their own "Liquidate now" button,
+                # or an auto-triggered max_drawdown/profit_target — see
+                # execution/client_risk_controls.py) — surfaced here so the
+                # operator can see a client paused themselves out without
+                # having to check the portal or client_orders directly.
+                "trading_paused": bool(row["trading_paused"]),
+                "pause_reason": row["pause_reason"],
                 "created_at": row["created_at"].isoformat() if pd.notna(row["created_at"]) else None,
             }
         )
     return clients
+
+
+@app.post("/api/clients/{client_id}/leverage")
+def set_client_leverage(client_id: int, body: _LeverageRequest) -> dict:
+    """
+    Operator-only leverage control — the client-facing portal has no
+    equivalent endpoint, deliberately (see client_fanout.py's module
+    docstring). Looks up the client's current margin_enabled to validate
+    against, rather than trusting the caller, since a stale/wrong
+    margin_enabled in the request body would otherwise let leverage > 1x
+    through validation for an account that can't actually support it — the
+    DB CHECK constraint (data/schema/012_client_leverage.sql) would still
+    catch that at the UPDATE itself, but a fresh lookup gives the operator a
+    clean, specific 400 instead of a raw constraint-violation error.
+    """
+    engine = get_engine()
+    existing = pd.read_sql(
+        text("SELECT margin_enabled FROM clients WHERE id = :id"), engine, params={"id": client_id}
+    )
+    if existing.empty:
+        return JSONResponse({"detail": "No such client."}, status_code=404)
+
+    leverage_error = _validate_leverage(body.leverage_multiplier, bool(existing["margin_enabled"].iloc[0]))
+    if leverage_error:
+        return JSONResponse({"detail": leverage_error}, status_code=400)
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE clients SET leverage_multiplier = %s WHERE id = %s", (body.leverage_multiplier, client_id)
+        )
+    return {"id": client_id, "leverage_multiplier": body.leverage_multiplier}
 
 
 @app.post("/api/clients/{client_id}/deactivate")
@@ -1062,6 +1134,19 @@ _CLIENT_PORTAL_PAGE = """<!doctype html>
   .long { color: #3ecf8e; } .short { color: #e5484d; }
   .status-submitted { color: #3ecf8e; } .status-failed { color: #e5484d; }
   .status-skipped_no_margin, .status-no_price, .status-no_change { color: #9aa4b8; }
+  button.btn {
+    padding: 8px 14px; border-radius: 6px; border: 1px solid #5b8cff;
+    background: #5b8cff; color: white; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  button.btn.danger { border-color: #e5484d; background: #e5484d; }
+  button.btn.secondary { background: transparent; color: #9aa4b8; border-color: #262c3b; }
+  .risk-form-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-top: 10px; }
+  .risk-form-row label { display: flex; flex-direction: column; font-size: 11px; color: #9aa4b8; gap: 4px; }
+  .risk-form-row input {
+    padding: 7px 10px; border-radius: 6px; border: 1px solid #262c3b; background: #131722;
+    color: #e6e9f0; font-size: 13px; width: 100px; box-sizing: border-box;
+  }
+  .risk-note { color: #9aa4b8; font-size: 12px; margin: 8px 0; }
 </style>
 </head>
 <body>
@@ -1091,6 +1176,27 @@ _CLIENT_PORTAL_PAGE = """<!doctype html>
           <tbody></tbody>
         </table>
       </div>
+    </section>
+    <section>
+      <h2>Risk Controls</h2>
+      <div id="risk-status" class="empty-state">Loading…</div>
+      <div class="risk-form-row">
+        <button id="liquidate-btn" class="btn danger">Liquidate now</button>
+        <button id="resume-btn" class="btn secondary" hidden>Resume trading</button>
+      </div>
+      <div id="liquidate-confirm" hidden>
+        <p class="risk-note">This closes every open position on your account right now and pauses trading until you resume. Are you sure?</p>
+        <button id="liquidate-yes" class="btn danger">Yes, liquidate everything</button>
+        <button id="liquidate-no" class="btn secondary">Cancel</button>
+      </div>
+      <p class="risk-note">Optional: automatically liquidate and pause if your account drops from its peak, or automatically secure gains and pause for the rest of the window once you hit a profit target. Leave a field blank to turn it off.</p>
+      <form id="risk-settings-form" class="risk-form-row">
+        <label>Max drawdown %<input id="risk-max-drawdown" type="number" min="1" max="50" step="0.5" placeholder="off" /></label>
+        <label>Profit target %<input id="risk-profit-target" type="number" min="1" max="100" step="0.5" placeholder="off" /></label>
+        <label>Window (days)<input id="risk-profit-window" type="number" min="1" max="365" step="1" placeholder="days" /></label>
+        <button type="submit" class="btn">Save</button>
+      </form>
+      <div id="risk-settings-status" class="risk-note"></div>
     </section>
   </main>
   <script>
@@ -1152,10 +1258,84 @@ _CLIENT_PORTAL_PAGE = """<!doctype html>
         tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Could not load trade history right now.</td></tr>';
       }
     }
+    async function postJSON(url, body) {
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+      if (res.status === 401) {
+        window.location.href = "/portal";
+        throw new Error("not authenticated");
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || (url + " -> " + res.status));
+      return data;
+    }
+    const _pauseReasonText = {
+      client_liquidate: "you liquidated your account",
+      max_drawdown: "your max drawdown limit was hit",
+      profit_target: "your profit target was hit",
+    };
+    async function loadRiskSettings() {
+      const statusEl = document.getElementById("risk-status");
+      try {
+        const s = await fetchJSON("/api/portal/risk_settings");
+        document.getElementById("liquidate-btn").hidden = s.trading_paused;
+        document.getElementById("resume-btn").hidden = !s.trading_paused;
+        statusEl.textContent = s.trading_paused
+          ? "Trading is paused — " + (_pauseReasonText[s.pause_reason] || "trading is paused") + "."
+          : "Trading is active.";
+        document.getElementById("risk-max-drawdown").value = s.max_drawdown_pct != null ? (s.max_drawdown_pct * 100) : "";
+        document.getElementById("risk-profit-target").value = s.profit_target_pct != null ? (s.profit_target_pct * 100) : "";
+        document.getElementById("risk-profit-window").value = s.profit_target_window_days != null ? s.profit_target_window_days : "";
+      } catch {
+        statusEl.textContent = "Could not load risk settings right now.";
+      }
+    }
+    document.getElementById("liquidate-btn").addEventListener("click", () => {
+      document.getElementById("liquidate-confirm").hidden = false;
+    });
+    document.getElementById("liquidate-no").addEventListener("click", () => {
+      document.getElementById("liquidate-confirm").hidden = true;
+    });
+    document.getElementById("liquidate-yes").addEventListener("click", async () => {
+      document.getElementById("liquidate-confirm").hidden = true;
+      try {
+        await postJSON("/api/portal/liquidate");
+        await Promise.all([loadAccount(), loadPositions(), loadTrades(), loadRiskSettings()]);
+      } catch (e) {
+        alert("Could not liquidate: " + e.message);
+      }
+    });
+    document.getElementById("resume-btn").addEventListener("click", async () => {
+      try {
+        await postJSON("/api/portal/resume");
+        await loadRiskSettings();
+      } catch (e) {
+        alert("Could not resume: " + e.message);
+      }
+    });
+    document.getElementById("risk-settings-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const statusEl = document.getElementById("risk-settings-status");
+      const dd = document.getElementById("risk-max-drawdown").value;
+      const pt = document.getElementById("risk-profit-target").value;
+      const pw = document.getElementById("risk-profit-window").value;
+      const body = {
+        max_drawdown_pct: dd === "" ? null : Number(dd) / 100,
+        profit_target_pct: pt === "" ? null : Number(pt) / 100,
+        profit_target_window_days: pw === "" ? null : Number(pw),
+      };
+      try {
+        await postJSON("/api/portal/risk_settings", body);
+        statusEl.textContent = "Saved.";
+        await loadRiskSettings();
+      } catch (e) {
+        statusEl.textContent = e.message;
+      }
+    });
     loadAccount();
     loadPositions();
     loadTrades();
-    setInterval(() => { loadAccount(); loadPositions(); }, 60000);
+    loadRiskSettings();
+    setInterval(() => { loadAccount(); loadPositions(); loadRiskSettings(); }, 60000);
   </script>
 </body>
 </html>"""
@@ -1270,6 +1450,184 @@ def portal_trades(request: Request, limit: int = 100) -> list[dict] | JSONRespon
         params={"client_id": client["id"], "limit": limit},
     )
     return _clean_records(df)
+
+
+class _RiskSettingsRequest(BaseModel):
+    max_drawdown_pct: float | None = None
+    profit_target_pct: float | None = None
+    profit_target_window_days: int | None = None
+
+
+# Bounds mirror the DB CHECK constraints in
+# data/schema/013_client_risk_controls.sql exactly -- kept as separate
+# constants (not shared with the master account's settings.max_drawdown_pct)
+# since a client's own stop is a completely independent decision from the
+# master account's own circuit breaker.
+_MIN_CLIENT_DRAWDOWN_PCT = 0.01
+_MAX_CLIENT_DRAWDOWN_PCT = 0.5
+_MIN_CLIENT_PROFIT_TARGET_PCT = 0.01
+_MAX_CLIENT_PROFIT_TARGET_PCT = 1.0
+_MIN_PROFIT_TARGET_WINDOW_DAYS = 1
+_MAX_PROFIT_TARGET_WINDOW_DAYS = 365
+
+
+def _validate_risk_settings(body: _RiskSettingsRequest) -> str | None:
+    """
+    Returns an error message if invalid, else None. Mirrors the DB CHECK
+    constraints so a bad input gets a clean 400 here instead of a raw
+    constraint-violation error surfacing to the client. profit_target_pct
+    and profit_target_window_days must be set together or not at all -- a
+    target % with no window (or a window with no target) is meaningless.
+    """
+    if body.max_drawdown_pct is not None and not (
+        _MIN_CLIENT_DRAWDOWN_PCT <= body.max_drawdown_pct <= _MAX_CLIENT_DRAWDOWN_PCT
+    ):
+        return f"max_drawdown_pct must be between {_MIN_CLIENT_DRAWDOWN_PCT:.0%} and {_MAX_CLIENT_DRAWDOWN_PCT:.0%}, or omitted to turn it off."
+    if (body.profit_target_pct is None) != (body.profit_target_window_days is None):
+        return "profit_target_pct and profit_target_window_days must be set together (or both left off)."
+    if body.profit_target_pct is not None and not (
+        _MIN_CLIENT_PROFIT_TARGET_PCT <= body.profit_target_pct <= _MAX_CLIENT_PROFIT_TARGET_PCT
+    ):
+        return f"profit_target_pct must be between {_MIN_CLIENT_PROFIT_TARGET_PCT:.0%} and {_MAX_CLIENT_PROFIT_TARGET_PCT:.0%}."
+    if body.profit_target_window_days is not None and not (
+        _MIN_PROFIT_TARGET_WINDOW_DAYS <= body.profit_target_window_days <= _MAX_PROFIT_TARGET_WINDOW_DAYS
+    ):
+        return f"profit_target_window_days must be between {_MIN_PROFIT_TARGET_WINDOW_DAYS} and {_MAX_PROFIT_TARGET_WINDOW_DAYS}."
+    return None
+
+
+@app.post("/api/portal/liquidate", response_model=None)
+def portal_liquidate(request: Request) -> dict | JSONResponse:
+    """
+    The client's own "exit everything, right now" button -- closes every
+    open position on THEIR account only (never the master account, never
+    another client) and pauses their trading with pause_reason=
+    'client_liquidate', the same way an auto-triggered max_drawdown pauses
+    -- so a signal an hour later doesn't immediately buy them right back
+    into what they just chose to exit. They resume whenever they're ready
+    via POST /api/portal/resume.
+    """
+    client = _require_client(request)
+    if not client:
+        return JSONResponse({"detail": "Not authenticated."}, status_code=401)
+    engine = get_engine()
+    try:
+        _client_broker(client["id"]).flatten_all()
+    except Exception as e:
+        return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE clients SET trading_paused = TRUE, pause_reason = %s WHERE id = %s",
+            ("client_liquidate", client["id"]),
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO client_orders (client_id, symbol, status) VALUES (%s, %s, %s)",
+            (client["id"], "ALL", "client_liquidate"),
+        )
+    return {"status": "liquidated", "trading_paused": True}
+
+
+@app.post("/api/portal/resume", response_model=None)
+def portal_resume(request: Request) -> dict | JSONResponse:
+    """
+    Un-pauses this client's trading, whatever the reason it was paused for
+    (their own liquidate click, or an auto-triggered max_drawdown /
+    profit_target) -- and resets the drawdown peak / profit-target baseline
+    to right now, so resuming doesn't immediately re-trigger off a stale
+    peak or an already-elapsed window.
+    """
+    client = _require_client(request)
+    if not client:
+        return JSONResponse({"detail": "Not authenticated."}, status_code=401)
+    engine = get_engine()
+    now = dt.datetime.now(tz=dt.UTC)
+    try:
+        equity = float(_client_broker(client["id"]).get_account().get("equity", 0) or 0)
+    except Exception as e:
+        return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE clients SET trading_paused = FALSE, pause_reason = NULL, equity_peak = %s, "
+            "profit_target_period_start_equity = %s, profit_target_period_start_ts = %s WHERE id = %s",
+            (equity or None, equity or None, now, client["id"]),
+        )
+    return {"status": "resumed", "trading_paused": False}
+
+
+@app.get("/api/portal/risk_settings", response_model=None)
+def get_portal_risk_settings(request: Request) -> dict | JSONResponse:
+    client = _require_client(request)
+    if not client:
+        return JSONResponse({"detail": "Not authenticated."}, status_code=401)
+    engine = get_engine()
+    df = pd.read_sql(
+        text(
+            "SELECT trading_paused, pause_reason, max_drawdown_pct, profit_target_pct, profit_target_window_days "
+            "FROM clients WHERE id = :id"
+        ),
+        engine,
+        params={"id": client["id"]},
+    )
+    row = df.iloc[0]
+    return {
+        "trading_paused": bool(row["trading_paused"]),
+        "pause_reason": row["pause_reason"],
+        "max_drawdown_pct": float(row["max_drawdown_pct"]) if pd.notna(row["max_drawdown_pct"]) else None,
+        "profit_target_pct": float(row["profit_target_pct"]) if pd.notna(row["profit_target_pct"]) else None,
+        "profit_target_window_days": int(row["profit_target_window_days"]) if pd.notna(row["profit_target_window_days"]) else None,
+    }
+
+
+@app.post("/api/portal/risk_settings", response_model=None)
+def set_portal_risk_settings(request: Request, body: _RiskSettingsRequest) -> dict | JSONResponse:
+    """
+    Self-service, unlike leverage -- the client sets their OWN thresholds
+    directly, no operator involved. Omitting a field turns that threshold
+    off; setting one (or changing its value) reseeds that threshold's
+    baseline (equity_peak for drawdown, the period start for profit-target)
+    to right now, so a new or changed limit is measured going forward, not
+    against a peak/baseline from before this call.
+    """
+    client = _require_client(request)
+    if not client:
+        return JSONResponse({"detail": "Not authenticated."}, status_code=401)
+    error = _validate_risk_settings(body)
+    if error:
+        return JSONResponse({"detail": error}, status_code=400)
+
+    engine = get_engine()
+    now = dt.datetime.now(tz=dt.UTC)
+    equity = None
+    if body.max_drawdown_pct is not None or body.profit_target_pct is not None:
+        try:
+            equity = float(_client_broker(client["id"]).get_account().get("equity", 0) or 0)
+        except Exception as e:
+            return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+
+    equity_peak = equity if (body.max_drawdown_pct is not None and equity) else None
+    period_equity = equity if (body.profit_target_pct is not None and equity) else None
+    period_ts = now if body.profit_target_pct is not None else None
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE clients SET max_drawdown_pct = %s, equity_peak = %s, "
+            "profit_target_pct = %s, profit_target_window_days = %s, "
+            "profit_target_period_start_equity = %s, profit_target_period_start_ts = %s "
+            "WHERE id = %s",
+            (
+                body.max_drawdown_pct, equity_peak,
+                body.profit_target_pct, body.profit_target_window_days,
+                period_equity, period_ts,
+                client["id"],
+            ),
+        )
+    return {
+        "max_drawdown_pct": body.max_drawdown_pct,
+        "profit_target_pct": body.profit_target_pct,
+        "profit_target_window_days": body.profit_target_window_days,
+    }
 
 
 # Static frontend, mounted last so it doesn't shadow /api/* routes. A mount

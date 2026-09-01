@@ -48,7 +48,7 @@ class _FakeBeginCtx:
         return False
 
 
-def _make_client_row(client_id: int, name: str, margin_enabled: bool) -> dict:
+def _make_client_row(client_id: int, name: str, margin_enabled: bool, leverage_multiplier: int = 1) -> dict:
     from execution.client_crypto import encrypt_credential
 
     return {
@@ -57,6 +57,7 @@ def _make_client_row(client_id: int, name: str, margin_enabled: bool) -> dict:
         "alpaca_api_key_encrypted": encrypt_credential(f"key-{name}"),
         "alpaca_api_secret_encrypted": encrypt_credential(f"secret-{name}"),
         "margin_enabled": margin_enabled,
+        "leverage_multiplier": leverage_multiplier,
     }
 
 
@@ -147,6 +148,71 @@ def test_replicate_to_clients_submits_short_for_a_margin_client(monkeypatch):
 
     # $10,000 * -60% / $50 = -120 sh
     assert broker.submitted == [("SNDK", pytest.approx(-120.0))]
+
+
+def test_replicate_to_clients_applies_leverage_multiplier(monkeypatch):
+    row = _make_client_row(1, "leo", margin_enabled=True, leverage_multiplier=2)
+    monkeypatch.setattr(client_fanout.pd, "read_sql", lambda *a, **k: pd.DataFrame([row]))
+    broker = _FakeAlpacaBroker("live", True, "key-leo", "secret-leo", portfolio_value=10_000.0)
+    _install_fake_broker_factory(monkeypatch, {"key-leo": broker})
+
+    engine = _FakeEngine()
+    client_fanout.replicate_to_clients({"TSLA": 0.10}, {"TSLA": 200.0}, engine)
+
+    # Unlevered would be $10,000 * 10% / $200 = 5 sh; 2x leverage doubles it to 10.
+    assert broker.submitted == [("TSLA", pytest.approx(10.0))]
+    # target_position_pct logged is the LEVERED figure actually used, not the master's raw 0.10.
+    logged = engine.inserted[-1]
+    assert logged[3] == pytest.approx(0.20)
+    assert logged[4] == pytest.approx(10.0)
+
+
+def test_replicate_to_clients_caps_leveraged_exposure_at_max_single_position_pct(monkeypatch):
+    monkeypatch.setattr(client_fanout.settings, "max_single_position_pct", 0.20)
+    row = _make_client_row(1, "mia", margin_enabled=True, leverage_multiplier=3)
+    monkeypatch.setattr(client_fanout.pd, "read_sql", lambda *a, **k: pd.DataFrame([row]))
+    broker = _FakeAlpacaBroker("live", True, "key-mia", "secret-mia", portfolio_value=10_000.0)
+    _install_fake_broker_factory(monkeypatch, {"key-mia": broker})
+
+    engine = _FakeEngine()
+    # 0.10 * 3x leverage = 0.30, which exceeds the 0.20 cap -- clamped to 0.20.
+    client_fanout.replicate_to_clients({"TSLA": 0.10}, {"TSLA": 200.0}, engine)
+
+    assert broker.submitted == [("TSLA", pytest.approx(10.0))]  # $10,000 * 20% (capped) / $200
+
+
+def test_replicate_to_clients_caps_a_leveraged_short_symmetrically(monkeypatch):
+    monkeypatch.setattr(client_fanout.settings, "max_single_position_pct", 0.20)
+    row = _make_client_row(1, "nate", margin_enabled=True, leverage_multiplier=3)
+    monkeypatch.setattr(client_fanout.pd, "read_sql", lambda *a, **k: pd.DataFrame([row]))
+    broker = _FakeAlpacaBroker("live", True, "key-nate", "secret-nate", portfolio_value=10_000.0)
+    _install_fake_broker_factory(monkeypatch, {"key-nate": broker})
+
+    engine = _FakeEngine()
+    client_fanout.replicate_to_clients({"SNDK": -0.10}, {"SNDK": 200.0}, engine)
+
+    assert broker.submitted == [("SNDK", pytest.approx(-10.0))]  # capped at -20%, not -30%
+
+
+def test_replicate_to_clients_does_not_cap_an_unlevered_client(monkeypatch):
+    """
+    The cap is new behavior introduced specifically for leverage > 1x -- an
+    unlevered (leverage=1, the default for every existing client) target
+    weight must size exactly as before even if it's already above
+    max_single_position_pct (e.g. one candidate getting the full deployable
+    book), since that's an existing, intentional master-account sizing
+    decision this module has never second-guessed.
+    """
+    monkeypatch.setattr(client_fanout.settings, "max_single_position_pct", 0.20)
+    row = _make_client_row(1, "opal", margin_enabled=True, leverage_multiplier=1)
+    monkeypatch.setattr(client_fanout.pd, "read_sql", lambda *a, **k: pd.DataFrame([row]))
+    broker = _FakeAlpacaBroker("live", True, "key-opal", "secret-opal", portfolio_value=10_000.0)
+    _install_fake_broker_factory(monkeypatch, {"key-opal": broker})
+
+    engine = _FakeEngine()
+    client_fanout.replicate_to_clients({"TSLA": 0.90}, {"TSLA": 200.0}, engine)
+
+    assert broker.submitted == [("TSLA", pytest.approx(45.0))]  # $10,000 * 90% / $200, uncapped
 
 
 def test_one_clients_construction_failure_does_not_block_the_next_client(monkeypatch):

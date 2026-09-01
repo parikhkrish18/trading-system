@@ -45,6 +45,7 @@ from execution import hold_rules
 from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.broker import get_broker
 from execution.client_fanout import replicate_to_clients
+from execution.client_risk_controls import check_all_clients_risk
 from execution.exit_levels import ExitLevels
 from execution.trading_loop import (
     _allocation_confirmation,
@@ -481,6 +482,16 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     if hasattr(broker, "client") and not broker.client.get_clock().is_open:
         logger.info("Market is closed — skipping this check (runs hourly during market hours).")
         return []
+
+    # Client self-service risk controls (max-drawdown auto-close,
+    # profit-target auto-secure — see execution/client_risk_controls.py)
+    # run on this same hourly, market-hours clock, independent of whether
+    # the MASTER account itself holds anything below. One client's failed
+    # check never raises past this call.
+    try:
+        check_all_clients_risk(engine)
+    except Exception:
+        logger.exception("Client risk-control check failed this pass — will retry next hour.")
 
     positions = {s: q for s, q in broker.get_positions().items() if q != 0}
     if not positions:

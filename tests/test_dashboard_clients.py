@@ -150,6 +150,90 @@ def test_create_client_buys_in_immediately_when_trading_enabled(monkeypatch, cli
 
 
 # ---------------------------------------------------------------------
+# Leverage: creation-time validation and the standalone update endpoint
+# ---------------------------------------------------------------------
+
+
+def test_create_client_rejects_leverage_above_the_hard_cap(monkeypatch, client):
+    resp = client.post(
+        "/api/clients",
+        json={
+            "name": "pat", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw12345",
+            "margin_enabled": True, "leverage_multiplier": 4,
+        },
+    )
+    assert resp.status_code == 400
+    assert "leverage_multiplier" in resp.json()["detail"]
+
+
+def test_create_client_rejects_leverage_without_margin(monkeypatch, client):
+    resp = client.post(
+        "/api/clients",
+        json={
+            "name": "quinn", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw12345",
+            "margin_enabled": False, "leverage_multiplier": 2,
+        },
+    )
+    assert resp.status_code == 400
+    assert "margin" in resp.json()["detail"].lower()
+
+
+def test_create_client_accepts_valid_leverage(monkeypatch, client):
+    monkeypatch.setattr(server, "AlpacaBroker", lambda *a, **k: _FakeVerifyBroker(*a, **k))
+    monkeypatch.setattr(server.settings, "client_trading_enabled", False)
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+
+    resp = client.post(
+        "/api/clients",
+        json={
+            "name": "rae", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw12345",
+            "margin_enabled": True, "leverage_multiplier": 2,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["leverage_multiplier"] == 2
+    assert engine.executed[0][1][4] == 2  # leverage_multiplier is the 5th INSERT param
+
+
+def test_set_client_leverage_rejects_above_the_hard_cap(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: object())
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame([{"margin_enabled": True}]))
+
+    resp = client.post("/api/clients/7/leverage", json={"leverage_multiplier": 5})
+    assert resp.status_code == 400
+
+
+def test_set_client_leverage_rejects_when_client_is_not_margin_enabled(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: object())
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame([{"margin_enabled": False}]))
+
+    resp = client.post("/api/clients/7/leverage", json={"leverage_multiplier": 2})
+    assert resp.status_code == 400
+    assert "margin" in resp.json()["detail"].lower()
+
+
+def test_set_client_leverage_404s_for_an_unknown_client(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: object())
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["margin_enabled"]))
+
+    resp = client.post("/api/clients/999/leverage", json={"leverage_multiplier": 2})
+    assert resp.status_code == 404
+
+
+def test_set_client_leverage_updates_when_valid(monkeypatch, client):
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame([{"margin_enabled": True}]))
+
+    resp = client.post("/api/clients/7/leverage", json={"leverage_multiplier": 3})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"id": 7, "leverage_multiplier": 3}
+    assert engine.executed[0][1] == (3, 7)
+
+
+# ---------------------------------------------------------------------
 # GET /api/clients — list, masked
 # ---------------------------------------------------------------------
 
@@ -160,7 +244,9 @@ def test_list_clients_masks_the_api_key(monkeypatch, client):
         [
             {
                 "id": 1, "name": "alice", "alpaca_api_key_encrypted": encrypted_key,
-                "margin_enabled": True, "active": True, "created_at": pd.Timestamp("2026-08-01", tz="UTC"),
+                "margin_enabled": True, "leverage_multiplier": 1, "active": True,
+                "trading_paused": False, "pause_reason": None,
+                "created_at": pd.Timestamp("2026-08-01", tz="UTC"),
             }
         ]
     )
@@ -355,3 +441,196 @@ def test_password_reset_invalidates_the_old_session_cookie(monkeypatch, client):
 
     resp = client.get("/api/portal/positions")
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------
+# Client portal — self-service risk controls (liquidate / resume / risk_settings)
+# ---------------------------------------------------------------------
+
+
+class _FakeRiskBroker:
+    """Stands in for _client_broker in the liquidate/resume/risk_settings tests."""
+
+    def __init__(self, equity=10_000.0, flatten_fails=False, account_fails=False):
+        self.equity = equity
+        self.flatten_fails = flatten_fails
+        self.account_fails = account_fails
+        self.flatten_calls = 0
+
+    def flatten_all(self):
+        self.flatten_calls += 1
+        if self.flatten_fails:
+            raise RuntimeError("Alpaca is down")
+
+    def get_account(self):
+        if self.account_fails:
+            raise RuntimeError("Alpaca is down")
+        return {"equity": self.equity}
+
+
+def test_portal_liquidate_and_resume_require_a_session(client):
+    assert client.post("/api/portal/liquidate").status_code == 401
+    assert client.post("/api/portal/resume").status_code == 401
+    assert client.get("/api/portal/risk_settings").status_code == 401
+    assert client.post("/api/portal/risk_settings", json={}).status_code == 401
+
+
+def test_portal_liquidate_flattens_and_pauses(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    broker = _FakeRiskBroker()
+    monkeypatch.setattr(server, "_client_broker", lambda client_id: broker)
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+
+    resp = client.post("/api/portal/liquidate")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "liquidated", "trading_paused": True}
+    assert broker.flatten_calls == 1
+    update_params = next(p for sql, p in engine.executed if "UPDATE clients" in sql)
+    assert update_params == ("client_liquidate", 1)
+    insert_params = next(p for sql, p in engine.executed if "INSERT INTO client_orders" in sql)
+    assert insert_params == (1, "ALL", "client_liquidate")
+
+
+def test_portal_liquidate_502s_when_broker_unreachable_and_does_not_pause(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    broker = _FakeRiskBroker(flatten_fails=True)
+    monkeypatch.setattr(server, "_client_broker", lambda client_id: broker)
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+
+    resp = client.post("/api/portal/liquidate")
+
+    assert resp.status_code == 502
+    assert engine.executed == []  # never got as far as pausing
+
+
+def test_portal_resume_clears_pause_and_reseeds_baselines(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    broker = _FakeRiskBroker(equity=12_345.0)
+    monkeypatch.setattr(server, "_client_broker", lambda client_id: broker)
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+
+    resp = client.post("/api/portal/resume")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "resumed", "trading_paused": False}
+    sql, params = engine.executed[0]
+    assert "trading_paused = FALSE" in sql
+    assert params[0] == 12_345.0  # equity_peak reseeded
+    assert params[1] == 12_345.0  # profit_target_period_start_equity reseeded
+    assert params[3] == 1  # client_id
+
+
+def test_portal_resume_502s_when_broker_unreachable(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+    monkeypatch.setattr(server, "_client_broker", lambda client_id: _FakeRiskBroker(account_fails=True))
+
+    resp = client.post("/api/portal/resume")
+    assert resp.status_code == 502
+
+
+def _risk_settings_row(**overrides) -> pd.DataFrame:
+    row = {
+        "trading_paused": False, "pause_reason": None,
+        "max_drawdown_pct": None, "profit_target_pct": None, "profit_target_window_days": None,
+    }
+    row.update(overrides)
+    return pd.DataFrame([row])
+
+
+def test_get_portal_risk_settings_returns_current_values(monkeypatch, client):
+    def fake_read_sql(query, engine, params=None):
+        sql = str(query)
+        if "trading_paused" in sql and "max_drawdown_pct" in sql:
+            return _risk_settings_row(trading_paused=True, pause_reason="max_drawdown", max_drawdown_pct=0.1)
+        return _client_row_df()
+
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", fake_read_sql)
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    resp = client.get("/api/portal/risk_settings")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "trading_paused": True, "pause_reason": "max_drawdown",
+        "max_drawdown_pct": 0.1, "profit_target_pct": None, "profit_target_window_days": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"max_drawdown_pct": 0.9},  # above the 50% hard cap
+        {"max_drawdown_pct": 0.0},  # 0% is not a valid limit
+        {"profit_target_pct": 0.05},  # window missing
+        {"profit_target_window_days": 7},  # target missing
+        {"profit_target_pct": 0.05, "profit_target_window_days": 400},  # window above 365
+    ],
+)
+def test_set_portal_risk_settings_rejects_invalid_input(monkeypatch, client, body):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    resp = client.post("/api/portal/risk_settings", json=body)
+    assert resp.status_code == 400
+
+
+def test_set_portal_risk_settings_updates_and_reseeds_baselines(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    broker = _FakeRiskBroker(equity=20_000.0)
+    monkeypatch.setattr(server, "_client_broker", lambda client_id: broker)
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+
+    body = {"max_drawdown_pct": 0.15, "profit_target_pct": 0.05, "profit_target_window_days": 7}
+    resp = client.post("/api/portal/risk_settings", json=body)
+
+    assert resp.status_code == 200
+    assert resp.json() == body
+    sql, params = engine.executed[0]
+    assert "UPDATE clients SET max_drawdown_pct" in sql
+    assert params[0] == 0.15  # max_drawdown_pct
+    assert params[1] == 20_000.0  # equity_peak reseeded
+    assert params[2] == 0.05  # profit_target_pct
+    assert params[3] == 7  # profit_target_window_days
+    assert params[4] == 20_000.0  # profit_target_period_start_equity reseeded
+    assert params[6] == 1  # client_id
+
+
+def test_set_portal_risk_settings_turning_everything_off_skips_the_broker_call(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    def _boom(client_id):
+        raise AssertionError("should not need the broker when every threshold is being turned off")
+
+    monkeypatch.setattr(server, "_client_broker", _boom)
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+
+    resp = client.post("/api/portal/risk_settings", json={})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"max_drawdown_pct": None, "profit_target_pct": None, "profit_target_window_days": None}
+    _sql, params = engine.executed[0]
+    assert params[:6] == (None, None, None, None, None, None)

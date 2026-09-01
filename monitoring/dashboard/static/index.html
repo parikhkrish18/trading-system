@@ -163,6 +163,14 @@
           <label class="client-margin-label">
             <input id="client-margin" type="checkbox" style="min-width: auto; width: auto;" /> Margin-enabled account
           </label>
+          <label class="client-margin-label">
+            Leverage
+            <select id="client-leverage">
+              <option value="1">1x (none)</option>
+              <option value="2">2x</option>
+              <option value="3">3x</option>
+            </select>
+          </label>
           <button type="submit" class="btn">Add client</button>
         </form>
         <div id="add-client-status" class="muted"></div>
@@ -174,7 +182,7 @@
           <table id="clients-table">
             <thead>
               <tr>
-                <th>Name</th><th>API key</th><th>Margin</th><th>Status</th><th>Added</th><th>Actions</th>
+                <th>Name</th><th>API key</th><th>Margin</th><th>Leverage</th><th>Status</th><th>Added</th><th>Actions</th>
               </tr>
             </thead>
             <tbody></tbody>

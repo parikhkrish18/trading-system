@@ -88,6 +88,19 @@ def _no_followups(monkeypatch):
     monkeypatch.setattr(cm, "send_followup", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_client_risk_checks(monkeypatch):
+    """
+    This file is about the contradiction/exit logic, not client self-service
+    risk controls (that's tests/test_client_risk_controls.py) -- these tests'
+    get_engine() fakes (bare object()) aren't real SQL connections, so a
+    real check_all_clients_risk call here would just fail and log noise on
+    every test. run_contradiction_check already swallows that failure, this
+    just keeps the test output clean.
+    """
+    monkeypatch.setattr(cm, "check_all_clients_risk", lambda *a, **k: [])
+
+
 def test_market_closed_is_a_clean_noop(monkeypatch):
     broker = _FakeBroker({"AAPL": 10}, is_open=False)
     monkeypatch.setattr(cm, "get_broker", lambda: broker)

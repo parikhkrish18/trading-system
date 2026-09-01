@@ -746,20 +746,32 @@ async function loadClientTradingBadge() {
   }
 }
 
+const _PAUSE_REASON_LABEL = {
+  client_liquidate: "client liquidated",
+  max_drawdown: "max drawdown hit",
+  profit_target: "profit target hit",
+};
+
 function clientRowHTML(c) {
-  const statusLabel = c.active ? "Active" : "Deactivated";
+  let statusLabel = c.active ? "Active" : "Deactivated";
+  if (c.active && c.trading_paused) {
+    statusLabel = `Paused (${_PAUSE_REASON_LABEL[c.pause_reason] || "self-paused"})`;
+  }
   const toggleLabel = c.active ? "Deactivate" : "Reactivate";
   const toggleAction = c.active ? "deactivate" : "reactivate";
+  const leverage = c.leverage_multiplier || 1;
   return `
     <tr data-client-id="${c.id}">
       <td>${escapeHTML(c.name)}</td>
       <td><code>${escapeHTML(c.api_key_preview)}</code></td>
       <td>${c.margin_enabled ? "Yes" : "No"}</td>
-      <td>${statusLabel}</td>
+      <td class="${leverage > 1 ? "pl-neg" : ""}">${leverage}x</td>
+      <td class="${c.active && c.trading_paused ? "pl-neg" : ""}">${statusLabel}</td>
       <td>${c.created_at ? new Date(c.created_at).toLocaleDateString() : ""}</td>
       <td>
         <button class="btn btn-secondary client-toggle-btn" data-action="${toggleAction}" data-id="${c.id}">${toggleLabel}</button>
         <button class="btn btn-secondary client-reset-btn" data-id="${c.id}">Reset password</button>
+        <button class="btn btn-secondary client-leverage-btn" data-id="${c.id}" data-current="${leverage}" data-margin="${c.margin_enabled}">Edit leverage</button>
       </td>
     </tr>`;
 }
@@ -772,9 +784,9 @@ async function loadClients() {
     document.getElementById("clients-count").textContent = `(${clients.length})`;
     tbody.innerHTML = clients.length
       ? clients.map(clientRowHTML).join("")
-      : '<tr><td colspan="6" class="empty-state">No clients yet.</td></tr>';
+      : '<tr><td colspan="7" class="empty-state">No clients yet.</td></tr>';
   } catch {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Could not load clients.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Could not load clients.</td></tr>';
   }
 }
 
@@ -782,11 +794,18 @@ document.getElementById("add-client-form").addEventListener("submit", async (e) 
   e.preventDefault();
   const statusEl = document.getElementById("add-client-status");
   statusEl.textContent = "Adding client and verifying Alpaca credentials…";
+  const leverage = Number(document.getElementById("client-leverage").value);
+  const marginEnabled = document.getElementById("client-margin").checked;
+  if (leverage > 1 && !marginEnabled) {
+    statusEl.textContent = "Leverage above 1x requires the margin-enabled checkbox too.";
+    return;
+  }
   const body = {
     name: document.getElementById("client-name").value.trim(),
     alpaca_api_key: document.getElementById("client-alpaca-key").value.trim(),
     alpaca_api_secret: document.getElementById("client-alpaca-secret").value.trim(),
-    margin_enabled: document.getElementById("client-margin").checked,
+    margin_enabled: marginEnabled,
+    leverage_multiplier: leverage,
     password: document.getElementById("client-password").value,
   };
   try {
@@ -811,6 +830,7 @@ document.getElementById("add-client-form").addEventListener("submit", async (e) 
 document.querySelector("#clients-table tbody").addEventListener("click", async (e) => {
   const toggleBtn = e.target.closest(".client-toggle-btn");
   const resetBtn = e.target.closest(".client-reset-btn");
+  const leverageBtn = e.target.closest(".client-leverage-btn");
   if (toggleBtn) {
     const id = toggleBtn.dataset.id;
     await fetch(`/api/clients/${id}/${toggleBtn.dataset.action}`, { method: "POST" });
@@ -824,6 +844,29 @@ document.querySelector("#clients-table tbody").addEventListener("click", async (
       body: JSON.stringify({ new_password: newPassword }),
     });
     alert("Password reset.");
+  } else if (leverageBtn) {
+    if (leverageBtn.dataset.margin !== "true") {
+      alert("This account isn't margin-enabled — leverage above 1x isn't available for it.");
+      return;
+    }
+    const input = prompt("New leverage for this client (1, 2, or 3):", leverageBtn.dataset.current);
+    if (input === null) return;
+    const leverage = Number(input);
+    if (!Number.isInteger(leverage) || leverage < 1 || leverage > 3) {
+      alert("Leverage must be a whole number from 1 to 3.");
+      return;
+    }
+    const res = await fetch(`/api/clients/${leverageBtn.dataset.id}/leverage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leverage_multiplier: leverage }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(`Error: ${data.detail || res.status}`);
+      return;
+    }
+    loadClients();
   }
 });
 
