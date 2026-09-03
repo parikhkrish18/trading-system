@@ -223,8 +223,21 @@ function newsFeedHTML(items) {
     .join("");
 }
 
-function positionCardHTML(p, idx, newsBySymbol) {
+// Just the live-updating numbers (qty/market value/entry/current price/P&L)
+// -- pulled out of positionCardHTML so loadPositions() can refresh these in
+// place on its 10s tick without touching the rest of the card (see the
+// "position-live-stats" patch path in loadPositions() below).
+function positionStatsHTML(p) {
   const plClass = p.unrealized_pl >= 0 ? "pl-pos" : "pl-neg";
+  return `
+        <div><div class="label">Qty</div>${fmt.num(p.qty, 4)}</div>
+        <div><div class="label">Market value</div>${fmt.money(p.market_value)}</div>
+        <div><div class="label">Entry price</div>${fmt.money(p.avg_entry_price)}</div>
+        <div><div class="label">Current price</div>${fmt.money(p.current_price)}</div>
+        <div><div class="label">Unrealized P/L</div><span class="${plClass}">${fmt.money(p.unrealized_pl)} (${fmt.pct(p.unrealized_plpc)})</span></div>`;
+}
+
+function positionCardHTML(p, idx, newsBySymbol) {
   const d = p.decision;
   const decisionBlock = d
     ? `
@@ -270,18 +283,12 @@ function positionCardHTML(p, idx, newsBySymbol) {
     </div>`;
 
   return `
-    <div class="position-card">
+    <div class="position-card" data-symbol="${escapeHTML(p.symbol)}">
       <div class="position-card-head">
         <span class="position-symbol">${escapeHTML(p.symbol)}</span>
         <span class="side-badge ${p.side}">${p.side}</span>
       </div>
-      <div class="position-grid-stats">
-        <div><div class="label">Qty</div>${fmt.num(p.qty, 4)}</div>
-        <div><div class="label">Market value</div>${fmt.money(p.market_value)}</div>
-        <div><div class="label">Entry price</div>${fmt.money(p.avg_entry_price)}</div>
-        <div><div class="label">Current price</div>${fmt.money(p.current_price)}</div>
-        <div><div class="label">Unrealized P/L</div><span class="${plClass}">${fmt.money(p.unrealized_pl)} (${fmt.pct(p.unrealized_plpc)})</span></div>
-      </div>
+      <div class="position-grid-stats position-live-stats">${positionStatsHTML(p)}</div>
       ${exitBlock}
       ${watcherNote}
       ${decisionBlock}
@@ -289,27 +296,12 @@ function positionCardHTML(p, idx, newsBySymbol) {
     </div>`;
 }
 
-async function loadPositions() {
-  const [positions, newsBySymbol] = await Promise.all([
-    fetchJSON("/api/positions"),
-    fetchJSON("/api/positions/news").catch(() => ({})),
-  ]);
-  document.getElementById("positions-count").textContent = `(${positions.length})`;
+// Symbols currently rendered in #positions-list (render order), so
+// loadPositions() can tell "same holdings, just new numbers" from "a
+// position actually opened or closed" on its next tick.
+let _lastPositionSymbols = null;
 
-  const totalValue = positions.reduce((s, p) => s + p.market_value, 0);
-  const totalPL = positions.reduce((s, p) => s + p.unrealized_pl, 0);
-  document.getElementById("positions-summary").innerHTML = `
-    <div class="stat-card"><div class="value">${positions.length}</div><div class="label">Open positions</div></div>
-    <div class="stat-card"><div class="value">${fmt.money(totalValue)}</div><div class="label">Total market value</div></div>
-    <div class="stat-card ${totalPL >= 0 ? "good" : "bad"}"><div class="value">${fmt.money(totalPL)}</div><div class="label">Unrealized P/L</div></div>
-  `;
-
-  const list = document.getElementById("positions-list");
-  if (positions.length === 0) {
-    list.innerHTML = '<div class="empty-state">No open positions.</div>';
-    return;
-  }
-  list.innerHTML = positions.map((p, i) => positionCardHTML(p, i, newsBySymbol)).join("");
+function wirePositionToggles(list) {
   list.querySelectorAll(".reasoning-toggle[data-idx]").forEach((el) => {
     el.addEventListener("click", () => {
       const body = document.getElementById(`reasoning-${el.dataset.idx}`);
@@ -324,6 +316,59 @@ async function loadPositions() {
       el.textContent = (body.classList.contains("open") ? "▾ " : "▸ ") + el.textContent.replace(/^[▾▸]\s*/, "");
     });
   });
+}
+
+async function loadPositions() {
+  const positions = await fetchJSON("/api/positions");
+  document.getElementById("positions-count").textContent = `(${positions.length})`;
+
+  const totalValue = positions.reduce((s, p) => s + p.market_value, 0);
+  const totalPL = positions.reduce((s, p) => s + p.unrealized_pl, 0);
+  document.getElementById("positions-summary").innerHTML = `
+    <div class="stat-card"><div class="value">${positions.length}</div><div class="label">Open positions</div></div>
+    <div class="stat-card"><div class="value">${fmt.money(totalValue)}</div><div class="label">Total market value</div></div>
+    <div class="stat-card ${totalPL >= 0 ? "good" : "bad"}"><div class="value">${fmt.money(totalPL)}</div><div class="label">Unrealized P/L</div></div>
+  `;
+
+  const list = document.getElementById("positions-list");
+  if (positions.length === 0) {
+    list.innerHTML = '<div class="empty-state">No open positions.</div>';
+    _lastPositionSymbols = null;
+    return;
+  }
+
+  const symbols = positions.map((p) => p.symbol);
+  const holdingsUnchanged =
+    _lastPositionSymbols &&
+    _lastPositionSymbols.length === symbols.length &&
+    _lastPositionSymbols.every((s) => symbols.includes(s));
+
+  if (holdingsUnchanged) {
+    // Same positions as the last render -- patch just the live
+    // price/qty/P&L numbers in place instead of tearing the whole list
+    // down and rebuilding it. A full rebuild replaces every card's DOM
+    // node, which silently re-collapses any "Why this trade" / "Recent
+    // news" dropdown someone had open and resets scroll position -- this
+    // fast 10s timer exists to feel live, not to yank the page out from
+    // under someone actually reading it. Nothing here needs the news
+    // list, so it isn't even fetched on this path.
+    positions.forEach((p) => {
+      const card = list.querySelector(`.position-card[data-symbol="${CSS.escape(p.symbol)}"]`);
+      const statsEl = card && card.querySelector(".position-live-stats");
+      if (statsEl) statsEl.innerHTML = positionStatsHTML(p);
+    });
+    return;
+  }
+
+  // A position actually opened or closed since the last render -- a real
+  // structural change, so a full rebuild is unavoidable. Still worth not
+  // yanking the scroll position back to the top while we're at it.
+  const newsBySymbol = await fetchJSON("/api/positions/news").catch(() => ({}));
+  const scrollY = window.scrollY;
+  list.innerHTML = positions.map((p, i) => positionCardHTML(p, i, newsBySymbol)).join("");
+  wirePositionToggles(list);
+  _lastPositionSymbols = symbols;
+  window.scrollTo(0, scrollY);
 }
 
 // ---------- Equity & drawdown ----------
