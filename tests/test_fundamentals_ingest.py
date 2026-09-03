@@ -14,9 +14,18 @@ class _FakeResponse:
         return self._payload
 
 
-def _polygon_report(end_date: str, eps: float, revenue: float) -> dict:
+_UNSET = object()
+
+
+def _polygon_report(end_date: str, eps: float, revenue: float, filing_date=_UNSET) -> dict:
     return {
         "end_date": end_date,
+        # Defaults to end_date so tests that aren't specifically about the
+        # filing_date/end_date distinction get a normally-dated, ingestible
+        # report -- pass filing_date=None explicitly to simulate a report
+        # missing it entirely (see
+        # test_fetch_fundamentals_excludes_reports_missing_filing_date).
+        "filing_date": end_date if filing_date is _UNSET else filing_date,
         "financials": {
             "income_statement": {
                 "diluted_earnings_per_share": {"value": eps},
@@ -64,13 +73,24 @@ def test_fetch_fundamentals_prefers_filing_date_over_end_date(monkeypatch):
     assert (df["ts"] == pd.Timestamp("2026-08-04", tz="UTC")).all()
 
 
-def test_fetch_fundamentals_falls_back_to_end_date_when_filing_date_missing(monkeypatch):
-    monkeypatch.setattr(fundamentals, "polygon_get",lambda *a, **k: _FakeResponse({"results": [_polygon_report("2026-06-30", eps=2.5, revenue=1_000_000.0)]}))
+def test_fetch_fundamentals_excludes_reports_missing_filing_date(monkeypatch):
+    """
+    Regression test: a report with no filing_date used to silently fall back
+    to end_date, which is exactly the look-ahead bias the filing_date-over-
+    end_date preference above exists to prevent (common for older/partial
+    Polygon records where filing_date is absent). It must be dropped, not
+    mis-dated.
+    """
+    report = _polygon_report("2026-06-30", eps=2.5, revenue=1_000_000.0, filing_date=None)
+    assert report["filing_date"] is None
+    assert report["end_date"] == "2026-06-30"
+
+    monkeypatch.setattr(fundamentals, "polygon_get", lambda *a, **k: _FakeResponse({"results": [report]}))
     monkeypatch.setattr(fundamentals.settings, "polygon_api_key", "test-key")
 
     df = fundamentals.fetch_fundamentals(["SPY"])
 
-    assert (df["ts"] == pd.Timestamp("2026-06-30", tz="UTC")).all()
+    assert df.empty  # excluded entirely, not silently dated by end_date
 
 
 def test_fetch_fundamentals_skips_missing_metrics(monkeypatch):

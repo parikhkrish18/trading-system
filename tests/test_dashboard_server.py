@@ -730,8 +730,14 @@ def test_reads_are_refused_without_a_session_cookie_once_a_password_is_configure
         assert client.get(path).status_code == 401, f"{path} leaked without a session cookie"
 
 
-def test_reads_are_refused_on_a_public_bind_even_with_no_password_configured(client):
-    """Fails closed: a blank DASHBOARD_PASSWORD must not mean 'open to all'."""
+def test_reads_are_refused_on_a_public_bind_even_with_no_password_configured(client, monkeypatch):
+    """
+    Fails closed: a blank DASHBOARD_PASSWORD must not mean 'open to all'.
+    DASHBOARD_HOST is the signal now (see _client_is_loopback), not the
+    per-request base_url -- a request's own local socket address is no
+    longer trusted for this, so the test has to say so explicitly.
+    """
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
     public = TestClient(server.app, base_url="http://0.0.0.0")
 
     assert public.get("/api/positions").status_code == 503
@@ -754,6 +760,7 @@ def test_reads_still_work_on_loopback_without_a_password(monkeypatch, client):
 
 def test_no_password_on_public_bind_is_refused(monkeypatch):
     monkeypatch.setattr(server.settings, "dashboard_password", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
     public = TestClient(server.app, base_url="http://0.0.0.0")
     resp = public.get("/api/circuit_breakers")
     assert resp.status_code == 503
@@ -763,6 +770,77 @@ def test_no_password_on_public_bind_is_refused(monkeypatch):
 def test_no_password_on_loopback_is_allowed(monkeypatch, client):
     monkeypatch.setattr(server, "load_latest_breaker_state", lambda limit: pd.DataFrame())
     assert client.get("/api/circuit_breakers").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# TRUST_PROXY_HEADERS -- a same-host reverse proxy (Railway, most PaaS, and
+# the shipped docker-compose.yml) makes request.scope["server"] look like
+# 127.0.0.1 regardless of who is really connecting on the other side of it,
+# so the "no password needed" exemption above can no longer trust a
+# request's own local socket address -- see _client_is_loopback.
+# --------------------------------------------------------------------------
+
+
+def test_unset_password_is_refused_when_not_provably_loopback_even_if_the_local_socket_looks_like_it(monkeypatch):
+    """
+    (a) The proxy-fooled case this bug is about: TRUST_PROXY_HEADERS is off
+    (the default) and DASHBOARD_HOST is NOT itself loopback -- exactly what
+    a same-host reverse proxy in front of a publicly-bound container looks
+    like from the outside. The request's own local socket (simulated here
+    via base_url, same as the rest of this file) looking like loopback must
+    not be enough to grant the no-password exemption on its own anymore.
+    """
+    monkeypatch.setattr(server.settings, "dashboard_password", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+    monkeypatch.setattr(server.settings, "trust_proxy_headers", False)
+    proxied = TestClient(server.app, base_url="http://127.0.0.1")
+
+    resp = proxied.get("/api/positions")
+
+    assert resp.status_code == 503
+
+
+def test_trust_proxy_headers_requires_password_for_a_real_forwarded_client(monkeypatch):
+    """
+    (b) TRUST_PROXY_HEADERS on + X-Forwarded-For naming a real remote
+    client -- a password is required regardless of what the local socket
+    looks like (DASHBOARD_HOST is left at loopback here, the shape of a
+    dashboard sitting entirely behind a same-host proxy).
+    """
+    monkeypatch.setattr(server.settings, "dashboard_password", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "127.0.0.1")
+    monkeypatch.setattr(server.settings, "trust_proxy_headers", True)
+    public = TestClient(server.app, base_url="http://127.0.0.1")
+
+    resp = public.get("/api/positions", headers={"X-Forwarded-For": "203.0.113.7"})
+
+    assert resp.status_code == 503
+
+
+def test_trust_proxy_headers_allows_loopback_when_the_forwarded_client_is_loopback(monkeypatch):
+    """The flip side of the above: a trusted proxy forwarding a genuinely
+    loopback client address still gets the no-password exemption."""
+    monkeypatch.setattr(server.settings, "dashboard_password", "")
+    monkeypatch.setattr(server.settings, "dashboard_host", "0.0.0.0")
+    monkeypatch.setattr(server.settings, "trust_proxy_headers", True)
+    monkeypatch.setattr(server, "get_broker", lambda: _FakeBroker([]))
+    public = TestClient(server.app, base_url="http://0.0.0.0")
+
+    resp = public.get("/api/positions", headers={"X-Forwarded-For": "127.0.0.1"})
+
+    assert resp.status_code == 200
+
+
+def test_genuine_local_dev_still_works_with_no_password_and_no_proxy(monkeypatch, client):
+    """
+    (c) The workflow this whole gate exists to keep frictionless: running
+    the dashboard directly on 127.0.0.1 (the `client` fixture's default),
+    no proxy, no password. Must keep working unchanged.
+    """
+    monkeypatch.setattr(server.settings, "trust_proxy_headers", False)
+    monkeypatch.setattr(server, "get_broker", lambda: _FakeBroker([]))
+
+    assert client.get("/api/positions").status_code == 200
 
 
 def test_login_page_is_reachable_without_a_session(monkeypatch):
@@ -897,6 +975,46 @@ def test_changing_the_password_invalidates_outstanding_sessions(monkeypatch):
     monkeypatch.setattr(server.settings, "dashboard_password", "new-password")
 
     assert public.get("/api/circuit_breakers").status_code == 401
+
+
+# --------------------------------------------------------------------------
+# CSRF: a second layer (an Origin check) on top of SameSite=Lax for
+# mutating requests under /api/portal/* and /api/clients* — see
+# _check_csrf_origin. Uses /api/portal/liquidate (no session) and
+# /api/clients/*/deactivate (operator-gated) as representative mutating
+# routes from each family; a 401/404 past the CSRF check (rather than
+# CSRF's own 403) is proof the request reached the next layer.
+# --------------------------------------------------------------------------
+
+
+def test_csrf_rejects_a_mismatched_origin_on_the_client_portal(client):
+    resp = client.post("/api/portal/liquidate", headers={"Origin": "https://evil.example"})
+    assert resp.status_code == 403
+
+
+def test_csrf_rejects_a_mismatched_origin_on_admin_client_mutations(client):
+    resp = client.post("/api/clients/7/deactivate", headers={"Origin": "https://evil.example"})
+    assert resp.status_code == 403
+
+
+def test_csrf_allows_a_matching_origin(client):
+    # Same host the `client` fixture's own base_url uses.
+    resp = client.post("/api/portal/liquidate", headers={"Origin": "http://127.0.0.1"})
+    assert resp.status_code == 401  # past CSRF; rejected only for lack of a portal session
+
+
+def test_csrf_allows_a_missing_origin(client):
+    """Non-browser API clients (curl, server-to-server) don't send Origin at
+    all — this must not be treated as a mismatch."""
+    resp = client.post("/api/portal/liquidate")
+    assert resp.status_code == 401  # past CSRF; rejected only for lack of a portal session
+
+
+def test_csrf_does_not_apply_to_get_requests(client):
+    """Only state-changing POSTs are checked — a cross-origin GET (reads,
+    not mutations) is unaffected."""
+    resp = client.get("/api/portal/positions", headers={"Origin": "https://evil.example"})
+    assert resp.status_code == 401  # rejected for lack of a session, not CSRF's 403
 
 
 # --------------------------------------------------------------------------

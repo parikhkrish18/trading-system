@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import re
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -30,6 +31,23 @@ from config.settings import settings
 from data.ingest.db import upsert_dataframe
 
 FOMC_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _eastern_to_utc(date: dt.date, hour: int, minute: int) -> dt.datetime:
+    """
+    Build a UTC timestamp for a wall-clock Eastern time on `date`, DST-aware.
+
+    A hardcoded UTC offset (e.g. "2pm ET is 18:00 UTC") is only true for
+    half the year -- EDT (UTC-4), roughly mid-March to early November. The
+    other half (EST, UTC-5) it's 19:00 UTC, and hand-rolling "second Sunday
+    in March to first Sunday in November" is exactly the kind of date-math
+    stdlib's zoneinfo already gets right (including the rare edge cases,
+    like a transition falling on the event date itself).
+    """
+    local = dt.datetime.combine(date, dt.time(hour, minute), tzinfo=_EASTERN)
+    return local.astimezone(dt.UTC)
 FRED_RELEASES_URL = "https://api.stlouisfed.org/fred/releases"
 FRED_RELEASE_DATES_URL = "https://api.stlouisfed.org/fred/release/dates"
 _USER_AGENT = "trading-system-macro-calendar/1.0 (personal research bot)"
@@ -76,8 +94,8 @@ def _parse_fomc_row(row, year: int) -> dict | None:
         decision_date = dt.datetime.strptime(date_str, "%Y%m%d").date()
     else:
         # Future meeting, no statement yet: fall back to the last day of the
-        # published date range (e.g. "17-18*" -> 18th), approximate 2pm ET
-        # statement release as 18:00 UTC (matches the existing seed list).
+        # published date range (e.g. "17-18*" -> 18th), approximate the
+        # statement release as 2pm ET (converted to UTC below, DST-aware).
         digits_only = re.sub(r"[^\d-]", "", date_el.get_text(strip=True))
         try:
             last_day = int(digits_only.split("-")[-1])
@@ -87,7 +105,7 @@ def _parse_fomc_row(row, year: int) -> dict | None:
 
     return {
         "event_name": "FOMC Decision",
-        "ts": dt.datetime.combine(decision_date, dt.time(18, 0), tzinfo=dt.UTC),
+        "ts": _eastern_to_utc(decision_date, 14, 0),
         "category": "FOMC",
         "notes": "",
     }
@@ -165,7 +183,9 @@ def fetch_fred_events(months_ahead: int = 6) -> pd.DataFrame:
             rows.append(
                 {
                     "event_name": event_name,
-                    "ts": dt.datetime.combine(release_date, dt.time(12, 30), tzinfo=dt.UTC),
+                    # 8:30am ET, DST-aware (see _eastern_to_utc) -- not a
+                    # hardcoded 12:30 UTC, which is only correct during EDT.
+                    "ts": _eastern_to_utc(release_date, 8, 30),
                     "category": category,
                     "notes": "",
                 }

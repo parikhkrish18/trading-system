@@ -15,6 +15,34 @@ def test_confidence_scaled_size_saturates_at_max():
     assert size == pytest.approx(0.25)
 
 
+def test_confidence_scaled_size_nan_forecast_scale_returns_zero():
+    """
+    `forecast_scale <= 0` alone doesn't catch NaN (NaN comparisons are
+    always False in Python) — a NaN scale (e.g. std() of a too-small
+    training frame, see models/screener.py) has to be caught explicitly, or
+    it flows straight through np.clip into a NaN position size.
+    """
+    size = confidence_scaled_size(forecast=0.05, forecast_scale=float("nan"), max_position_pct=0.25)
+    assert size == 0.0
+
+
+def test_correlation_adjusted_size_logs_when_a_pair_is_unmeasured(caplog):
+    """A symbol pair missing from the correlation matrix silently contributes
+    0 to correlated exposure (conservative-in-math, but the gap must be
+    visible rather than silently ignored)."""
+    corr = pd.DataFrame({"TQQQ": [1.0]}, index=["TQQQ"])  # no SQQQ column/row at all
+    with caplog.at_level("WARNING"):
+        size = correlation_adjusted_size(
+            proposed_size=0.30,
+            symbol="SQQQ",
+            current_positions={"TQQQ": 0.45},
+            correlation_matrix=corr,
+            max_correlated_exposure_pct=0.50,
+        )
+    assert size == pytest.approx(0.30)  # unmeasured pair treated as uncorrelated
+    assert any("no correlation data" in r.message for r in caplog.records)
+
+
 def test_confidence_scaled_size_scales_linearly_below_saturation():
     size = confidence_scaled_size(forecast=0.5, forecast_scale=1.0, max_position_pct=0.25)
     assert size == pytest.approx(0.125)

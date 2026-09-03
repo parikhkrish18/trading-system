@@ -216,8 +216,8 @@ function newsFeedHTML(items) {
       const sentLabel = n.sentiment === null || n.sentiment === undefined ? "unscored" : fmt.num(n.sentiment, 2);
       return `
         <div class="news-row">
-          <div class="news-headline">${n.headline}</div>
-          <div class="news-meta"><span class="${sentClass}">${sentLabel}</span> · ${fmt.time(n.ts)} · ${n.source || ""}</div>
+          <div class="news-headline">${escapeHTML(n.headline)}</div>
+          <div class="news-meta"><span class="${sentClass}">${sentLabel}</span> · ${fmt.time(n.ts)} · ${escapeHTML(n.source || "")}</div>
         </div>`;
     })
     .join("");
@@ -272,7 +272,7 @@ function positionCardHTML(p, idx, newsBySymbol) {
   return `
     <div class="position-card">
       <div class="position-card-head">
-        <span class="position-symbol">${p.symbol}</span>
+        <span class="position-symbol">${escapeHTML(p.symbol)}</span>
         <span class="side-badge ${p.side}">${p.side}</span>
       </div>
       <div class="position-grid-stats">
@@ -341,12 +341,16 @@ async function loadEquity() {
   const values = rows.map((r) => r.equity_value);
   const latest = values[values.length - 1];
   const peak = Math.max(...values);
-  const drawdown = peak > 0 ? latest / peak - 1 : 0;
+  // peak <= 0 means every equity snapshot seen (including the latest) is
+  // non-positive -- a corrupted feed, not "no drawdown". Reporting 0% here
+  // would silently hide exactly the situation someone most needs to see,
+  // so this surfaces as a clear "N/A" instead of a fake number.
+  const drawdown = peak > 0 ? latest / peak - 1 : null;
 
   document.getElementById("equity-summary").innerHTML = `
     <div class="stat-card"><div class="value">${fmt.money(latest)}</div><div class="label">Current equity</div></div>
     <div class="stat-card"><div class="value">${fmt.money(peak)}</div><div class="label">Peak equity</div></div>
-    <div class="stat-card ${drawdown >= 0 ? "good" : "bad"}"><div class="value">${fmt.pct(drawdown)}</div><div class="label">Current drawdown</div></div>
+    <div class="stat-card ${drawdown === null ? "bad" : drawdown >= 0 ? "good" : "bad"}"><div class="value">${drawdown === null ? "N/A" : fmt.pct(drawdown)}</div><div class="label">Current drawdown${drawdown === null ? " (peak equity is not positive)" : ""}</div></div>
   `;
 
   // regime_history is dense (daily); equity snapshots are sparser -- for each
@@ -369,11 +373,16 @@ async function loadEquity() {
     { color: "#5b8cff", regimeAt: sortedRegimes.length ? regimeAt : null }
   );
 
+  // Same "don't fake a 0%" rule as the summary tile above, applied point by
+  // point: a point whose running peak isn't positive yet is dropped from
+  // the series rather than plotted as a misleading flat 0% drawdown.
   let runningPeak = -Infinity;
-  const ddPoints = rows.map((r) => {
-    runningPeak = Math.max(runningPeak, r.equity_value);
-    return { y: runningPeak > 0 ? r.equity_value / runningPeak - 1 : 0, label: r.ts };
-  });
+  const ddPoints = rows
+    .map((r) => {
+      runningPeak = Math.max(runningPeak, r.equity_value);
+      return runningPeak > 0 ? { y: r.equity_value / runningPeak - 1, label: r.ts } : null;
+    })
+    .filter((p) => p !== null);
   renderLineChart(document.getElementById("drawdown-chart"), ddPoints, { color: "#e5484d", zeroLine: true });
 }
 
@@ -401,7 +410,7 @@ async function loadClosedTrades() {
       const plClass = t.realized_pnl >= 0 ? "pl-pos" : "pl-neg";
       return `
       <tr>
-        <td><strong>${t.symbol}</strong></td>
+        <td><strong>${escapeHTML(t.symbol)}</strong></td>
         <td><span class="side-badge ${t.side}">${t.side}</span></td>
         <td>${fmt.time(t.entry_ts)}</td>
         <td>${fmt.time(t.exit_ts)}</td>

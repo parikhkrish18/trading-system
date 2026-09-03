@@ -83,6 +83,8 @@ rm ~/Library/LaunchAgents/com.trading-system.news-stream.plist
   is missed — check `logs/weekly-cycle.log` periodically. `news-stream` is
   the same story in reverse: it just stops collecting news while the Mac is
   off/asleep and picks back up on wake/login, it doesn't backfill the gap.
-- `--feature-set-id v3` and `--top-k 10` are baked into the plist; edit
-  `ProgramArguments` and reload (`launchctl unload` + `launchctl load`) to
-  change them.
+- `--feature-set-id v4` is baked into the plist; edit `ProgramArguments`
+  and reload (`launchctl unload` + `launchctl load`) to change it.
+  `scripts/run_weekly_cycle.py` has no `--top-k` flag — the diversified
+  book's size is `SCREENER_TOP_K` (config/settings.py, default 10), an env
+  var read at runtime, not a CLI argument, so it's set in `.env`, not here.

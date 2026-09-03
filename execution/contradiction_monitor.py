@@ -22,7 +22,15 @@ rather than leaving it in cash until next week -- see _attempt_reactivation.
 The strategy doesn't change, it just doesn't have to wait for Monday.
 
 Safety boundary, same as trading_loop.py: only ever calls get_broker()
-without confirm_live=True.
+without confirm_live=True, so it can never fire a live order on the MASTER
+account no matter what TRADING_MODE is set to.
+
+That guarantee is scoped to the master account only. This file also calls
+check_all_clients_risk(...) and replicate_to_clients(...) below, both of
+which submit real orders on each client's OWN broker account whenever
+CLIENT_TRADING_ENABLED is True -- a separate switch from TRADING_MODE, and
+real money regardless of whether the master account above is trading paper
+or live. See execution/client_risk_controls.py and execution/client_fanout.py.
 
 Usage:
     python -m execution.contradiction_monitor
@@ -42,7 +50,7 @@ from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.news import ingest_news
 from data.ingest.universe import load_active_universe
 from execution import hold_rules
-from execution.approval_gate import ProposedTrade, request_approval, send_followup
+from execution.approval_gate import ProposedTrade, advisory_lock, request_approval, send_followup
 from execution.broker import get_broker
 from execution.client_fanout import replicate_to_clients
 from execution.client_risk_controls import check_all_clients_risk
@@ -51,6 +59,8 @@ from execution.trading_loop import (
     _allocation_confirmation,
     _apply_allocation,
     _correlation_matrix,
+    _flatten_and_alert,
+    _run_breaker_check,
     current_pnl_by_symbol,
 )
 from features.qualitative.sentiment import backfill_unscored_news
@@ -79,6 +89,13 @@ _MOMENTUM_WINDOW_DAYS = 5
 
 # Don't bother re-screening for a sliver of freed capital too small to matter.
 _MIN_REACTIVATION_FRACTION = 0.05
+
+# One fixed key for "an hourly contradiction-check pass is running" — a slow
+# news backfill call can push one run past the next hourly trigger, and two
+# overlapping passes would double-submit closes/reactivations against the
+# same positions. Distinct from approval_gate.APPROVAL_LOCK_KEY (that one
+# guards Telegram's single-consumer getUpdates poll, a different resource).
+_CONTRADICTION_LOCK_KEY = 903218
 
 
 @dataclasses.dataclass
@@ -475,12 +492,45 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     the freed capital (_attempt_reactivation, itself gated the same way)
     rather than leaving it idle until next week. No-ops cleanly if nothing
     is held or nothing contradicts.
+
+    Runs under advisory_lock(_CONTRADICTION_LOCK_KEY): this fires hourly, and
+    a slow pass (e.g. the news backfill call below) can run long enough to
+    still be going when the next hourly trigger fires. A second overlapping
+    call finds the lock held and no-ops (logs and returns []) rather than
+    double-processing the same positions.
     """
+    with advisory_lock(_CONTRADICTION_LOCK_KEY) as got_lock:
+        if not got_lock:
+            logger.warning(
+                "Another contradiction-check pass is already running (advisory lock held) — "
+                "skipping this run rather than double-processing. It will run again next hour."
+            )
+            return []
+        return _run_contradiction_check(request_fn)
+
+
+def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
+    """The actual check, run under run_contradiction_check's advisory lock — see its docstring."""
     broker = get_broker()  # never passes confirm_live=True — paper-only by construction
     engine = get_engine()
 
     if hasattr(broker, "client") and not broker.client.get_clock().is_open:
         logger.info("Market is closed — skipping this check (runs hourly during market hours).")
+        return []
+
+    # Master-account circuit breakers (risk/circuit_breakers.py) — the same
+    # checks the weekly cycle runs before/after trading (trading_loop.py's
+    # _run_breaker_check). This hourly monitor is documented everywhere as
+    # the emergency brake between weekly cycles, but until now it only ever
+    # checked the two contradiction signals below, never the master
+    # account's own risk limits — a breach between Mondays went unnoticed
+    # until the next weekly cycle. A trip here flattens the master account
+    # exactly like a weekly-cycle trip does (same alert, same flatten call,
+    # see _flatten_and_alert) and skips the rest of this pass.
+    breaker_triggers = _run_breaker_check(broker, engine)
+    if breaker_triggers:
+        reasons = "; ".join(r.reason for r in breaker_triggers)
+        _flatten_and_alert(broker, reasons)
         return []
 
     # Client self-service risk controls (max-drawdown auto-close,

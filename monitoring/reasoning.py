@@ -482,6 +482,28 @@ def phase_execution(
     return {"phase": 5, "title": "Execution", "summary": summary, "lines": lines}
 
 
+def phase_execution_skipped(symbol: str, reason: str) -> dict:
+    """
+    Phase 5, for an approved pick that never got an order because execution
+    itself couldn't proceed -- e.g. no current price to size it with.
+    Distinct from phase_execution_rejected (a human said no): this pick WAS
+    approved, target_position on its decisions row is still whatever the
+    human agreed to, and this phase is what explains why 0 shares were ever
+    sent despite that -- so the audit trail doesn't quietly read as "opened
+    0 shares" when nothing was attempted at all.
+    """
+    summary = f"{symbol}: approved, but not executed — {reason}."
+    return {
+        "phase": 5,
+        "title": "Execution",
+        "summary": summary,
+        "lines": [
+            f"This pick was approved, but no order was sent to the broker: {reason}.",
+            "The position was not opened this cycle; it will be reconsidered at the next screen.",
+        ],
+    }
+
+
 def phase_execution_rejected(symbol: str, status: str) -> dict:
     """
     Phase 5, for a proposal that never became an order because the human

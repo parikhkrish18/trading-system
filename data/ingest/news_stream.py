@@ -167,16 +167,28 @@ class NewsStreamBuffer:
         # Same belt-and-suspenders as data/ingest/news.py's fetch_news: Alpaca
         # redelivers an article (a reconnect, or a corrected/updated version
         # pushed again) often enough in practice that two rows with the same
-        # (id, ts) land in one flush window. Postgres's ON CONFLICT DO UPDATE
-        # can't touch the same target row twice in a single statement and
-        # raises CardinalityViolation -- which was crash-looping this process
-        # every time it happened (uncaught inside the flush the websocket
-        # handler calls, so run_stream's outer retry saw it as a fatal
-        # disconnect and reconnected only to hit the next duplicate). Keep
-        # the last delivery of each (id, ts) pair -- it carries any sentiment
-        # correction -- and drop the earlier one before it ever reaches SQL.
-        df = df.drop_duplicates(subset=["id", "ts"], keep="last")
-        n = self._writer(df, table="news_events", conflict_cols=["id", "ts"])
+        # id land in one flush window. Postgres's ON CONFLICT DO UPDATE can't
+        # touch the same target row twice in a single statement and raises
+        # CardinalityViolation -- which was crash-looping this process every
+        # time it happened (uncaught inside the flush the websocket handler
+        # calls, so run_stream's outer retry saw it as a fatal disconnect and
+        # reconnected only to hit the next duplicate). Keep the last delivery
+        # of each id -- it carries any timestamp/sentiment correction -- and
+        # drop the earlier one before it ever reaches SQL. Keyed on id alone
+        # (not id+ts): id alone is the upsert conflict target now (see
+        # data/schema/014_news_id_unique.sql), so two deliveries sharing an
+        # id but disagreeing on ts would otherwise still collide.
+        df = df.drop_duplicates(subset=["id"], keep="last")
+        n = self._writer(
+            df,
+            table="news_events",
+            # See data/ingest/news.py::ingest_news for why this is id alone
+            # and why sentiment/surprise are preserved on conflict -- same
+            # table, same idempotent-id scheme, same "never wipe a score
+            # that's already been computed" requirement.
+            conflict_cols=["id"],
+            preserve_cols=["sentiment", "surprise"],
+        )
         self.total_ingested += n
         logger.info("Flushed %d row(s) to news_events (%d total this run).", n, self.total_ingested)
         return n

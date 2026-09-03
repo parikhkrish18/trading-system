@@ -1,7 +1,10 @@
 import json
 
 import pandas as pd
+import pytest
+from sqlalchemy import text
 
+from data.ingest.db import get_engine, upsert_dataframe
 from features.qualitative import sentiment
 
 
@@ -200,3 +203,76 @@ def test_score_sentiment_batches_in_groups_of_batch_size(monkeypatch):
     sentiment.score_sentiment(headlines)
 
     assert calls == [2, 1]
+
+
+# --------------------------------------------------------------------------
+# backfill_unscored_news: a batch with one id missing from the LLM's
+# response must not crash and must not take the rest of the batch down.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _unscored_news_rows():
+    """Two unscored news_events rows on the real DB, cleaned up after."""
+    engine = get_engine()
+    rows = pd.DataFrame(
+        {
+            "id": [900001, 900002],
+            "symbol": ["ZZZTEST", "ZZZTEST"],
+            "ts": pd.to_datetime(["2026-07-27T12:00:00Z", "2026-07-27T13:00:00Z"], utc=True),
+            "headline": ["headline scores fine", "headline the LLM response omits"],
+            "source": ["test-fixture", "test-fixture"],
+        }
+    )
+    upsert_dataframe(rows, table="news_events", conflict_cols=["id"])
+    yield rows
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM news_events WHERE source = 'test-fixture'"))
+
+
+def test_backfill_unscored_news_survives_a_response_missing_one_id(monkeypatch, _unscored_news_rows):
+    """
+    Regression test, finding #3: score_sentiment leaves sentiment_relevant as
+    pd.NA for any row whose id the LLM's JSON response omits.
+    backfill_unscored_news used to do a raw bool(row["sentiment_relevant"])
+    per row -- bool(pd.NA) raises TypeError, aborting the WHOLE batch
+    transaction (including rows that scored fine), and since the next run
+    re-selects the same oldest batch it hit the same missing id and crashed
+    again forever. The row with a real score must still get written; the
+    row the response omitted must not crash the batch, and should stay
+    unscored (sentiment IS NULL) so it's retried, not permanently skipped.
+    """
+    engine = get_engine()
+    scored_row_id = _unscored_news_rows.iloc[0]["id"]
+    missing_row_id = _unscored_news_rows.iloc[1]["id"]
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        # Omit the second id entirely, simulating a malformed/truncated
+        # LLM response that doesn't cover every headline it was sent.
+        return json.dumps(
+            [
+                {"id": item["id"], "sentiment": 0.4, "reason": "fine", "relevant": True}
+                for item in items
+                if item["id"] == int(scored_row_id)
+            ]
+        )
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+
+    n = sentiment.backfill_unscored_news(batch_size=500)
+
+    assert n == 1  # only the row that actually scored was written
+
+    with engine.connect() as conn:
+        scored = conn.execute(
+            text("SELECT sentiment, sentiment_relevant FROM news_events WHERE id = :id"), {"id": int(scored_row_id)}
+        ).fetchone()
+        missing = conn.execute(
+            text("SELECT sentiment, sentiment_relevant FROM news_events WHERE id = :id"), {"id": int(missing_row_id)}
+        ).fetchone()
+
+    assert scored.sentiment == 0.4
+    assert scored.sentiment_relevant is True
+    assert missing.sentiment is None  # left unscored, not crashed on and not fabricated
+    assert missing.sentiment_relevant is None

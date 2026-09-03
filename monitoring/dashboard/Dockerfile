@@ -28,9 +28,9 @@ COPY . .
 # local docker-compose publish.
 EXPOSE 8501
 # Explicit, deliberate non-loopback bind: a container has to listen on
-# 0.0.0.0 for its published port to work. The token check in server.py
-# reads this same variable, so a networked dashboard without
-# DASHBOARD_API_TOKEN set refuses its mutating endpoints.
+# 0.0.0.0 for its published port to work. server.py's auth middleware reads
+# this same variable, so a networked dashboard without DASHBOARD_PASSWORD
+# set refuses to serve at all rather than opening up unauthenticated.
 ENV DASHBOARD_HOST=0.0.0.0
 # Unbuffered stdout, so a crash loop's traceback reaches the platform log
 # instead of dying in the buffer with the process.

@@ -126,6 +126,18 @@ def test_submit_target_position_rounds_new_short_to_whole_shares(monkeypatch):
     assert client.submitted_orders[0].qty == 9.0
 
 
+def test_submit_target_position_floors_new_short_rather_than_rounding_up(monkeypatch):
+    """
+    Regression test: rounding a new/increased short to the NEAREST whole
+    share could round up past the approved/capped target (e.g. -100.6 ->
+    101), submitting more size than was ever approved. Must floor, exactly
+    like the extended-hours branch already does for the opposite case.
+    """
+    broker, client = _make_broker(monkeypatch)
+    broker.submit_target_position("NVDA", -100.6)
+    assert client.submitted_orders[0].qty == 100.0
+
+
 def test_submit_target_position_skips_short_rounding_to_zero(monkeypatch):
     broker, client = _make_broker(monkeypatch)
     result = broker.submit_target_position("XYZ", -0.4)

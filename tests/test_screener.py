@@ -6,6 +6,7 @@ from models.regime.trend_chop_classifier import TREND
 from models.screener import (
     TradeCandidate,
     _attach_reasoning,
+    _bounded_conviction_weights,
     apply_short_preference,
     attach_exit_levels,
     build_correlation_matrix,
@@ -182,6 +183,113 @@ def test_select_trades_shortable_check_does_not_affect_longs():
     )
 
     assert len(candidates) == 1
+
+
+def test_select_trades_enforces_correlated_exposure_cap_across_its_own_picks():
+    """
+    Regression for the bug where select_trades only checked a new pick
+    against the externally-passed current_positions and never folded its
+    OWN newly-sized picks into that exposure as it went — so four
+    pairwise-correlated symbols, each individually under the cap versus an
+    empty starting book, could each get sized to the full single-position
+    cap independently and land the combined book at 2x the correlated-
+    exposure limit (100% instead of the 50% cap).
+
+    With the fix, exposure accumulates across the loop: the first two picks
+    fill the entire 50% correlated-exposure cap between them (0.25 each),
+    which leaves exactly zero headroom for a third or fourth — so they size
+    to 0 and get filtered out by the ordinary "no signal" skip-check, same
+    as any other zero-sized candidate. The combined book stays at, never
+    over, the cap.
+    """
+    scored = _scored_df(
+        [
+            {"symbol": "A", "predicted_return": 0.20, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "B", "predicted_return": 0.19, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "C", "predicted_return": 0.18, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "D", "predicted_return": 0.17, "direction_agreement": 1.0, "confident": True},
+        ]
+    )
+    symbols = ["A", "B", "C", "D"]
+    # All four pairwise-correlated at 0.9 — well above the 0.7 threshold.
+    corr = pd.DataFrame(0.9, index=symbols, columns=symbols)
+    for s in symbols:
+        corr.loc[s, s] = 1.0
+
+    candidates = select_trades(
+        scored,
+        regime=TREND,
+        forecast_scale=0.05,  # every forecast saturates the confidence scaling
+        max_position_pct=0.25,
+        max_short_position_pct=0.15,
+        max_correlated_exposure_pct=0.50,
+        correlation_matrix=corr,
+        top_k=10,
+        current_positions={},  # empty starting book
+    )
+
+    total_exposure = sum(abs(c.target_position_pct) for c in candidates)
+    assert total_exposure <= 0.50 + 1e-9  # the whole point: never past the cap, unlike the buggy version (1.0)
+    assert total_exposure == pytest.approx(0.50)  # and it's not left needlessly under-deployed either
+    assert {c.symbol for c in candidates} == {"A", "B"}  # first two by rank fill the cap; C/D get zero headroom
+    for c in candidates:
+        assert c.target_position_pct == pytest.approx(0.25)
+
+
+def test_select_trades_does_not_mutate_the_callers_current_positions_dict():
+    """current_positions is folded into internally as each pick is sized, but the caller's own dict must be untouched."""
+    scored = _scored_df(
+        [{"symbol": "A", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    )
+    corr = pd.DataFrame({"A": [1.0]}, index=["A"])
+    caller_positions = {"EXISTING": 0.1}
+
+    select_trades(
+        scored, regime=TREND, forecast_scale=0.05, max_position_pct=0.25,
+        max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr,
+        current_positions=caller_positions,
+    )
+
+    assert caller_positions == {"EXISTING": 0.1}
+
+
+def test_select_trades_skips_nan_sized_candidates(monkeypatch):
+    """
+    A NaN target_position_pct must never survive into a candidate, even if
+    it originates somewhere upstream that isn't itself NaN-guarded — the
+    `abs(size) < 1e-9` skip-check alone doesn't catch NaN (NaN comparisons
+    are always False in Python), so screener.py needs its own explicit
+    isnan check as defense in depth, independent of risk.sizing's own guard.
+    """
+    import models.screener as scr
+
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    )
+    corr = pd.DataFrame({"AAPL": [1.0]}, index=["AAPL"])
+    monkeypatch.setattr(scr, "target_position_size", lambda **kwargs: float("nan"))
+
+    candidates = select_trades(
+        scored, regime=TREND, forecast_scale=0.05, max_position_pct=0.25,
+        max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr,
+    )
+
+    assert candidates == []
+
+
+def test_select_trades_nan_forecast_scale_yields_no_candidates():
+    """Integration-level: a NaN forecast_scale (e.g. std() of a too-small training frame) must not produce a candidate."""
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    )
+    corr = pd.DataFrame({"AAPL": [1.0]}, index=["AAPL"])
+
+    candidates = select_trades(
+        scored, regime=TREND, forecast_scale=float("nan"), max_position_pct=0.25,
+        max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr,
+    )
+
+    assert candidates == []
 
 
 class TestApplyShortPreference:
@@ -450,6 +558,68 @@ def test_select_concentrated_trades_never_forces_a_third_pick_to_hit_max_positio
     assert {c.symbol for c in candidates} == {"AAPL", "MSFT"}
 
 
+class TestBoundedConvictionWeights:
+    """
+    Regression coverage for the water-filling bug: when a dominant leg needs
+    capping AND the other legs need flooring in the SAME iteration, the old
+    code fixed every violating leg to its bound without checking whether
+    those bounds summed to more than the remaining budget — e.g. with
+    production defaults (max_leg_pct=0.70, min_leg_floor_fraction=0.6) and a
+    3-way conviction spread this dominant, [0.70, 0.20, 0.20] summed to
+    1.0999999999999999, a 10% over-deployment.
+    """
+
+    def test_multi_leg_simultaneous_violation_never_exceeds_the_budget(self):
+        # Exact reproduction: one leg wants ~98% of the split (violates the
+        # 0.70 cap) while the other two want ~1% each (violate the 0.20
+        # floor) — ALL THREE violate in the very first water-filling pass.
+        weights = _bounded_conviction_weights([100.0, 1.0, 1.0], max_leg_pct=0.70, min_leg_floor_fraction=0.6)
+
+        assert sum(weights) <= 1.0 + 1e-9
+        assert weights[0] <= 0.70 + 1e-9
+        for w in weights:
+            assert w >= 0.20 - 1e-9  # this feasible case can fully honor the floor too
+        assert sum(weights) == pytest.approx(1.0)  # and does so with the whole book deployed
+
+    def test_multi_leg_violation_regardless_of_which_leg_is_dominant(self):
+        """Same shape, dominant leg in a different position — order shouldn't matter."""
+        weights = _bounded_conviction_weights([1.0, 100.0, 1.0], max_leg_pct=0.70, min_leg_floor_fraction=0.6)
+        assert sum(weights) <= 1.0 + 1e-9
+        assert all(w <= 0.70 + 1e-9 for w in weights)
+        assert sum(weights) == pytest.approx(1.0)
+
+    def test_never_exceeds_the_cap_or_the_budget_across_many_conviction_spreads(self):
+        """Broader sweep at production bounds: no spread should ever push a leg over its cap or the total over 1.0."""
+        max_leg_pct, min_leg_floor_fraction = 0.70, 0.6
+        spreads = [
+            [100.0, 1.0, 1.0],
+            [1.0, 1.0, 100.0],
+            [50.0, 49.0, 1.0],
+            [0.04, 0.02, 0.001],
+            [10.0, 10.0],
+            [10.0, 0.01],
+            [1.0, 1.0, 1.0, 1.0],
+        ]
+        for scores in spreads:
+            weights = _bounded_conviction_weights(scores, max_leg_pct=max_leg_pct, min_leg_floor_fraction=min_leg_floor_fraction)
+            assert sum(weights) <= 1.0 + 1e-9, scores
+            assert all(w <= max_leg_pct + 1e-9 for w in weights), scores
+
+    def test_logs_a_warning_when_the_floor_cannot_be_honored_within_the_cap(self, caplog):
+        """
+        Genuinely infeasible bounds (max_leg_pct below what an equal split
+        would need) can't honor every floor without breaching the cap or the
+        1.0 total — both of those are the hard invariants, so the floor
+        yields, and that under-deployment must be logged, not silent.
+        """
+        with caplog.at_level("WARNING"):
+            weights = _bounded_conviction_weights([1.0, 1.0], max_leg_pct=0.3, min_leg_floor_fraction=0.6)
+
+        assert sum(weights) <= 1.0 + 1e-9
+        assert sum(weights) < 1.0 - 1e-9  # genuinely under-deployed, not just capped exactly at 1.0
+        assert any("under-deployed" in r.message for r in caplog.records)
+
+
 def test_attach_reasoning_picks_top_features_by_absolute_contribution():
     scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
     candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
@@ -612,6 +782,66 @@ def test_run_screen_diversified_honors_full_deployment(monkeypatch):
 
     # One pick under a 25% cap: scaled up to the cap, shortfall logged, never past it.
     assert result[0].target_position_pct == pytest.approx(0.25)
+
+
+def test_run_screen_diversified_threads_current_positions_to_select_trades(monkeypatch):
+    """run_screen_with_scores must pass its caller's current_positions through to select_trades, not default it away."""
+    scr, calls = _run_screen_harness(monkeypatch, "diversified")
+
+    scr.run_screen("v3", ["A"], current_positions={"EXISTING": 0.1})
+
+    assert calls["diversified"]["current_positions"] == {"EXISTING": 0.1}
+
+
+def test_run_screen_diversified_defaults_current_positions_to_none_when_not_given(monkeypatch):
+    """No broker/portfolio context available (e.g. offline scoring) -> select_trades sees None, which it treats as {}."""
+    scr, calls = _run_screen_harness(monkeypatch, "diversified")
+
+    scr.run_screen("v3", ["A"])
+
+    assert calls["diversified"]["current_positions"] is None
+
+
+def test_run_screen_diversified_skips_screening_on_nan_forecast_scale(monkeypatch):
+    """
+    A training frame with <=1 usable row makes std() (forecast_scale) NaN —
+    every downstream size would be NaN too, so the cycle must be skipped
+    rather than shortlisting against a meaningless scale.
+    """
+    import models.screener as scr
+
+    monkeypatch.setattr(scr.settings, "strategy_mode", "diversified")
+    monkeypatch.setattr(scr.settings, "screener_top_k", 7)
+    monkeypatch.setattr(scr.settings, "full_deployment", False)
+    monkeypatch.setattr(scr.settings, "max_single_position_pct", 0.25)
+    monkeypatch.setattr(scr.settings, "max_short_position_pct", 0.15)
+    monkeypatch.setattr(scr.settings, "max_correlated_exposure_pct", 0.50)
+
+    dates = pd.bdate_range("2026-01-01", periods=1, tz="UTC")
+    train_df = pd.DataFrame(
+        {
+            "symbol": ["A"], "ts": dates, "close": [1.0], "fwd_return": [0.01], "target": [0.01], "f1": [1],
+        }
+    )
+    monkeypatch.setattr(scr, "load_training_frame", lambda *a, **k: train_df)
+
+    class _NoopEnsemble:
+        def __init__(self, n_models=5): ...
+        def fit(self, X, y): ...
+
+    monkeypatch.setattr(scr, "EnsembleForecastModel", _NoopEnsemble)
+    monkeypatch.setattr(scr, "load_latest_features", lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3]}))
+    monkeypatch.setattr(scr, "score_universe", lambda *a, **k: _scored_df(
+        [{"symbol": "A", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    ))
+    called = {}
+    monkeypatch.setattr(scr, "select_trades", lambda *a, **k: called.setdefault("ran", True))
+    monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+
+    result = scr.run_screen("v3", ["A"])
+
+    assert result == []
+    assert "ran" not in called  # select_trades never even called
 
 
 def test_attach_reasoning_diversified_wording_tells_the_topk_story():

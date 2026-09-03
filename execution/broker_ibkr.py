@@ -191,7 +191,16 @@ class IBKRBroker:
             "symbol": symbol,
             "side": side,
             "qty": qty,
+            # "id" is the cross-broker contract trading_loop.py's
+            # _order_states reads to re-query get_order() after submission
+            # (see get_order's docstring above) -- AlpacaBroker.submit_target_position
+            # returns order.model_dump(), whose primary key is "id", so this
+            # is kept as an alias of "order_id" rather than renaming that key
+            # (other callers already read "order_id" directly) so both
+            # brokers speak the same "id" contract without special-casing
+            # either broker in trading_loop.py.
             "order_id": trade.order.orderId,
+            "id": trade.order.orderId,
             "status": trade.orderStatus.status,
         }
 

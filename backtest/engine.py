@@ -132,6 +132,20 @@ class BacktestEngine:
                         {"date": date, "symbol": sym, "trade_shares": trade_shares, "price": price, "cost": cost}
                     )
 
+                # Re-mark AFTER the rebalance: cash/shares above were just
+                # mutated by today's trades (and their transaction costs),
+                # so the pre-trade portfolio_value snapshotted at the top of
+                # this iteration is now stale for THIS date. Storing that
+                # stale value would report every rebalance date's equity as
+                # if its own costs hadn't happened yet — they'd only show up
+                # as an artificial one-day-lagged drop tomorrow, and
+                # wouldn't show up at all if this date is the backtest's
+                # last one.
+                portfolio_value = cash
+                for sym, df in prices.items():
+                    if date in df.index:
+                        portfolio_value += shares[sym] * df.loc[date, "close"]
+
             position_log.append({"date": date, **{sym: shares[sym] for sym in prices}})
             equity_curve[date] = portfolio_value
 

@@ -88,7 +88,7 @@ def test_create_client_rejects_bad_alpaca_credentials(monkeypatch, client):
 
     resp = client.post(
         "/api/clients",
-        json={"name": "alice", "alpaca_api_key": "bad", "alpaca_api_secret": "bad", "password": "pw12345"},
+        json={"name": "alice", "alpaca_api_key": "bad", "alpaca_api_secret": "bad", "password": "pw123456"},
     )
 
     assert resp.status_code == 400
@@ -99,6 +99,15 @@ def test_create_client_rejects_bad_alpaca_credentials(monkeypatch, client):
 def test_create_client_requires_name_and_password(monkeypatch, client):
     resp = client.post("/api/clients", json={"name": "", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": ""})
     assert resp.status_code == 400
+
+
+def test_create_client_rejects_a_too_short_password(monkeypatch, client):
+    resp = client.post(
+        "/api/clients",
+        json={"name": "alice", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "short1"},
+    )
+    assert resp.status_code == 400
+    assert "8 characters" in resp.json()["detail"]
 
 
 def test_create_client_succeeds_and_reports_trading_disabled(monkeypatch, client):
@@ -113,7 +122,7 @@ def test_create_client_succeeds_and_reports_trading_disabled(monkeypatch, client
         "/api/clients",
         json={
             "name": "alice", "alpaca_api_key": "PKGOODKEY", "alpaca_api_secret": "goodsecret",
-            "margin_enabled": True, "password": "pw12345",
+            "margin_enabled": True, "password": "pw123456",
         },
     )
 
@@ -141,7 +150,7 @@ def test_create_client_buys_in_immediately_when_trading_enabled(monkeypatch, cli
 
     resp = client.post(
         "/api/clients",
-        json={"name": "bob", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw12345"},
+        json={"name": "bob", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw123456"},
     )
 
     assert resp.status_code == 200
@@ -158,7 +167,7 @@ def test_create_client_rejects_leverage_above_the_hard_cap(monkeypatch, client):
     resp = client.post(
         "/api/clients",
         json={
-            "name": "pat", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw12345",
+            "name": "pat", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw123456",
             "margin_enabled": True, "leverage_multiplier": 4,
         },
     )
@@ -170,7 +179,7 @@ def test_create_client_rejects_leverage_without_margin(monkeypatch, client):
     resp = client.post(
         "/api/clients",
         json={
-            "name": "quinn", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw12345",
+            "name": "quinn", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw123456",
             "margin_enabled": False, "leverage_multiplier": 2,
         },
     )
@@ -187,7 +196,7 @@ def test_create_client_accepts_valid_leverage(monkeypatch, client):
     resp = client.post(
         "/api/clients",
         json={
-            "name": "rae", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw12345",
+            "name": "rae", "alpaca_api_key": "k", "alpaca_api_secret": "s", "password": "pw123456",
             "margin_enabled": True, "leverage_multiplier": 2,
         },
     )
@@ -271,6 +280,7 @@ def test_list_clients_masks_the_api_key(monkeypatch, client):
 def test_deactivate_client_writes_active_false(monkeypatch, client):
     engine = _FakeEngine()
     monkeypatch.setattr(server, "get_engine", lambda: engine)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame([{"id": 7}]))
 
     resp = client.post("/api/clients/7/deactivate")
 
@@ -279,14 +289,51 @@ def test_deactivate_client_writes_active_false(monkeypatch, client):
     assert engine.executed[0][1] == (7,)
 
 
+def test_deactivate_client_404s_for_an_unknown_client(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["id"]))
+
+    resp = client.post("/api/clients/999/deactivate")
+
+    assert resp.status_code == 404
+
+
+def test_reactivate_client_writes_active_true(monkeypatch, client):
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame([{"id": 7}]))
+
+    resp = client.post("/api/clients/7/reactivate")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"id": 7, "active": True}
+    assert engine.executed[0][1] == (7,)
+
+
+def test_reactivate_client_404s_for_an_unknown_client(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["id"]))
+
+    resp = client.post("/api/clients/999/reactivate")
+
+    assert resp.status_code == 404
+
+
 def test_reset_client_password_requires_new_password(monkeypatch, client):
     resp = client.post("/api/clients/7/reset_password", json={"new_password": ""})
     assert resp.status_code == 400
 
 
+def test_reset_client_password_rejects_a_too_short_password(monkeypatch, client):
+    resp = client.post("/api/clients/7/reset_password", json={"new_password": "short1"})
+    assert resp.status_code == 400
+    assert "8 characters" in resp.json()["detail"]
+
+
 def test_reset_client_password_hashes_before_storing(monkeypatch, client):
     engine = _FakeEngine()
     monkeypatch.setattr(server, "get_engine", lambda: engine)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame([{"id": 7}]))
 
     resp = client.post("/api/clients/7/reset_password", json={"new_password": "new-secret-pw"})
 
@@ -294,6 +341,15 @@ def test_reset_client_password_hashes_before_storing(monkeypatch, client):
     stored_hash = engine.executed[0][1][0]
     assert stored_hash != "new-secret-pw"
     assert client_crypto.verify_password("new-secret-pw", stored_hash) is True
+
+
+def test_reset_client_password_404s_for_an_unknown_client(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["id"]))
+
+    resp = client.post("/api/clients/999/reset_password", json={"new_password": "new-secret-pw"})
+
+    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------
@@ -325,8 +381,36 @@ _ALICE_PASSWORD = "clientpass123"
 _ALICE_PASSWORD_HASH = client_crypto.hash_password(_ALICE_PASSWORD)
 
 
-def _client_row_df(client_id=1, name="alice", password_hash=_ALICE_PASSWORD_HASH, active=True):
-    return pd.DataFrame([{"id": client_id, "name": name, "password_hash": password_hash, "active": active}])
+def _client_row_df(client_id=1, name="alice", password_hash=_ALICE_PASSWORD_HASH, active=True, trading_paused=False):
+    return pd.DataFrame(
+        [{"id": client_id, "name": name, "password_hash": password_hash, "active": active, "trading_paused": trading_paused}]
+    )
+
+
+def test_portal_page_escapes_a_malicious_client_name(monkeypatch, client):
+    """
+    Stored-XSS regression guard: the client name is operator-entered (see
+    execution/client_fanout.py) but still lands directly in the portal
+    page's markup as __CLIENT_NAME__ -- a name containing a script tag or
+    an onerror handler must never reach the response unescaped.
+    """
+    evil_name = '<script>alert(1)</script><img src=x onerror=alert(2)>'
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df(name=evil_name))
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    resp = client.get("/portal")
+
+    assert resp.status_code == 200
+    # The page's own legitimate <script> block is expected -- what must
+    # never appear is the *injected* markup surviving as real HTML rather
+    # than inert escaped text.
+    assert "<script>alert(1)" not in resp.text
+    assert "<img src=x onerror=alert(2)>" not in resp.text
+    # The escaped form is present -- proof this actually rendered the name
+    # (inert, as plain text) rather than stripping it silently.
+    assert "&lt;script&gt;alert(1)" in resp.text
+    assert "&lt;img src=x onerror=alert(2)&gt;" in resp.text
 
 
 def test_portal_login_wrong_password_returns_401(monkeypatch, client):
@@ -346,6 +430,40 @@ def test_portal_login_inactive_client_rejected(monkeypatch, client):
     resp = client.post("/portal/login", data={"name": "alice", "password": _ALICE_PASSWORD})
 
     assert resp.status_code == 401
+
+
+def test_portal_login_calls_verify_password_even_for_a_nonexistent_name(monkeypatch, client):
+    """
+    Timing side-channel guard: verify_password (a ~600,000-iteration PBKDF2
+    check) must run for a name that isn't in `clients` at all, not just for
+    a real one -- short-circuiting before ever calling it is exactly the
+    timing gap that would let an attacker enumerate real client names by
+    how long /portal/login takes to respond.
+    """
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["id", "password_hash", "active"]))
+    calls = []
+    monkeypatch.setattr(server, "verify_password", lambda password, stored: calls.append((password, stored)) or False)
+
+    resp = client.post("/portal/login", data={"name": "ghost", "password": "whatever"})
+
+    assert resp.status_code == 401
+    assert len(calls) == 1
+    assert calls[0] == ("whatever", server._DUMMY_PASSWORD_HASH)
+
+
+def test_portal_login_compares_against_the_real_hash_when_the_name_exists(monkeypatch, client):
+    """The flip side: a real client's own stored hash is what gets compared, not the dummy."""
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    calls = []
+    monkeypatch.setattr(server, "verify_password", lambda password, stored: calls.append((password, stored)) or False)
+
+    resp = client.post("/portal/login", data={"name": "alice", "password": "whatever"})
+
+    assert resp.status_code == 401
+    assert len(calls) == 1
+    assert calls[0] == ("whatever", _ALICE_PASSWORD_HASH)
 
 
 def test_portal_endpoints_require_a_session(client):
@@ -387,7 +505,35 @@ def test_portal_positions_authenticated(monkeypatch, client):
 
     resp = client.get("/api/portal/positions")
     assert resp.status_code == 200
-    assert resp.json() == fake_positions
+
+
+def test_portal_positions_does_not_leak_the_raw_exception_to_the_client(monkeypatch, client, caplog):
+    """
+    A broker failure (e.g. a credential-decryption error from
+    _client_broker()) must be logged server-side, not forwarded verbatim to
+    the client -- internal state (a decryption error's own message, an
+    Alpaca error string) has no business crossing that trust boundary.
+    """
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df())
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    secret_detail = "decryption failed: CLIENT_KEY_ENCRYPTION_KEY rotated, ciphertext abc123==)"
+
+    class _FakeClientBroker:
+        def get_positions_detailed(self):
+            raise RuntimeError(secret_detail)
+
+    monkeypatch.setattr(server, "_client_broker", lambda client_id: _FakeClientBroker())
+
+    with caplog.at_level("ERROR"):
+        resp = client.get("/api/portal/positions")
+
+    assert resp.status_code == 502
+    assert secret_detail not in resp.text
+    assert "Could not reach your Alpaca account" in resp.json()["detail"]
+    # The real detail is still findable server-side, just not in the response.
+    assert secret_detail in caplog.text
 
 
 def test_portal_trades_excludes_reasoning_and_forecast_fields(monkeypatch, client):
@@ -494,6 +640,34 @@ def test_portal_liquidate_flattens_and_pauses(monkeypatch, client):
     assert update_params == ("client_liquidate", 1)
     insert_params = next(p for sql, p in engine.executed if "INSERT INTO client_orders" in sql)
     assert insert_params == (1, "ALL", "client_liquidate")
+
+
+def test_portal_liquidate_is_idempotent_when_already_paused(monkeypatch, client):
+    """
+    A double-click, or a race with an auto-triggered max_drawdown/
+    profit_target pause landing between two clicks, must not fire
+    flatten_all() twice or write two client_orders audit rows for one
+    logical liquidation -- the real harm a missing idempotency check causes.
+    Simulates the already-paused state directly (a stateless
+    already-paused-before-this-request read) rather than a literal
+    double-call, per the same "simulate it" pattern used for the timing
+    guard above.
+    """
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: _client_row_df(trading_paused=True))
+    _log_in_as(client, client_id=1, password_hash=_ALICE_PASSWORD_HASH)
+
+    broker = _FakeRiskBroker()
+    monkeypatch.setattr(server, "_client_broker", lambda client_id: broker)
+    engine = _FakeEngine()
+    monkeypatch.setattr(server, "get_engine", lambda: engine)
+
+    resp = client.post("/api/portal/liquidate")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "already_paused", "trading_paused": True}
+    assert broker.flatten_calls == 0  # never touched the broker
+    assert engine.executed == []  # no duplicate UPDATE, no duplicate client_orders row
 
 
 def test_portal_liquidate_502s_when_broker_unreachable_and_does_not_pause(monkeypatch, client):

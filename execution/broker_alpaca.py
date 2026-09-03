@@ -204,7 +204,13 @@ class AlpacaBroker:
         qty = abs(round(delta, 4))
 
         if side == OrderSide.SELL and target_shares < 0:
-            qty = float(round(qty))
+            # Truncate, never round up: rounding up here can request more
+            # shares short than the approved/capped target allowed, the same
+            # over-the-cap failure mode the extended-hours branch below
+            # documents for the opposite case (a sell that would exceed what
+            # is actually held). Flooring is always safe here too, since it
+            # never asks for more size than was actually approved.
+            qty = float(int(qty))
             if qty < 1:
                 logger.info("Skipping %s: rounds to 0 whole shares for a short order.", symbol)
                 return None

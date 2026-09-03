@@ -116,6 +116,32 @@ def test_small_differences_stay_within_tolerance():
     assert results[0].flagged is False
 
 
+def test_tiny_position_rounding_dust_is_not_a_false_positive():
+    """
+    Regression test: the percentage tolerance breaks down as intended_shares
+    approaches 0 -- intended=0.01, actual=0.011 is a trivial rounding
+    difference (0.001 shares), but as a fraction of 0.01 that is a 10%
+    "divergence", well past the 2% tolerance. Both the position and the gap
+    are economically negligible, so this must not be flagged.
+    """
+    results = reconcile_positions(
+        intended={"SPY": 0.01},
+        actual={"SPY": 0.011},
+        orders={},
+    )
+
+    assert results[0].outcome == FILLED
+    assert results[0].flagged is False
+
+
+def test_a_real_divergence_on_a_larger_position_still_flags_despite_the_dust_floor():
+    """The dust floor must not swallow genuine problems on non-trivial size."""
+    results = reconcile_positions(intended={"SPY": 100.0}, actual={"SPY": 40.0}, orders={})
+
+    assert results[0].outcome == DIVERGED
+    assert results[0].flagged is True
+
+
 def test_an_unrecognised_status_is_treated_as_pending_not_failed():
     """
     Inventing a warning out of a status we don't understand is exactly the

@@ -9,12 +9,15 @@ execution/broker code.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 from collections.abc import Mapping
 
 import numpy as np
 
 from models.regime.trend_chop_classifier import CHOP, TREND
+
+logger = logging.getLogger(__name__)
 
 # Everything is a fraction of portfolio value, so sizes that differ by less
 # than this are the same size in any currency anyone will actually trade.
@@ -32,7 +35,10 @@ def confidence_scaled_size(
     forecast is relative to `forecast_scale` (a typical/expected forecast
     magnitude — e.g. the trailing std of forecasts). Saturates at the max.
     """
-    if forecast_scale <= 0:
+    # NaN comparisons are always False, so `forecast_scale <= 0` alone lets
+    # a NaN scale (e.g. std() of a too-small training frame) straight
+    # through — math.isnan catches what the comparison can't.
+    if forecast_scale <= 0 or math.isnan(forecast_scale):
         return 0.0
     raw = forecast / forecast_scale
     return float(np.clip(raw, -1.0, 1.0) * max_position_pct)
@@ -76,6 +82,17 @@ def correlation_adjusted_size(
             corr = correlation_matrix.loc[symbol, other_symbol]
             if corr > 0.7:
                 correlated_exposure += abs(other_size)
+        else:
+            # An unmeasured pair silently contributes 0 to correlated
+            # exposure rather than being assumed correlated — logged so a
+            # gap in the correlation matrix (a symbol too new for the
+            # lookback window, e.g.) is visible instead of quietly
+            # understating exposure.
+            logger.warning(
+                "correlation_adjusted_size: no correlation data for (%s, %s) — treating as "
+                "uncorrelated for this check.",
+                symbol, other_symbol,
+            )
 
     headroom = max(max_correlated_exposure_pct - correlated_exposure, 0.0)
     if abs(proposed_size) <= headroom:

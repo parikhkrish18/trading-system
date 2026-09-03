@@ -14,6 +14,36 @@ macro calendar refresh, feature build, retraining) following the same
 pattern. Keep each one-shot and idempotent so a missed run just gets caught
 by the next one, or by `Persistent=true` firing it on next boot.
 
+## Every unit a complete self-hosted deployment needs
+
+Ingestion alone doesn't trade anything — a complete deployment needs the
+trading units too. `infra/systemd/` ships:
+
+| Unit(s) | What it runs | Schedule |
+|---|---|---|
+| `price-ingest.service` + `.timer` | `data.ingest.prices` | daily, after close |
+| `macro-calendar-refresh.service` + `.timer` | `data.ingest.macro_calendar` | monthly |
+| `news-stream.service` (no timer — long-running) | `data.ingest.news_stream` | continuous |
+| `weekly-cycle.service` + `.timer` | `scripts.run_weekly_cycle` (universe refresh, ingest, screen, trade) | weekly, Monday 08:00 UTC |
+| `contradiction-monitor.service` + `.timer` | `execution.contradiction_monitor` (mid-week emergency close check) | hourly, weekday market hours |
+
+The last two are the actual trading cycle — without `weekly-cycle` and
+`contradiction-monitor` enabled, the ingestion units above just keep the
+database fresh; nothing ever screens or places an order. See
+`infra/launchd/README.md` for the equivalent macOS jobs (same five units,
+scheduled via `launchd` instead) and `infra/railway/README.md` for how the
+same commands map onto Railway's own cron services.
+
+Install the two trading units the same way as `price-ingest` above:
+
+```bash
+sudo cp infra/systemd/weekly-cycle.service infra/systemd/weekly-cycle.timer /etc/systemd/system/
+sudo cp infra/systemd/contradiction-monitor.service infra/systemd/contradiction-monitor.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now weekly-cycle.timer contradiction-monitor.timer
+systemctl list-timers | grep -E 'weekly-cycle|contradiction-monitor'
+```
+
 ## `news-stream.service` (the one long-running exception)
 
 Every other job above is a one-shot `.service` fired by a `.timer` on a

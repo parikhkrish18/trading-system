@@ -144,7 +144,10 @@ times.
 | `TELEGRAM_BOT_TOKEN` | secret | BotFather |
 | `TELEGRAM_CHAT_ID` | negative number | the group's id — negative because it is a group, not a DM |
 | `DASHBOARD_PASSWORD` | secret | any long random string |
+| `TRUST_PROXY_HEADERS` | `true` | Railway's edge sits in front of the container as a reverse proxy — set this so the dashboard's auth gate reads the real client address/scheme from `X-Forwarded-For`/`X-Forwarded-Proto` instead of the container's own local socket, which a same-host proxy makes indistinguishable from loopback. See `config/settings.py` and `monitoring/dashboard/server.py::_client_is_loopback`. |
 | `FEATURE_SET_ID` | `v4` | must match what features were built with |
+| `CLIENT_KEY_ENCRYPTION_KEY` | secret | generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` — only needed if using client fan-out (adding client Alpaca accounts from the dashboard); leaving it unset is fine otherwise, and `execution/client_crypto.py` raises a clear error the moment it's needed and missing, rather than failing silently |
+| `CLIENT_TRADING_ENABLED` | `false` unless deliberately enabling client fan-out | fixed off by default — flips real client-account trading on, so set it to `true` as its own deliberate change, not bundled into an unrelated deploy |
 
 `DASHBOARD_HOST` is already `0.0.0.0` in the image and does not need
 setting. **Do not set `PORT`** — Railway injects it and routes the domain

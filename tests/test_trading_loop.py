@@ -533,6 +533,57 @@ def test_log_decisions_writes_rejected_rows_with_zero_executed_position(monkeypa
     assert "no order" in nope_phase5["summary"].lower() or "rejected" in nope_phase5["summary"].lower()
 
 
+def test_log_decisions_records_a_no_price_skip_instead_of_a_silent_zero(monkeypatch):
+    """
+    Regression test: a candidate the human approved but that never got an
+    order (no current price to size it with) used to log with no trace of
+    WHY — target_position nonzero, phase 5 reading like an ordinary "opened
+    0 shares". The decisions row must say it was skipped, and why.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+
+    approved = _candidate("NOPRICE", "long", 0.2, agreement=0.9)
+    phase1 = reasoning.phase_pretrade_risk([])
+
+    _real_log_decisions(
+        candidates=[approved],
+        closing_symbols=[],
+        executed={},
+        intended_shares={"NOPRICE": 0.0},
+        feature_set_id="v3",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        approval_status_by_symbol={"NOPRICE": "approved"},
+        skip_reasons={"NOPRICE": "no current price available to size the order"},
+    )
+
+    row = captured["rows"][0]
+    assert row["target_position"] == pytest.approx(0.2)  # what the human actually approved
+    phase5 = next(p for p in json.loads(row["reasoning"]) if p["phase"] == 5)
+    assert "no current price" in phase5["summary"].lower()
+    assert "not executed" in phase5["summary"].lower() or "approved" in phase5["summary"].lower()
+
+
+def test_run_cycle_records_no_price_skip_reason_for_the_decisions_log(monkeypatch):
+    """The run_cycle wiring: a candidate with no post-gate price flows a skip reason into _log_decisions."""
+    captured = {}
+    broker = _FakeBroker()
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("GHOST", "long", 0.1)], {})  # no price for GHOST
+    monkeypatch.setattr(trading_loop, "_log_decisions", lambda *a, **k: captured.update(kwargs=k))
+
+    trading_loop.run_cycle("v3", ["GHOST"])
+
+    assert captured["kwargs"]["skip_reasons"] == {"GHOST": "no current price available to size the order"}
+    assert broker.submitted == []
+
+
 def test_log_decisions_writes_direction_agreement_and_status_for_approved_rows(monkeypatch):
     captured = {}
     monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
@@ -602,6 +653,29 @@ def test_run_cycle_fetches_prices_after_the_gate_not_before(monkeypatch):
     trading_loop.run_cycle("v3", ["AAPL"], request_fn=gate)
 
     assert order.index("gate") < order.index("prices")
+
+
+def test_run_cycle_sizes_using_portfolio_value_fetched_after_the_gate(monkeypatch):
+    """
+    portfolio_value must be read AFTER the approval wait, same as prices —
+    equity can move while a human reply is pending (APPROVAL_MODE=telegram
+    can block up to APPROVAL_TIMEOUT_S). Simulated by having the broker's
+    reported equity change during the gate call itself.
+    """
+    broker = _FakeBroker(portfolio_value=50_000.0)
+    monkeypatch.setattr(trading_loop.settings, "max_single_position_pct", 1.0)
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("AAPL", "long", 0.1)], {"AAPL": 100.0})
+
+    def gate(proposals, *, context, **kwargs):
+        broker._portfolio_value = 100_000.0  # equity moved while the human was deciding
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["AAPL"], request_fn=gate)
+
+    # 100% of the book (single candidate, cap raised) sized off the
+    # POST-wait $100,000 -> 1,000 shares at $100. The stale $50,000 snapshot
+    # would have produced 500.
+    assert dict(broker.submitted)["AAPL"] == pytest.approx(1000.0)
 
 
 # --- approve first, then size ----------------------------------------------
@@ -918,6 +992,37 @@ def test_order_states_works_with_a_broker_that_has_no_get_order():
     submitted = {"SPY": {"id": "o1", "status": "accepted"}}
 
     assert trading_loop._order_states(object(), submitted) == submitted
+
+
+@pytest.mark.parametrize(
+    "order_dict",
+    [
+        # AlpacaBroker.submit_target_position returns order.model_dump(),
+        # keyed by "id" directly.
+        {"id": "alpaca-o1", "status": "accepted"},
+        # IBKRBroker.submit_target_position returns "order_id" plus an "id"
+        # alias (see broker_ibkr.py) so both brokers speak the same contract.
+        {"order_id": 42, "id": 42, "status": "Submitted"},
+    ],
+)
+def test_order_states_calls_get_order_with_the_id_for_both_broker_shapes(order_dict):
+    """
+    Regression test: BROKER defaults to "ibkr", whose submit_target_position
+    used to return only "order_id" — trading_loop's order.get("id") found
+    nothing, so the real order status was never re-queried for the default
+    broker. Both shapes must drive the same get_order(id) call.
+    """
+    calls = []
+
+    class _Broker:
+        def get_order(self, order_id):
+            calls.append(order_id)
+            return {"status": "filled"}
+
+    states = trading_loop._order_states(_Broker(), {"AAPL": order_dict})
+
+    assert calls == [order_dict["id"]]
+    assert states["AAPL"]["status"] == "filled"
 
 
 # --------------------------------------------------------------------------

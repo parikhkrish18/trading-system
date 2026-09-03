@@ -6,8 +6,15 @@ ranked candidates" into "positions actually move at a broker."
 
 Safety boundary, enforced by construction, not by config: this only ever
 calls get_broker() without confirm_live=True, so it can never fire a live
-order no matter what TRADING_MODE is set to. Going live requires a human to
-deliberately change this file, not flip an environment variable.
+order on the MASTER account no matter what TRADING_MODE is set to. Going
+live for the master account requires a human to deliberately change this
+file, not flip an environment variable.
+
+That guarantee is scoped to the master account only. This file also calls
+replicate_to_clients(...) below, which submits real orders on each client's
+OWN broker account whenever CLIENT_TRADING_ENABLED is True -- a separate
+switch from TRADING_MODE, and real money regardless of whether the master
+account above is trading paper or live. See execution/client_fanout.py.
 
 Usage:
     python -m execution.trading_loop --feature-set-id v3 --universe --dry-run
@@ -392,6 +399,7 @@ def _log_decisions(
     rejected_close_symbols=(),
     approval_status_by_symbol: dict[str, str] | None = None,
     close_phase4_by_symbol: dict[str, dict] | None = None,
+    skip_reasons: dict[str, str] | None = None,
 ) -> None:
     """
     Logs one decisions row per symbol touched this cycle — new/adjusted
@@ -402,6 +410,12 @@ def _log_decisions(
     full 7-phase reasoning: phases 1/5/6/7 are cycle-level facts merged in
     here, phases 2/3/4 come from run_screen for real candidates (see
     monitoring/reasoning.py).
+
+    `skip_reasons`: {symbol: reason} for an APPROVED candidate that still
+    never got an order (e.g. no price to size it with) — target_position on
+    that row is still the nonzero size the human agreed to, so phase 5 has
+    to say explicitly why 0 shares went out, rather than reading as an
+    ordinary "opened 0 shares".
     """
     now = dt.datetime.now(tz=dt.UTC)
     statuses = approval_status_by_symbol or {}
@@ -430,7 +444,11 @@ def _log_decisions(
 
     for c in candidates:
         shares = intended_shares.get(c.symbol, 0.0)
-        phase5 = reasoning.phase_execution(c.symbol, "opened", shares, order_type)
+        skip_reason = (skip_reasons or {}).get(c.symbol)
+        if skip_reason:
+            phase5 = reasoning.phase_execution_skipped(c.symbol, skip_reason)
+        else:
+            phase5 = reasoning.phase_execution(c.symbol, "opened", shares, order_type)
         phase6 = phase6_by_symbol.get(c.symbol) or reasoning.phase_reconciliation(c.symbol, shares, executed.get(c.symbol, 0.0), False)
         phase7 = reasoning.phase_ongoing_monitoring(closed=False)
         full_reasoning = reasoning.combine_phases(phase1, *(c.reasoning or []), phase5, phase6, phase7)
@@ -499,6 +517,16 @@ def run_cycle(
 
     regime = _market_regime(engine)
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
+    # current_positions is intentionally not threaded through here: getting
+    # it in the right units (signed fraction of portfolio value) needs a
+    # fresh portfolio_value AND price read, and this file already fetches
+    # both of those at carefully chosen points around the human-approval
+    # wait below (see the comments there) -- adding another read here risks
+    # fighting that timing rather than helping it. run_screen_with_scores
+    # defaults current_positions to {} for exactly this case: a caller that
+    # doesn't have it cheaply on hand yet. The correlated-exposure cap this
+    # seeds is a soft pre-check either way; circuit_breakers.py is the hard
+    # backstop against real correlated exposure regardless.
     screen = run_screen_with_scores(feature_set_id, symbols, regime=regime, is_shortable_fn=is_shortable_fn)
     candidates = screen.candidates
 
@@ -521,7 +549,12 @@ def run_cycle(
     # everything else is held. The hourly contradiction monitor is the
     # fourth exit path and runs separately — a position it already closed
     # simply isn't in current_positions here, so nothing double-closes.
-    portfolio_value = broker.get_portfolio_value()
+    #
+    # portfolio_value is NOT read here — the human-approval wait below can
+    # block for up to the full approval timeout, and equity used to size
+    # positions has to reflect that, not a snapshot from before the wait
+    # (same reasoning as the price re-fetch after the gate, just below).
+    # It's read fresh right alongside those prices, once the gate returns.
     current_positions = broker.get_positions()
     candidate_symbols = {c.symbol for c in candidates}
     pnl_by_symbol = current_pnl_by_symbol(broker)
@@ -560,7 +593,7 @@ def run_cycle(
         logger.info("No candidates cleared the confidence bar, and no exit condition fired — holding the book as-is.")
         send_slack_alert("No confident candidates this cycle — nothing traded, existing positions held.", severity="info")
         _store_hold_state(engine, {d.symbol: d.missed_cycles for d in held_decisions})
-        return CycleResult("no_candidates", 0, 0, None, portfolio_value)
+        return CycleResult("no_candidates", 0, 0, None, broker.get_portfolio_value())
 
     # --- The human gate. Everything below this point only acts on what a
     # human approved: one numbered Telegram message (closes first, then
@@ -608,12 +641,15 @@ def run_cycle(
             len(outcome.rejected), len(proposals), outcome.status,
         )
 
-    # Prices fetched AFTER the gate, not before: a human reply can take up
-    # to the full approval timeout, and shares must be sized off quotes
-    # from after that wait, not before it. Kept positions (holds with no
-    # exit condition, rejected closes, rejected re-picks of held names) are
-    # included so their tied-up capital can be valued when computing what's
-    # deployable.
+    # Prices AND portfolio_value fetched AFTER the gate, not before: a human
+    # reply can take up to the full approval timeout, and sizing has to use
+    # equity and quotes from after that wait, not a snapshot from before it
+    # (mirrors execution/contradiction_monitor.py's _attempt_reactivation,
+    # which fetches its own portfolio_value the same way after its gate
+    # call). Kept positions (holds with no exit condition, rejected closes,
+    # rejected re-picks of held names) are included so their tied-up capital
+    # can be valued when computing what's deployable.
+    portfolio_value = broker.get_portfolio_value()
     kept_symbols = (
         rejected_close_symbols
         + [c.symbol for c in rejected_candidates if current_positions.get(c.symbol)]
@@ -667,10 +703,18 @@ def run_cycle(
     for symbol in rejected_close_symbols:
         intended_shares[symbol] = current_positions.get(symbol, 0.0)
 
+    # Populated only for an approved candidate that never got an order for a
+    # reason that isn't "the human said no" -- read by _log_decisions so the
+    # permanent record explains a nonzero target_position next to 0 shares
+    # sent, instead of that gap being silently unexplained.
+    skip_reasons: dict[str, str] = {}
+
     for c in approved_candidates:
         price = prices.get(c.symbol)
         if not price:
             logger.warning("No price for %s — skipping this candidate.", c.symbol)
+            intended_shares[c.symbol] = 0.0
+            skip_reasons[c.symbol] = "no current price available to size the order"
             continue
         if abs(c.target_position_pct or 0.0) < 1e-9:
             logger.warning("%s was approved but the caps left it no allocation — no order.", c.symbol)
@@ -733,6 +777,7 @@ def run_cycle(
         rejected_close_symbols=rejected_close_symbols,
         approval_status_by_symbol=approval_status_by_symbol,
         close_phase4_by_symbol=close_phase4_by_symbol,
+        skip_reasons=skip_reasons,
     )
 
     # Hold state reflects what is ACTUALLY still open after execution: an

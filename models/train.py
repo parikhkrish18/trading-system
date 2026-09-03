@@ -276,10 +276,14 @@ def run_walk_forward(
     # backtest/cost_model.py.
     round_trip_cost = round_trip_cost_fraction()
 
-    # The concentrated strategy holds exactly two names; the diversified one
-    # holds up to SCREENER_TOP_K. Resolved once so every fold measures the
-    # same book.
-    book_top_k = 2 if settings.strategy_mode == "concentrated" else settings.screener_top_k
+    # The concentrated strategy holds up to settings.max_concentrated_positions
+    # names (2 or 3 with the production defaults, never a hardcoded 2 — the
+    # screener genuinely fills that many slots, see select_concentrated_trades);
+    # the diversified one holds up to SCREENER_TOP_K. Resolved once so every
+    # fold measures the same book.
+    book_top_k = (
+        settings.max_concentrated_positions if settings.strategy_mode == "concentrated" else settings.screener_top_k
+    )
 
     # Risk profile per (symbol, ts), for judging whether the book simply
     # took more risk than the universe. Deliberately kept in its OWN frame

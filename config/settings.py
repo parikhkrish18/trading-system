@@ -118,6 +118,22 @@ class Settings(BaseSettings):
     # there means the platform health-checks a dead port and the deploy is
     # marked failed. Unset locally, so 8501 stays the local default.
     dashboard_port: int = Field(default=8501, alias="PORT")
+    # Whether the dashboard is reachable only through a reverse proxy on the
+    # SAME host (the standard TLS-termination pattern — Railway and most
+    # PaaS deployments work this way; so does the shipped docker-compose.yml
+    # NATing the dashboard's port). When true, request.scope["server"] (the
+    # LOCAL socket the connection was accepted on) stops being trustworthy
+    # for "is this actually a loopback-only request" — a same-host proxy
+    # always shows up as 127.0.0.1 there regardless of who is really
+    # connecting on the other side of it — so the auth gate instead reads
+    # the standard forwarded headers (X-Forwarded-For / X-Forwarded-Proto)
+    # for the real client address and scheme. Off by default: with this
+    # false, DASHBOARD_HOST itself is the only signal trusted for "nothing
+    # external can reach this process at all" (see _client_is_loopback in
+    # monitoring/dashboard/server.py) — a same-host proxy in front of a
+    # loopback-bound dashboard would otherwise look identical, from inside
+    # the process, to a developer hitting it directly on localhost.
+    trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
 
     # --- Alerts ---
     slack_webhook_url: str = Field(default="", alias="SLACK_WEBHOOK_URL")

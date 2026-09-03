@@ -308,20 +308,42 @@ def format_ack_message(outcome: ApprovalOutcome, proposals: list[ProposedTrade])
 
 
 @contextlib.contextmanager
-def poll_lock(engine=None):
+def advisory_lock(key: int, engine=None):
     """
-    Yields True if this process now holds the approval-poll lock, False if
-    someone else does. Held for the duration of the with-block; session-level,
-    so it survives across the poll's many round trips.
+    Yields True if this process now holds the Postgres advisory lock `key`,
+    False if someone else does. Held for the duration of the with-block;
+    session-level, so it survives across many round trips inside it.
+
+    Generic form of the lock this module already used for Telegram's
+    getUpdates (see poll_lock, just below) — factored out so any other job
+    that must never run two overlapping instances at once can reuse the
+    exact same pg_try_advisory_lock/pg_advisory_unlock mechanism under its
+    own key instead of hand-rolling it. execution/contradiction_monitor.py's
+    run_contradiction_check is the other caller, guarding against a slow
+    news backfill call pushing one hourly run past the next.
     """
     engine = engine or get_engine()
     with engine.connect() as conn:
-        got = bool(conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": APPROVAL_LOCK_KEY}).scalar())
+        got = bool(conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar())
         try:
             yield got
         finally:
             if got:
-                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": APPROVAL_LOCK_KEY})
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+
+
+@contextlib.contextmanager
+def poll_lock(engine=None):
+    """
+    Yields True if this process now holds the approval-poll lock, False if
+    someone else does. The weekly cycle and the hourly contradiction monitor
+    share one Telegram bot, and getUpdates is single-consumer, so only one
+    poller may hold this at a time. See advisory_lock — this is that generic
+    lock pinned to APPROVAL_LOCK_KEY, kept as its own name since
+    request_approval takes it as a lock_factory: Callable[[], object].
+    """
+    with advisory_lock(APPROVAL_LOCK_KEY, engine) as got:
+        yield got
 
 
 # --------------------------------------------------------------------------

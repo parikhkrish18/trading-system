@@ -20,7 +20,7 @@ import html
 import json
 import logging
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import mlflow
 import pandas as pd
@@ -50,6 +50,63 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _client_is_loopback(request: Request) -> bool:
+    """
+    Whether the real caller behind this request can only ever be local —
+    the signal the auth gate uses to decide whether DASHBOARD_PASSWORD may
+    be safely left unset, and whether the session cookie needs Secure.
+
+    Deliberately NOT based on request.scope["server"] (the LOCAL socket the
+    connection was accepted on): that is indistinguishable from 127.0.0.1
+    whether this process is genuinely only reachable on localhost, or is
+    sitting behind a same-host reverse proxy (the standard TLS-termination
+    pattern, and how the shipped docker-compose.yml NATs the dashboard's
+    port) that anyone on the public internet can reach — trusting it would
+    mean any remote caller of a proxied, password-unset dashboard gets in
+    for free.
+
+    - TRUST_PROXY_HEADERS on: this deployment asserts a proxy sits in
+      front, so the standard X-Forwarded-For header (its first value, the
+      original client) is trusted for the real address instead.
+    - TRUST_PROXY_HEADERS off (the default): no proxy is trusted, so the
+      only safe signal is DASHBOARD_HOST itself — nothing external can
+      reach this process at all only when the process is bound to loopback
+      itself, proxy or not. A non-loopback DASHBOARD_HOST with no trusted
+      proxy in front is never treated as loopback-exempt, even if a given
+      request's local socket happens to look like one.
+    """
+    if settings.trust_proxy_headers:
+        forwarded_for = request.headers.get("x-forwarded-for", "")
+        remote = forwarded_for.split(",")[0].strip() if forwarded_for else ""
+        if not remote:
+            client = request.scope.get("client")
+            remote = client[0] if client else ""
+        return remote in _LOOPBACK_HOSTS
+    return settings.dashboard_host in _LOOPBACK_HOSTS
+
+
+def _cookie_should_be_secure(request: Request) -> bool:
+    """
+    Whether the session cookie this response sets should be Secure-flagged.
+    Same signal problem as _client_is_loopback above, for the same reason
+    (a same-host proxy makes the local socket look like loopback
+    regardless of the real, possibly-public scheme) — so this uses the
+    same two-mode logic rather than request.scope["server"].
+
+    - TRUST_PROXY_HEADERS on: honor X-Forwarded-Proto from the trusted
+      proxy; default Secure when it's missing rather than assume plain
+      http.
+    - TRUST_PROXY_HEADERS off: Secure unless DASHBOARD_HOST is itself
+      loopback (genuine local dev, no proxy, plain http is the only thing
+      that will ever hit this process).
+    """
+    if settings.trust_proxy_headers:
+        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        return proto != "http"
+    return settings.dashboard_host not in _LOOPBACK_HOSTS
+
 
 # One shared password gates the whole dashboard — the static page and every
 # /api route (reads included) alike. There used to be a second, separate
@@ -144,7 +201,6 @@ async def login_submit(request: Request) -> Response:
             _LOGIN_PAGE.format(error_html='<div class="error">Wrong password.</div>'), status_code=401
         )
     resp = RedirectResponse("/", status_code=303)
-    server_host = (request.scope.get("server") or ("", 0))[0]
     resp.set_cookie(
         _SESSION_COOKIE,
         _session_token(configured),
@@ -154,8 +210,9 @@ async def login_submit(request: Request) -> Response:
         # Secure unless we're plainly in loopback dev — a real deploy is
         # always HTTPS, and browsers treat 127.0.0.1/localhost as
         # "potentially trustworthy" so Secure cookies still round-trip there
-        # over plain http during local testing.
-        secure=server_host not in _LOOPBACK_HOSTS,
+        # over plain http during local testing. See _cookie_should_be_secure
+        # for why this isn't request.scope["server"] directly.
+        secure=_cookie_should_be_secure(request),
     )
     return resp
 
@@ -173,11 +230,13 @@ def _check_dashboard_auth(request: Request) -> PlainTextResponse | JSONResponse 
     route (reads included), and /login itself. Returns a response to
     short-circuit with, or None to let the request through.
 
-    - DASHBOARD_PASSWORD unset: served only on a loopback bind. The only
-      people who can reach a 127.0.0.1 dashboard are already on the
-      machine, so local development needs no ceremony; any other interface
-      fails closed rather than exposing positions and the test runner to
-      the public internet on a blank env var.
+    - DASHBOARD_PASSWORD unset: served only when nothing external can reach
+      this process at all — see _client_is_loopback for exactly what that
+      requires (DASHBOARD_HOST itself bound to loopback, unless
+      TRUST_PROXY_HEADERS says a trusted proxy is in front and the
+      forwarded client address is loopback). Local development needs no
+      ceremony; anything else fails closed rather than exposing positions
+      and the test runner to the public internet on a blank env var.
     - DASHBOARD_PASSWORD set: /login and /logout stay reachable logged out
       (the login flow has to work before anyone is logged in); everything
       else needs the session cookie /login sets. An unauthenticated /api
@@ -193,12 +252,13 @@ def _check_dashboard_auth(request: Request) -> PlainTextResponse | JSONResponse 
         return None
 
     password = settings.dashboard_password
-    server_host = (request.scope.get("server") or ("", 0))[0]
     if not password:
-        if server_host in _LOOPBACK_HOSTS:
+        if _client_is_loopback(request):
             return None
         return PlainTextResponse(
-            "DASHBOARD_PASSWORD is not set; refusing to serve on a non-loopback interface.",
+            "DASHBOARD_PASSWORD is not set; refusing to serve without a way to confirm this "
+            "request could only have come from the local machine (see TRUST_PROXY_HEADERS in "
+            "config/settings.py if this is proxied).",
             status_code=503,
         )
 
@@ -213,9 +273,43 @@ def _check_dashboard_auth(request: Request) -> PlainTextResponse | JSONResponse 
     return RedirectResponse("/login")
 
 
+def _check_csrf_origin(request: Request) -> JSONResponse | None:
+    """
+    Second CSRF layer for state-changing requests, on top of SameSite=Lax
+    (which alone is only one layer for money-moving actions like
+    liquidate/resume/risk_settings and every client-admin mutation).
+    SameSite=Lax already blocks the cookie on a cross-site POST from most
+    browsers; this adds a check that doesn't depend on cookie behavior at
+    all, in case a browser or an intermediary ever treats Lax more loosely.
+
+    Only POSTs under /api/portal/* and /api/clients* are checked — the
+    mutating routes this matters for. A request is rejected only when it
+    carries an Origin header (browsers reliably send it on cross-origin
+    POSTs; same-origin requests either omit it or send a matching one) AND
+    that Origin's host doesn't match the Host this request came in on.
+    Origin absent entirely (non-browser API clients, curl, server-to-server
+    calls) is deliberately let through — this is a second layer against
+    browser-driven CSRF, not a general caller-identity check.
+    """
+    if request.method != "POST":
+        return None
+    path = request.url.path
+    if not (path.startswith("/api/portal/") or path.startswith("/api/clients")):
+        return None
+
+    origin = request.headers.get("origin")
+    if not origin:
+        return None
+
+    origin_host = urlsplit(origin).hostname
+    if origin_host is not None and origin_host == request.url.hostname:
+        return None
+    return JSONResponse({"detail": "Cross-origin request rejected."}, status_code=403)
+
+
 @app.middleware("http")
 async def _dashboard_auth_middleware(request: Request, call_next):
-    return _check_dashboard_auth(request) or await call_next(request)
+    return _check_csrf_origin(request) or _check_dashboard_auth(request) or await call_next(request)
 
 
 def _clean_records(df: pd.DataFrame) -> list[dict]:
@@ -800,6 +894,11 @@ class _LeverageRequest(BaseModel):
 # error surfacing to the operator.
 _MAX_CLIENT_LEVERAGE = 3
 
+# No existing convention elsewhere in the repo for this (DASHBOARD_PASSWORD
+# is operator-set and unvalidated by design) -- 8 characters is the usual
+# baseline minimum for a password that gates a funded brokerage account.
+_MIN_CLIENT_PASSWORD_LENGTH = 8
+
 
 def _validate_leverage(leverage_multiplier: int, margin_enabled: bool) -> str | None:
     """Returns an error message if invalid, else None. Shared by create and update so the two paths can't drift."""
@@ -835,6 +934,10 @@ def create_client(body: _NewClientRequest) -> dict:
     """
     if not body.name.strip() or not body.password:
         return JSONResponse({"detail": "Name and password are required."}, status_code=400)
+    if len(body.password) < _MIN_CLIENT_PASSWORD_LENGTH:
+        return JSONResponse(
+            {"detail": f"password must be at least {_MIN_CLIENT_PASSWORD_LENGTH} characters."}, status_code=400
+        )
 
     leverage_error = _validate_leverage(body.leverage_multiplier, body.margin_enabled)
     if leverage_error:
@@ -962,6 +1065,9 @@ def deactivate_client(client_id: int) -> dict:
     until the client or operator acts on them directly.
     """
     engine = get_engine()
+    existing = pd.read_sql(text("SELECT id FROM clients WHERE id = :id"), engine, params={"id": client_id})
+    if existing.empty:
+        return JSONResponse({"detail": "No such client."}, status_code=404)
     with engine.begin() as conn:
         conn.exec_driver_sql("UPDATE clients SET active = FALSE WHERE id = %s", (client_id,))
     return {"id": client_id, "active": False}
@@ -970,6 +1076,9 @@ def deactivate_client(client_id: int) -> dict:
 @app.post("/api/clients/{client_id}/reactivate")
 def reactivate_client(client_id: int) -> dict:
     engine = get_engine()
+    existing = pd.read_sql(text("SELECT id FROM clients WHERE id = :id"), engine, params={"id": client_id})
+    if existing.empty:
+        return JSONResponse({"detail": "No such client."}, status_code=404)
     with engine.begin() as conn:
         conn.exec_driver_sql("UPDATE clients SET active = TRUE WHERE id = %s", (client_id,))
     return {"id": client_id, "active": True}
@@ -979,7 +1088,14 @@ def reactivate_client(client_id: int) -> dict:
 def reset_client_password(client_id: int, body: _ResetPasswordRequest) -> dict:
     if not body.new_password:
         return JSONResponse({"detail": "new_password is required."}, status_code=400)
+    if len(body.new_password) < _MIN_CLIENT_PASSWORD_LENGTH:
+        return JSONResponse(
+            {"detail": f"new_password must be at least {_MIN_CLIENT_PASSWORD_LENGTH} characters."}, status_code=400
+        )
     engine = get_engine()
+    existing = pd.read_sql(text("SELECT id FROM clients WHERE id = :id"), engine, params={"id": client_id})
+    if existing.empty:
+        return JSONResponse({"detail": "No such client."}, status_code=404)
     with engine.begin() as conn:
         conn.exec_driver_sql(
             "UPDATE clients SET password_hash = %s WHERE id = %s", (hash_password(body.new_password), client_id)
@@ -1013,6 +1129,19 @@ def get_client_orders(client_id: int, limit: int = 100) -> list[dict]:
 
 _CLIENT_SESSION_COOKIE = "client_portal_session"
 _CLIENT_SESSION_MAX_AGE_S = 30 * 24 * 3600
+
+# A hash of a fixed, never-used password, computed once at import time --
+# portal_login compares against this (instead of short-circuiting on a
+# missing/inactive name) so a login attempt for a name that doesn't exist
+# still pays the same ~600,000-iteration PBKDF2 cost as one for a real,
+# active client. Without this, the response-time gap between "no such
+# name" (no PBKDF2 call at all) and "wrong password for a real name" (one
+# full PBKDF2 call) lets an attacker enumerate real client names purely by
+# timing /portal/login. Module-level and computed once: hashing it fresh on
+# every failed request would defeat the point (that cost is exactly what
+# has to happen either way) and add needless latency to every real login
+# attempt for no benefit.
+_DUMMY_PASSWORD_HASH = hash_password("not-a-real-password-this-is-only-for-constant-time-comparison")
 
 
 def _client_session_token(password_hash: str) -> str:
@@ -1363,19 +1492,30 @@ async def portal_login(request: Request) -> Response:
 
     engine = get_engine()
     df = pd.read_sql(text("SELECT id, password_hash, active FROM clients WHERE name = :name"), engine, params={"name": name})
-    if df.empty or not bool(df.iloc[0]["active"]) or not verify_password(password, df.iloc[0]["password_hash"]):
+    found = not df.empty
+    # verify_password always runs, found or not -- comparing against
+    # _DUMMY_PASSWORD_HASH when the name doesn't exist -- so a nonexistent
+    # name costs the same ~600,000-iteration PBKDF2 check as a real one.
+    # Skipping it here (short-circuiting on `found` before ever calling
+    # verify_password) is exactly the timing side-channel this guards
+    # against: it would make a real, active name measurably slower to
+    # reject-on-wrong-password than a name that isn't in `clients` at all,
+    # letting an attacker enumerate real client names by timing alone.
+    password_hash = df.iloc[0]["password_hash"] if found else _DUMMY_PASSWORD_HASH
+    password_ok = verify_password(password, password_hash)
+    active = found and bool(df.iloc[0]["active"])
+    if not (found and active and password_ok):
         return HTMLResponse(_CLIENT_LOGIN_PAGE.format(error_html='<div class="error">Wrong name or password.</div>'), status_code=401)
 
     row = df.iloc[0]
     resp = RedirectResponse("/portal", status_code=303)
-    server_host = (request.scope.get("server") or ("", 0))[0]
     resp.set_cookie(
         _CLIENT_SESSION_COOKIE,
         f"{int(row['id'])}.{_client_session_token(row['password_hash'])}",
         max_age=_CLIENT_SESSION_MAX_AGE_S,
         httponly=True,
         samesite="lax",
-        secure=server_host not in _LOOPBACK_HOSTS,
+        secure=_cookie_should_be_secure(request),
     )
     return resp
 
@@ -1403,6 +1543,15 @@ def _client_broker(client_id: int) -> AlpacaBroker:
     )
 
 
+# The one message every /api/portal/* broker-failure branch below shows the
+# client -- never the real exception text (a credential-decryption failure
+# detail from _client_broker(), an Alpaca error message that might name
+# internal state, etc.). The real exception is always logged server-side
+# via logger.exception first; this is only what crosses the trust boundary
+# to the client's browser.
+_ALPACA_UNREACHABLE_DETAIL = "Could not reach your Alpaca account right now — please try again shortly."
+
+
 @app.get("/api/portal/positions", response_model=None)
 def portal_positions(request: Request) -> list[dict] | JSONResponse:
     client = _require_client(request)
@@ -1410,8 +1559,9 @@ def portal_positions(request: Request) -> list[dict] | JSONResponse:
         return JSONResponse({"detail": "Not authenticated."}, status_code=401)
     try:
         return _client_broker(client["id"]).get_positions_detailed()
-    except Exception as e:
-        return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+    except Exception:
+        logger.exception("Could not fetch positions from Alpaca for client %s", client["id"])
+        return JSONResponse({"detail": _ALPACA_UNREACHABLE_DETAIL}, status_code=502)
 
 
 @app.get("/api/portal/account", response_model=None)
@@ -1421,8 +1571,9 @@ def portal_account(request: Request) -> dict | JSONResponse:
         return JSONResponse({"detail": "Not authenticated."}, status_code=401)
     try:
         account = _client_broker(client["id"]).get_account()
-    except Exception as e:
-        return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+    except Exception:
+        logger.exception("Could not fetch account details from Alpaca for client %s", client["id"])
+        return JSONResponse({"detail": _ALPACA_UNREACHABLE_DETAIL}, status_code=502)
     return {
         "equity": float(account.get("equity", 0) or 0),
         "cash": float(account.get("cash", 0) or 0),
@@ -1511,10 +1662,24 @@ def portal_liquidate(request: Request) -> dict | JSONResponse:
     if not client:
         return JSONResponse({"detail": "Not authenticated."}, status_code=401)
     engine = get_engine()
+
+    # Idempotency guard: a double-click, or a race with an auto-triggered
+    # max_drawdown/profit_target pause landing between two clicks, must not
+    # fire flatten_all() twice or write two client_orders audit rows for
+    # one logical liquidation. A fresh read of the current trading_paused
+    # state (not whatever _require_client happened to load) is the
+    # check-then-act -- not a row lock, but Alpaca is itself idempotent
+    # about closing an already-flat position, so the real harm this
+    # prevents is the duplicate audit row, and this closes that.
+    current = pd.read_sql(text("SELECT trading_paused FROM clients WHERE id = :id"), engine, params={"id": client["id"]})
+    if not current.empty and bool(current.iloc[0]["trading_paused"]):
+        return {"status": "already_paused", "trading_paused": True}
+
     try:
         _client_broker(client["id"]).flatten_all()
-    except Exception as e:
-        return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+    except Exception:
+        logger.exception("Could not flatten positions on Alpaca for client %s", client["id"])
+        return JSONResponse({"detail": _ALPACA_UNREACHABLE_DETAIL}, status_code=502)
 
     with engine.begin() as conn:
         conn.exec_driver_sql(
@@ -1544,8 +1709,9 @@ def portal_resume(request: Request) -> dict | JSONResponse:
     now = dt.datetime.now(tz=dt.UTC)
     try:
         equity = float(_client_broker(client["id"]).get_account().get("equity", 0) or 0)
-    except Exception as e:
-        return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+    except Exception:
+        logger.exception("Could not fetch account equity from Alpaca while resuming client %s", client["id"])
+        return JSONResponse({"detail": _ALPACA_UNREACHABLE_DETAIL}, status_code=502)
 
     with engine.begin() as conn:
         conn.exec_driver_sql(
@@ -1603,8 +1769,9 @@ def set_portal_risk_settings(request: Request, body: _RiskSettingsRequest) -> di
     if body.max_drawdown_pct is not None or body.profit_target_pct is not None:
         try:
             equity = float(_client_broker(client["id"]).get_account().get("equity", 0) or 0)
-        except Exception as e:
-            return JSONResponse({"detail": f"Could not reach your Alpaca account: {e}"}, status_code=502)
+        except Exception:
+            logger.exception("Could not fetch account equity from Alpaca while saving risk settings for client %s", client["id"])
+            return JSONResponse({"detail": _ALPACA_UNREACHABLE_DETAIL}, status_code=502)
 
     equity_peak = equity if (body.max_drawdown_pct is not None and equity) else None
     period_equity = equity if (body.profit_target_pct is not None and equity) else None

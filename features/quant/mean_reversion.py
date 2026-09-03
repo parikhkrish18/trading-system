@@ -31,5 +31,20 @@ def rsi(close: pd.Series, window: int = 14) -> pd.Series:
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / window, min_periods=window).mean()
     avg_loss = loss.ewm(alpha=1 / window, min_periods=window).mean()
+
     rs = avg_gain / avg_loss.replace(0, pd.NA)
-    return 100 - (100 / (1 + rs))
+    result = 100 - (100 / (1 + rs))
+    # avg_loss == 0 isn't "no data" (that's the window guard above via
+    # min_periods) -- inside a filled window it means zero down-moves,
+    # i.e. the strongest possible bullish reading. The .replace(0, pd.NA)
+    # guard above exists only to avoid a division by zero and ends up
+    # producing NaN here instead of 100, silently dropping RSI's single
+    # most informative case (a strict uptrend) into missing data -- which
+    # is exactly the shape of bug models/screener.py and risk/sizing.py
+    # both guard against elsewhere (a NaN quietly bypassing a downstream
+    # filter rather than being a real, usable value). Fix it at the
+    # source: 100 when there were gains and zero losses, 50 (undefined
+    # direction) only when both are zero.
+    result = result.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+    result = result.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
+    return result

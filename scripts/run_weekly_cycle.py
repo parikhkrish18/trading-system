@@ -14,8 +14,8 @@ data/ingest/http.py) — that's roughly two hours for those two steps alone
 on this tier, not a bug, just what the vendor limit costs.
 
 Usage:
-    python -m scripts.run_weekly_cycle --feature-set-id v3
-    python -m scripts.run_weekly_cycle --feature-set-id v3 --dry-run
+    python -m scripts.run_weekly_cycle --feature-set-id v4
+    python -m scripts.run_weekly_cycle --feature-set-id v4 --dry-run
 """
 from __future__ import annotations
 

@@ -23,6 +23,7 @@ import dataclasses
 import datetime as dt
 import json
 import logging
+import math
 from collections.abc import Callable
 
 import pandas as pd
@@ -242,6 +243,17 @@ def select_trades(
     handles signed forecasts, regime damping, and correlation caps
     generically, nothing here is symbol- or ETF-specific.
 
+    `current_positions` seeds the correlated-exposure check with whatever is
+    already held, but the correlation cap has to bind across THIS call's own
+    picks too, not just against that starting book: as each candidate is
+    sized, its size is folded into a running copy of `current_positions` so
+    the next candidate in the same loop is checked against "already held
+    plus everything sized so far this call". Without that, four candidates
+    that are all pairwise correlated but individually within the cap versus
+    an (unchanged) external book can each get sized independently and land
+    the combined book well past `max_correlated_exposure_pct`. The caller's
+    own dict is never mutated — sizing works on a local copy.
+
     Short candidates that fail `is_shortable_fn` (when given — pass e.g.
     execution.broker_alpaca.AlpacaBroker.is_shortable) are dropped rather
     than resized to zero, so the caller can see which symbols got skipped.
@@ -261,7 +273,9 @@ def select_trades(
     ranking preference can apply without touching how a selected
     candidate is actually sized below.
     """
-    current_positions = current_positions or {}
+    # Copied, not aliased: this dict is mutated below as each candidate is
+    # sized, and the caller's own current_positions must never see that.
+    current_positions = dict(current_positions) if current_positions else {}
     sort_col = rank_score_col if rank_score_col and rank_score_col in scored.columns else "conviction_score"
     confident = scored.loc[scored["confident"]].sort_values(sort_col, ascending=False)
 
@@ -290,7 +304,7 @@ def select_trades(
             max_correlated_exposure_pct=max_correlated_exposure_pct,
             max_short_position_pct=max_short_position_pct,
         )
-        if abs(size) < 1e-9:
+        if abs(size) < 1e-9 or math.isnan(size):
             continue
 
         candidates.append(
@@ -303,6 +317,9 @@ def select_trades(
                 target_position_pct=float(size),
             )
         )
+        # Fold this pick into the running exposure so the NEXT candidate
+        # sized in this same call is checked against it too (see docstring).
+        current_positions[symbol] = size
 
     return candidates
 
@@ -343,11 +360,41 @@ def _bounded_conviction_weights(
         feasible for any leg count, rather than being tuned for one
         specific n.
 
-    Capped/floored legs are fixed first and the remaining allocation is
-    re-split by conviction among the still-free legs, iterating (like
-    water-filling) until every leg sits inside its bounds. Falls back to an
-    equal split only if the bounds are configured infeasibly (shouldn't
-    happen with the defaults above, for any n).
+    Two-phase water-filling, run against a shrinking `target` (starts at
+    1.0) rather than fixing every violating leg to its bound in one shot —
+    fixing them all at once was the bug: a leg pinned to `max_leg_pct` and
+    another pinned to `min_leg_pct` in the SAME pass can together claim more
+    than what's actually left, since neither pin checks what the other one
+    just took.
+
+    Each outer pass:
+
+      1. Cap-only water-fill `target` across the still-free legs (identical
+         in spirit to risk.sizing.scale_to_full_deployment's own
+         water-filling): split proportional to conviction, pin any leg
+         whose share would exceed `max_leg_pct` there, and re-split the
+         leftover among the rest — repeating until nobody still free
+         exceeds the cap. This alone can never push a leg over its cap or
+         the running total over `target` (a pinned leg's cap is always less
+         than the share it would otherwise have gotten, so pinning it only
+         ever gives back budget, never take more).
+      2. Check that result against the floor. Legs under `min_leg_pct` are
+         pinned there instead — which shrinks `target` for whoever is still
+         free — and the pass repeats. Re-deriving the cap-only split against
+         the smaller `target` (rather than reusing the stale pre-floor
+         shares from step 1) is what keeps the combined total from ever
+         exceeding 1.0.
+
+    Terminates in at most n passes (each non-final pass pins at least one
+    more leg permanently). If a pass produces no floor violations, every
+    still-free leg's step-1 share is final and the loop stops.
+
+    A leg can still end up under its floor if honoring every floor would
+    require exceeding `max_leg_pct` or the 1.0 total — both of those are the
+    hard bounds; the floor is not, once it stops being possible to hit it
+    without violating them, the shortfall is logged (see FullDeploymentResult
+    /scale_to_full_deployment for the same "reached_target=False, log why"
+    convention this mirrors) rather than silently under- or over-deploying.
     """
     n = len(scores)
     if n == 1:
@@ -357,35 +404,59 @@ def _bounded_conviction_weights(
     min_leg_pct = min_leg_floor_fraction * equal_share
     clipped_scores = [max(s, 0.0) for s in scores]
 
-    fixed: list[float | None] = [None] * n
+    weights = [0.0] * n
+    free_idx = list(range(n))
+    target = 1.0
+
     for _ in range(n):
-        free_idx = [i for i in range(n) if fixed[i] is None]
         if not free_idx:
             break
-        remaining = 1.0 - sum(fixed[i] for i in range(n) if fixed[i] is not None)
-        free_scores = [clipped_scores[i] for i in free_idx]
-        free_total = sum(free_scores)
-        proposal = (
-            {i: remaining / len(free_idx) for i in free_idx}
-            if free_total <= 0
-            else {i: remaining * clipped_scores[i] / free_total for i in free_idx}
-        )
-        any_violation = False
-        for i in free_idx:
-            if proposal[i] > max_leg_pct + 1e-9:
-                fixed[i] = max_leg_pct
-                any_violation = True
-            elif proposal[i] < min_leg_pct - 1e-9:
-                fixed[i] = min_leg_pct
-                any_violation = True
-        if not any_violation:
+
+        # Phase 1: cap-only water-fill `target` across the free legs.
+        capped: dict[int, float] = {}
+        active = set(free_idx)
+        remaining = target
+        while active:
+            active_total = sum(clipped_scores[i] for i in active)
+            proposal = (
+                {i: remaining / len(active) for i in active}
+                if active_total <= 0
+                else {i: remaining * clipped_scores[i] / active_total for i in active}
+            )
+            newly_capped = [i for i in active if proposal[i] > max_leg_pct + 1e-9]
+            if not newly_capped:
+                capped.update(proposal)
+                break
+            for i in newly_capped:
+                capped[i] = max_leg_pct
+                remaining -= max_leg_pct
+                active.discard(i)
+
+        # Phase 2: pin anyone that leaves under the floor and shrink target
+        # for the next pass; otherwise this allocation is final.
+        below_floor = [i for i in free_idx if capped.get(i, 0.0) < min_leg_pct - 1e-9]
+        if not below_floor:
             for i in free_idx:
-                fixed[i] = proposal[i]
+                weights[i] = capped[i]
+            free_idx = []
             break
+
+        for i in below_floor:
+            weights[i] = min_leg_pct
+            target -= min_leg_pct
+        free_idx = [i for i in free_idx if i not in below_floor]
     else:
         return [equal_share] * n
 
-    return [w if w is not None else equal_share for w in fixed]
+    total = sum(weights)
+    if total < 1.0 - 1e-9:
+        logger.warning(
+            "Concentrated split under-deployed: max_leg_pct=%.0f%% and min_leg_floor_fraction="
+            "%.0f%% can't both be honored for this conviction spread, so only %.1f%% of the "
+            "intended 100%% was allocated across %d leg(s) rather than breaching either bound.",
+            max_leg_pct * 100, min_leg_floor_fraction * 100, total * 100, n,
+        )
+    return weights
 
 
 def select_concentrated_trades(
@@ -598,6 +669,7 @@ def run_screen(
     is_shortable_fn: Callable[[str], bool] | None = None,
     total_deploy_pct: float = 1.0,
     max_positions_override: int | None = None,
+    current_positions: dict[str, float] | None = None,
 ) -> list[TradeCandidate]:
     """The shortlist-only view of run_screen_with_scores — see ScreenResult for who needs more."""
     return run_screen_with_scores(
@@ -610,6 +682,7 @@ def run_screen(
         is_shortable_fn=is_shortable_fn,
         total_deploy_pct=total_deploy_pct,
         max_positions_override=max_positions_override,
+        current_positions=current_positions,
     ).candidates
 
 
@@ -623,6 +696,7 @@ def run_screen_with_scores(
     is_shortable_fn: Callable[[str], bool] | None = None,
     total_deploy_pct: float = 1.0,
     max_positions_override: int | None = None,
+    current_positions: dict[str, float] | None = None,
 ) -> ScreenResult:
     """
     Trains a fresh ensemble on all available history, scores today's
@@ -631,6 +705,14 @@ def run_screen_with_scores(
     the conservative caps in risk/sizing.py) or the concentrated small book
     (select_concentrated_trades, at most settings.max_concentrated_positions
     names).
+
+    `current_positions`: what's already held, as {symbol: signed fraction of
+    portfolio value} — the same units target_position_size/
+    correlation_adjusted_size expect. Only consulted in diversified mode, to
+    seed the correlated-exposure cap with the real starting book instead of
+    an empty one (see select_trades). Defaults to None (treated as {}) for
+    callers with no broker/portfolio context to draw it from — offline
+    scoring, backtests, and any caller genuinely starting from cash.
 
     `total_deploy_pct` defaults to 1.0 (the normal weekly-cycle behavior --
     100% of the book). execution/contradiction_monitor.py's mid-week
@@ -723,32 +805,48 @@ def run_screen_with_scores(
         # own volatility, and using the wrong one would systematically
         # mis-size every position.
         forecast_scale = float(train_df["target"].std())
-        correlation_matrix = build_correlation_matrix(train_df[["symbol", "ts", "close"]])
-        candidates = select_trades(
-            scored,
-            regime=regime,
-            forecast_scale=forecast_scale,
-            max_position_pct=settings.max_single_position_pct,
-            max_short_position_pct=settings.max_short_position_pct,
-            max_correlated_exposure_pct=settings.max_correlated_exposure_pct,
-            correlation_matrix=correlation_matrix,
-            top_k=settings.screener_top_k,
-            is_shortable_fn=is_shortable_fn,
-            allow_shorts=settings.allow_shorts,
-            rank_score_col="rank_score",
-        )
-        # Reactivation semantics: when only a freed slice of the portfolio
-        # is on the table, every size shrinks proportionally to fit it.
-        if total_deploy_pct < 1.0:
-            for candidate in candidates:
-                candidate.target_position_pct *= total_deploy_pct
-        if settings.full_deployment:
-            candidates = apply_full_deployment(
-                candidates,
+        if math.isnan(forecast_scale):
+            # A training frame with <=1 usable row for `target` (e.g. a
+            # brand-new feature set, or a universe with almost nothing
+            # history-eligible this cycle) makes std() NaN. Every downstream
+            # size derived from it would be NaN too — confidence_scaled_size
+            # guards against that, but sizing against a scale that means
+            # nothing isn't a cycle worth running at all, so skip screening
+            # outright rather than shortlist against garbage.
+            logger.warning(
+                "Diversified screen: forecast_scale (std of the training frame's target) is "
+                "NaN — the training frame has too few usable rows this cycle. Skipping "
+                "screening rather than sizing candidates against a meaningless scale."
+            )
+            candidates = []
+        else:
+            correlation_matrix = build_correlation_matrix(train_df[["symbol", "ts", "close"]])
+            candidates = select_trades(
+                scored,
+                regime=regime,
+                forecast_scale=forecast_scale,
                 max_position_pct=settings.max_single_position_pct,
                 max_short_position_pct=settings.max_short_position_pct,
-                target_allocation=total_deploy_pct,
+                max_correlated_exposure_pct=settings.max_correlated_exposure_pct,
+                correlation_matrix=correlation_matrix,
+                top_k=settings.screener_top_k,
+                current_positions=current_positions,
+                is_shortable_fn=is_shortable_fn,
+                allow_shorts=settings.allow_shorts,
+                rank_score_col="rank_score",
             )
+            # Reactivation semantics: when only a freed slice of the
+            # portfolio is on the table, every size shrinks proportionally.
+            if total_deploy_pct < 1.0:
+                for candidate in candidates:
+                    candidate.target_position_pct *= total_deploy_pct
+            if settings.full_deployment:
+                candidates = apply_full_deployment(
+                    candidates,
+                    max_position_pct=settings.max_single_position_pct,
+                    max_short_position_pct=settings.max_short_position_pct,
+                    target_allocation=total_deploy_pct,
+                )
 
     _attach_reasoning(
         candidates,

@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly universe-refresh + screen + trade cycle for trading-system
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/trading-system
+EnvironmentFile=/opt/trading-system/.env
+ExecStart=/opt/trading-system/.venv/bin/python -m scripts.run_weekly_cycle --feature-set-id v4

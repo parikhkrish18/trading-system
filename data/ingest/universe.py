@@ -89,20 +89,26 @@ def refresh_universe() -> int:
     constituents["added_at"] = now
     constituents["is_active"] = True
 
-    n = upsert_dataframe(constituents, table="universe", conflict_cols=["symbol"])
-
     # Point-in-time membership record: the `universe` table only knows who
     # is in the index *today* (survivorship bias baked in); this snapshot
     # says who was in it on each refresh date, for honest future backtests.
     snapshot = constituents[["symbol", "name", "gics_sector"]].copy()
     snapshot.insert(0, "snapshot_date", now.date())
-    upsert_dataframe(snapshot, table="universe_snapshot", conflict_cols=["snapshot_date", "symbol"])
 
-    engine = get_engine()
     deactivate = text("UPDATE universe SET is_active = FALSE WHERE symbol NOT IN :symbols").bindparams(
         bindparam("symbols", expanding=True)
     )
+
+    # All three writes share one transaction: a crash between them used to
+    # be able to leave the `universe` table and its `universe_snapshot`
+    # point-in-time record inconsistent (e.g. the upsert lands but the
+    # process dies before the snapshot or the deactivation runs). Wrapping
+    # them in a single engine.begin() means they all commit together or all
+    # roll back together.
+    engine = get_engine()
     with engine.begin() as conn:
+        n = upsert_dataframe(constituents, table="universe", conflict_cols=["symbol"], conn=conn)
+        upsert_dataframe(snapshot, table="universe_snapshot", conflict_cols=["snapshot_date", "symbol"], conn=conn)
         conn.execute(deactivate, {"symbols": symbols})
     return n
 

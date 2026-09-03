@@ -44,6 +44,16 @@ DIVERGED = "diverged"
 # Outcomes that mean something needs a human's attention.
 _PROBLEM_OUTCOMES = frozenset({PARTIAL, REJECTED, DIVERGED})
 
+# Absolute floor under the percentage tolerance, in shares. Percentage
+# tolerance alone breaks down as intended_shares -> 0: a fraction-of-a-share
+# rounding difference on a near-dust position (intended=0.01, actual=0.011)
+# computes as a triple-digit diff_pct and flags as "diverged" even though
+# the position is economically negligible either way. Below this many
+# shares of absolute difference, on a position that is itself this small,
+# the percentage check is skipped rather than made to answer a question it
+# was never a good tool for.
+_DUST_SHARE_TOLERANCE = 0.05
+
 
 @dataclasses.dataclass
 class ReconciliationResult:
@@ -110,7 +120,15 @@ def reconcile_positions(
         order = orders.get(symbol)
         raw_status = order.get("status") if isinstance(order, dict) else None
 
-        if abs(diff_pct) <= tolerance_pct:
+        # Dust guard: a percentage denominator built from a near-zero
+        # intended size makes even a fraction-of-a-share rounding difference
+        # read as a huge diff_pct. When BOTH the position itself and the
+        # absolute gap are within a few hundredths of a share, treat it as
+        # reconciled rather than flag it on a percentage that was never
+        # measuring anything real at this size.
+        is_dust = abs(intended_shares) <= _DUST_SHARE_TOLERANCE and abs(diff) <= _DUST_SHARE_TOLERANCE
+
+        if is_dust or abs(diff_pct) <= tolerance_pct:
             # The position is what we asked for. How it got there doesn't
             # matter, and a stale "accepted" status must not manufacture a
             # warning about a position that is already correct.

@@ -91,8 +91,19 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
             # weeks before they were actually filed. That's look-ahead bias:
             # it would inflate backtested accuracy in a way that can't repeat
             # in live trading, since real-time data has no such head start.
-            report_date = report.get("filing_date") or report.get("end_date")
+            #
+            # No `or report.get("end_date")` fallback: that would leak the
+            # exact look-ahead bias this comment warns about, every time
+            # filing_date happens to be missing/falsy (common for
+            # older/partial Polygon records). A report with no filing_date
+            # is skipped and logged, not silently mis-dated.
+            report_date = report.get("filing_date")
             if not report_date:
+                logger.warning(
+                    "Skipping a %s fundamentals report with no filing_date (would otherwise "
+                    "need end_date, which leaks look-ahead bias) — end_date was %r.",
+                    symbol, report.get("end_date"),
+                )
                 continue
             financials = report.get("financials", {})
             for metric, (statement, field, subfield) in _METRIC_PATHS.items():

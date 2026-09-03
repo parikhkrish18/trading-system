@@ -1,0 +1,14 @@
+[Unit]
+Description=Run weekly-cycle.service every Monday morning
+
+[Timer]
+# Monday 08:00 UTC = 4:00am ET (summer) / 3:00am ET (winter). Matches
+# infra/launchd/com.trading-system.weekly-cycle.plist and
+# infra/railway/README.md's `0 8 * * 1` — see either for why Monday
+# morning (not Sunday) and why this leaves enough buffer before the
+# 9:30am ET open. Doesn't shift for DST, same as those two.
+OnCalendar=Mon *-*-* 08:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

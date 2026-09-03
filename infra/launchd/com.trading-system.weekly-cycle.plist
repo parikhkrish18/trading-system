@@ -11,7 +11,7 @@
         <string>-m</string>
         <string>scripts.run_weekly_cycle</string>
         <string>--feature-set-id</string>
-        <string>v3</string>
+        <string>v4</string>
     </array>
 
     <key>WorkingDirectory</key>

@@ -1,0 +1,16 @@
+[Unit]
+Description=Run contradiction-monitor.service hourly during market hours
+
+[Timer]
+# Hourly, on the hour, 14:00-20:00 UTC — matches infra/railway/README.md's
+# `0 14-20 * * 1-5` (weekdays only; execution/contradiction_monitor.py
+# itself no-ops outside actual market hours, so this only needs to be
+# "often enough" during the session, not exact). Same DST caveat as the
+# Railway schedule: this doesn't shift for daylight saving, so its actual
+# US/Eastern coverage moves by an hour twice a year — see
+# infra/railway/README.md for the specifics.
+OnCalendar=Mon..Fri *-*-* 14..20:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

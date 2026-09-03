@@ -1,5 +1,6 @@
 import pandas as pd
 import pytest
+from sqlalchemy import text
 
 from data.ingest import universe
 
@@ -82,8 +83,8 @@ def test_refresh_universe_deactivates_removed_symbols(monkeypatch):
 
     upsert_calls = {}
 
-    def fake_upsert(df, table, conflict_cols):
-        upsert_calls[table] = {"df": df, "conflict_cols": conflict_cols}
+    def fake_upsert(df, table, conflict_cols, conn=None):
+        upsert_calls[table] = {"df": df, "conflict_cols": conflict_cols, "conn": conn}
         return len(df)
 
     executed = {}
@@ -106,6 +107,65 @@ def test_refresh_universe_deactivates_removed_symbols(monkeypatch):
     assert "is_active = FALSE" in executed["stmt"]
     assert executed["params"] == {"symbols": ["MMM", "TSLA"]}
     assert "MMM" not in executed["stmt"]
+    # All three writes (universe upsert, universe_snapshot upsert, the
+    # deactivation UPDATE) must share one transaction/connection so a crash
+    # partway through can't commit some and lose the rest.
+    assert upsert_calls["universe"]["conn"] is not None
+    assert upsert_calls["universe"]["conn"] is upsert_calls["universe_snapshot"]["conn"]
+
+
+def test_refresh_universe_rolls_back_all_three_writes_on_failure(monkeypatch):
+    """
+    Regression test, hit live: the universe upsert, the universe_snapshot
+    upsert, and the is_active deactivation ran as three separate
+    transactions -- a crash between them could leave the universe and its
+    point-in-time snapshot inconsistent. All three must now share one
+    transaction: if any of them fails, none of them should have taken
+    effect, even the ones that individually succeeded before the failure.
+    Runs against the real local Postgres instance (needed to prove an
+    actual rollback, not just a mocked call sequence).
+    """
+    test_symbols = ["ZZZTEST1", "ZZZTEST2"]
+    monkeypatch.setattr(universe, "fetch_sp500_constituents", lambda: _scrape_of(test_symbols))
+    monkeypatch.setattr(universe, "MIN_EXPECTED_CONSTITUENTS", 2)
+
+    engine = universe.get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM universe WHERE symbol = ANY(:symbols)"), {"symbols": test_symbols})
+        conn.execute(text("DELETE FROM universe_snapshot WHERE symbol = ANY(:symbols)"), {"symbols": test_symbols})
+
+    real_upsert = universe.upsert_dataframe
+    calls = {"n": 0}
+
+    def flaky_upsert(df, table, conflict_cols, conn=None):
+        n = real_upsert(df, table=table, conflict_cols=conflict_cols, conn=conn)
+        calls["n"] += 1
+        if calls["n"] == 2:  # after the universe_snapshot upsert -- the 2nd of the 3 writes
+            raise RuntimeError("simulated crash after the 2nd write")
+        return n
+
+    monkeypatch.setattr(universe, "upsert_dataframe", flaky_upsert)
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            universe.refresh_universe()
+
+        with engine.connect() as conn:
+            u_count = conn.execute(
+                text("SELECT count(*) FROM universe WHERE symbol = ANY(:symbols)"), {"symbols": test_symbols}
+            ).scalar()
+            s_count = conn.execute(
+                text("SELECT count(*) FROM universe_snapshot WHERE symbol = ANY(:symbols)"), {"symbols": test_symbols}
+            ).scalar()
+        # The universe upsert (write #1) succeeded on its own before the
+        # simulated crash on write #2 -- it must still have been rolled back
+        # because it shares a transaction with the write that failed.
+        assert u_count == 0
+        assert s_count == 0
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM universe WHERE symbol = ANY(:symbols)"), {"symbols": test_symbols})
+            conn.execute(text("DELETE FROM universe_snapshot WHERE symbol = ANY(:symbols)"), {"symbols": test_symbols})
 
 
 def test_refresh_universe_aborts_on_empty_scrape(monkeypatch):

@@ -118,9 +118,10 @@ class TestNewsStreamBuffer:
     def _buffer(self, **kwargs):
         writes: list[pd.DataFrame] = []
 
-        def writer(df, table, conflict_cols):
+        def writer(df, table, conflict_cols, preserve_cols=None):
             assert table == "news_events"
-            assert conflict_cols == ["id", "ts"]
+            assert conflict_cols == ["id"]
+            assert preserve_cols == ["sentiment", "surprise"]
             writes.append(df)
             return len(df)
 
@@ -201,7 +202,7 @@ class TestNewsStreamBuffer:
     def test_flush_dedupes_a_redelivered_article_within_one_batch(self):
         """Regression: Alpaca redelivering the same article (reconnect, or a
         corrected version) within one flush window used to write two rows
-        with the same (id, ts) in a single upsert statement, which Postgres
+        with the same id in a single upsert statement, which Postgres
         rejects with CardinalityViolation and crashed the whole stream."""
         buf, writes, _ = self._buffer()
         buf.add_article(_article(symbols=["AAPL"]))
@@ -212,15 +213,17 @@ class TestNewsStreamBuffer:
         assert n == 1
         assert len(writes[0]) == 1
 
-    def test_flush_keeps_distinct_rows_with_different_timestamps(self):
-        """Dedup is scoped to (id, ts) together, not id alone -- a follow-up
-        article that reuses an id (shouldn't happen, but) at a different ts
-        must not be silently dropped."""
+    def test_flush_dedupes_a_redelivered_article_even_with_a_corrected_timestamp(self):
+        """id alone is the upsert conflict target (data/schema/014_news_id_unique.sql),
+        so two rows sharing an id but disagreeing on ts would still collide in
+        one ON CONFLICT statement -- dedup must be keyed on id alone, keeping
+        the latest delivery (it may carry a corrected ts/sentiment)."""
         buf, writes, _ = self._buffer()
         buf.add_article(_article(id="art-1", symbols=["AAPL"], created_at="2026-08-20T14:30:00Z"))
         buf.add_article(_article(id="art-1", symbols=["AAPL"], created_at="2026-08-20T15:00:00Z"))
 
         n = buf.flush()
 
-        assert n == 2
-        assert len(writes[0]) == 2
+        assert n == 1
+        assert len(writes[0]) == 1
+        assert writes[0].iloc[0]["ts"] == pd.Timestamp("2026-08-20T15:00:00Z")

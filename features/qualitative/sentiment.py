@@ -12,12 +12,15 @@ re-score historical news with a better model without re-pulling raw data.
 from __future__ import annotations
 
 import json
+import logging
 
 import pandas as pd
 from anthropic import Anthropic
 
 from config.settings import settings
 from data.ingest.db import get_engine
+
+logger = logging.getLogger(__name__)
 
 _MODEL = "claude-haiku-4-5"
 _BATCH_SIZE = 20
@@ -128,11 +131,30 @@ def backfill_unscored_news(batch_size: int = 500) -> int:
         return 0
 
     scored = score_sentiment(df)
+    written = 0
     with engine.begin() as conn:
         for _, row in scored.iterrows():
+            # A row whose id the LLM's JSON response omitted (a malformed/
+            # truncated response, or the model just dropping one) keeps the
+            # pd.NA that score_sentiment initializes every row to. bool(pd.NA)
+            # raises TypeError -- which used to abort this entire batch
+            # transaction, including every row that scored fine, and since
+            # the next run re-selects the same oldest unscored batch it hit
+            # the same missing id and crashed again forever. Skip just this
+            # row instead: it stays sentiment IS NULL, so it's naturally
+            # retried by the next backfill run rather than permanently
+            # skipped, and every other row in the batch still gets written.
+            if pd.isna(row["sentiment"]) or pd.isna(row["sentiment_relevant"]):
+                logger.warning(
+                    "No sentiment score came back for news_events id=%s (ts=%s) -- "
+                    "leaving it unscored for the next backfill run.",
+                    row["id"], row["ts"],
+                )
+                continue
             conn.exec_driver_sql(
                 "UPDATE news_events SET sentiment = %s, sentiment_reason = %s, sentiment_relevant = %s "
                 "WHERE id = %s AND ts = %s",
                 (row["sentiment"], row["sentiment_reason"], bool(row["sentiment_relevant"]), row["id"], row["ts"]),
             )
-    return len(scored)
+            written += 1
+    return written

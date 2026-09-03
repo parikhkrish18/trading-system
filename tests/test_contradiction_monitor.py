@@ -1,9 +1,21 @@
+import contextlib
+
 import pandas as pd
 import pytest
 
 from execution import contradiction_monitor as cm
 from execution.approval_gate import ApprovalOutcome, number_proposals
 from execution.exit_levels import ExitLevels
+
+
+@contextlib.contextmanager
+def _free_lock(*a, **k):
+    yield True
+
+
+@contextlib.contextmanager
+def _busy_lock(*a, **k):
+    yield False
 
 
 def _past_the_brake() -> float:
@@ -50,12 +62,17 @@ class _FakeBroker:
         self.client = _FakeClient(is_open)
         self.closed: list[str] = []
         self._portfolio_value = portfolio_value
+        self.flattened = False
 
     def get_positions(self):
         return dict(self._positions)
 
     def get_portfolio_value(self):
         return self._portfolio_value
+
+    def flatten_all(self):
+        self.flattened = True
+        self._positions = {}
 
     def submit_target_position(self, symbol, target_shares):
         self.closed.append(symbol)
@@ -99,6 +116,28 @@ def _no_client_risk_checks(monkeypatch):
     just keeps the test output clean.
     """
     monkeypatch.setattr(cm, "check_all_clients_risk", lambda *a, **k: [])
+
+
+@pytest.fixture(autouse=True)
+def _lock_free_by_default(monkeypatch):
+    """
+    This file is about the contradiction/exit logic, not the overlapping-run
+    guard (see the "concurrency guard" tests further down) -- default every
+    test to an uncontended lock so run_contradiction_check proceeds as before.
+    """
+    monkeypatch.setattr(cm, "advisory_lock", _free_lock)
+
+
+@pytest.fixture(autouse=True)
+def _no_master_breaker_trip_by_default(monkeypatch):
+    """
+    This file is about the contradiction/exit logic, not the master-account
+    circuit breakers wired in from trading_loop.py (see the breaker tests
+    further down) -- default every test to a clean breaker pass. These
+    tests' get_engine() fakes (bare object()) aren't real SQL connections,
+    so a real _run_breaker_check call here would just fail on every test.
+    """
+    monkeypatch.setattr(cm, "_run_breaker_check", lambda broker, engine: [])
 
 
 def test_market_closed_is_a_clean_noop(monkeypatch):
@@ -787,6 +826,98 @@ def test_the_brake_is_configurable_without_a_deploy(monkeypatch):
 
     assert _momentum_triggers(monkeypatch, -0.15) is False
     assert _momentum_triggers(monkeypatch, -0.25) is True
+
+
+# --------------------------------------------------------------------------
+# Concurrency guard — two overlapping hourly passes must not double-process
+# --------------------------------------------------------------------------
+
+
+def test_a_second_overlapping_run_no_ops_when_the_lock_is_already_held(monkeypatch):
+    """
+    A slow news backfill call can push one pass past the next hourly
+    trigger. A second call finding the lock already held must skip entirely
+    -- not touch the broker, not check positions -- rather than
+    double-processing the same closes/reactivations.
+    """
+    broker_touched = []
+
+    class _BoomBroker:
+        def get_positions(self):
+            broker_touched.append(1)
+            return {}
+
+    monkeypatch.setattr(cm, "get_broker", lambda: _BoomBroker())
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "advisory_lock", _busy_lock)
+
+    results = cm.run_contradiction_check()
+
+    assert results == []
+    assert broker_touched == []  # never even got to the market-hours check
+
+
+def test_an_uncontended_lock_lets_the_pass_run_normally(monkeypatch):
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "advisory_lock", _free_lock)
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
+
+    results = cm.run_contradiction_check()
+
+    assert broker.closed == []
+    assert not results[0].closed
+
+
+# --------------------------------------------------------------------------
+# Master-account circuit breakers, wired into the hourly pass
+# --------------------------------------------------------------------------
+
+
+def test_a_tripped_breaker_flattens_the_master_account_and_alerts(monkeypatch):
+    """
+    This hourly monitor is documented everywhere as the emergency brake
+    between weekly cycles -- it must actually enforce the master account's
+    own risk limits, not just the two contradiction signals.
+    """
+    from execution import trading_loop
+    from risk.circuit_breakers import BreakerResult
+
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "_run_breaker_check", lambda b, e: [BreakerResult(True, "drawdown breach")])
+    monkeypatch.setattr(trading_loop, "record_equity_snapshot", lambda *a, **k: None)
+
+    checked = []
+    monkeypatch.setattr(cm, "check_all_clients_risk", lambda *a, **k: checked.append(1))
+
+    results = cm.run_contradiction_check()
+
+    assert results == []
+    assert broker.flattened is True
+    assert checked == []  # breaker trip skips the rest of this pass entirely
+
+
+def test_a_clean_breaker_pass_leaves_the_hourly_check_unaffected(monkeypatch):
+    """A no-breach breaker read must not change anything about the normal check."""
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
+
+    results = cm.run_contradiction_check()
+
+    assert broker.flattened is False
+    assert not results[0].closed
 
 
 def test_the_brake_is_direction_aware_for_shorts(monkeypatch):
