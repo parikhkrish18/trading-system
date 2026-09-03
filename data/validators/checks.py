@@ -101,6 +101,48 @@ def check_nonpositive_prices(df: pd.DataFrame, price_cols: tuple[str, ...] = ("o
     return issues
 
 
+def check_extreme_single_day_moves(
+    df: pd.DataFrame,
+    symbol_col: str = "symbol",
+    ts_col: str = "ts",
+    price_col: str = "close",
+    max_abs_move: float = 0.60,
+) -> list[str]:
+    """
+    Flags a symbol whose close moved by more than max_abs_move (60% by
+    default) from one bar to the next, within this batch.
+
+    A single day that big is not unconditionally impossible the way a
+    non-positive close is (check_nonpositive_prices) -- a real S&P 500
+    constituent occasionally does gap 60%+ in a day (a failed drug trial, a
+    collapsed merger, a halt-and-reopen). It is, however, exactly the
+    signature an unhandled stock split leaves in an unadjusted price
+    series: a 4-for-1 forward split reads as a fake ~-75% day, a 1-for-4
+    reverse split as a fake ~+300% day (data/ingest/prices.py's
+    auto_adjust=True / Adjustment.ALL fetches are meant to prevent this at
+    the source going forward) -- and either way, that one bad day then
+    poisons every rolling momentum/volatility window that includes it. This
+    is deliberately an alert-only check (like check_gaps/check_staleness),
+    not a row-dropper: a genuine crash is real data a human should see, not
+    data to silently discard.
+    """
+    issues = []
+    if df.empty or price_col not in df.columns:
+        return issues
+    for symbol, sub in df.groupby(symbol_col):
+        sub = sub.sort_values(ts_col)
+        prior = sub[price_col].shift(1)
+        pct_change = (sub[price_col] - prior) / prior
+        moves = pct_change[pct_change.abs() > max_abs_move]
+        for idx, move in moves.items():
+            issues.append(
+                f"{symbol} on {sub.loc[idx, ts_col]}: {price_col} moved {move:+.1%} from the prior bar "
+                f"(> {max_abs_move:.0%}) — check for an unhandled corporate action (split) or a vendor error "
+                "before trusting any rolling feature that spans this date."
+            )
+    return issues
+
+
 def check_nulls(df: pd.DataFrame, required_cols: list[str]) -> list[str]:
     issues = []
     for col in required_cols:
@@ -124,6 +166,7 @@ def run_all_validators(
     issues: list[str] = []
     issues += check_duplicates(df, key_cols)
     issues += check_nonpositive_prices(df)
+    issues += check_extreme_single_day_moves(df)
     if expect_daily:
         issues += check_gaps(df, expect_daily=True)
         issues += check_staleness(df, max_age_days=max_age_days)

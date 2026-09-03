@@ -2,6 +2,7 @@ import pandas as pd
 
 from data.validators.checks import (
     check_duplicates,
+    check_extreme_single_day_moves,
     check_gaps,
     check_nonpositive_prices,
     check_nulls,
@@ -129,3 +130,51 @@ def test_check_nonpositive_prices_only_flags_the_bad_row():
     assert len(issues) == 1
     assert "BADCO" in issues[0]
     assert "SPY" not in issues[0]
+
+
+def test_check_extreme_single_day_moves_flags_a_split_shaped_jump():
+    """
+    A 1-for-4 reverse split reads as a fake ~+300% single day in an
+    unadjusted price series -- the exact class of bug data/ingest/prices.py's
+    auto_adjust fix targets, and this validator is the early-warning layer
+    for whatever slips through anyway (a vendor bug, a mixed-adjustment
+    history) rather than the primary fix.
+    """
+    dates = pd.bdate_range("2026-08-17", periods=4)
+    df = pd.DataFrame({"symbol": ["SPLITCO"] * 4, "ts": dates, "close": [55.0, 56.0, 220.0, 222.0]})
+    issues = check_extreme_single_day_moves(df)
+    assert len(issues) == 1
+    assert "SPLITCO" in issues[0]
+    assert "+293" in issues[0] or "+292" in issues[0]  # (220-56)/56 ~= +292.9%
+
+
+def test_check_extreme_single_day_moves_ignores_ordinary_daily_noise():
+    dates = pd.bdate_range("2026-08-17", periods=5)
+    df = pd.DataFrame({"symbol": ["SPY"] * 5, "ts": dates, "close": [500.0, 503.0, 498.0, 502.0, 505.0]})
+    assert check_extreme_single_day_moves(df) == []
+
+
+def test_check_extreme_single_day_moves_respects_a_custom_threshold():
+    dates = pd.bdate_range("2026-08-17", periods=2)
+    df = pd.DataFrame({"symbol": ["VOLCO"] * 2, "ts": dates, "close": [100.0, 130.0]})  # +30%
+    assert check_extreme_single_day_moves(df, max_abs_move=0.60) == []
+    assert len(check_extreme_single_day_moves(df, max_abs_move=0.20)) == 1
+
+
+def test_check_extreme_single_day_moves_checks_each_symbol_independently():
+    dates = pd.bdate_range("2026-08-17", periods=2)
+    df = pd.DataFrame(
+        {
+            "symbol": ["SPY", "SPY", "SPLITCO", "SPLITCO"],
+            "ts": list(dates) * 2,
+            "close": [500.0, 503.0, 55.0, 220.0],
+        }
+    )
+    issues = check_extreme_single_day_moves(df)
+    assert len(issues) == 1
+    assert "SPLITCO" in issues[0]
+
+
+def test_check_extreme_single_day_moves_no_prior_bar_is_not_a_move():
+    df = pd.DataFrame({"symbol": ["SPY"], "ts": [pd.Timestamp("2026-08-17")], "close": [500.0]})
+    assert check_extreme_single_day_moves(df) == []

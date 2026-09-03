@@ -4,6 +4,33 @@ from data.ingest import prices
 from data.ingest.prices import _fetch_yfinance, ingest_prices
 
 
+def test_fetch_alpaca_requests_split_and_dividend_adjusted_bars(monkeypatch):
+    """Same rationale as _fetch_yfinance's auto_adjust=True -- Alpaca's default (unset) is raw/unadjusted."""
+    import alpaca.data.historical as alpaca_historical
+    from alpaca.data.enums import Adjustment
+
+    captured = {}
+
+    class _FakeBarsResponse:
+        def __init__(self):
+            idx = pd.MultiIndex.from_tuples([], names=["symbol", "timestamp"])
+            self.df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"], index=idx)
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_stock_bars(self, req):
+            captured["adjustment"] = req.adjustment
+            return _FakeBarsResponse()
+
+    monkeypatch.setattr(alpaca_historical, "StockHistoricalDataClient", _FakeClient)
+
+    prices._fetch_alpaca(["SPY"], pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-05").date())
+
+    assert captured["adjustment"] == Adjustment.ALL
+
+
 def _fake_multi_symbol_frame():
     """
     Mimics yfinance's group_by="ticker" multi-symbol return shape: a
@@ -35,6 +62,28 @@ def test_fetch_yfinance_drops_rows_with_any_null_ohlcv_field(monkeypatch):
     assert df["close"].isna().sum() == 0
     assert len(df[df["symbol"] == "SPY"]) == 3  # all 3 SPY bars kept
     assert len(df[df["symbol"] == "BADCO"]) == 2  # the null-close bar dropped, other 2 kept
+
+
+def test_fetch_yfinance_requests_split_and_dividend_adjusted_prices(monkeypatch):
+    """
+    Regression test for the "+252.7% in 20 days" / "144% annualized vol"
+    bug: auto_adjust=False (the old default here) returns raw OHLC, so a
+    stock's own ordinary split reads as a fake, enormous single-day price
+    move to every rolling-return/volatility feature built on top of it.
+    """
+    import yfinance
+
+    captured = {}
+
+    def fake_download(symbols, **kwargs):
+        captured["kwargs"] = kwargs
+        return _fake_multi_symbol_frame()
+
+    monkeypatch.setattr(yfinance, "download", fake_download)
+
+    _fetch_yfinance(["SPY", "BADCO"], pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-05").date())
+
+    assert captured["kwargs"]["auto_adjust"] is True
 
 
 def test_fetch_yfinance_translates_dotted_tickers_to_dashes(monkeypatch):
@@ -142,3 +191,54 @@ def test_ingest_prices_drops_nonpositive_price_rows_before_writing(monkeypatch):
     assert (captured["df"]["close"] <= 0).sum() == 0
     assert len(alerted) == 1
     assert alerted[0][0] == "price_ingest"
+
+
+def test_ingest_prices_alerts_on_an_extreme_single_day_move(monkeypatch):
+    """
+    Regression test for the "+252.7% in 20 days" / "144% annualized vol"
+    incident: an unhandled split reads as a real, physically-plausible-
+    looking (not caught by check_nonpositive_prices) but wrong single-day
+    jump, and it needs to actually reach someone -- not just sit in a log
+    line nobody's tailing.
+    """
+    df = pd.DataFrame(
+        {
+            "symbol": ["SPLITCO", "SPLITCO"],
+            "ts": pd.to_datetime(["2026-01-02", "2026-01-05"], utc=True),
+            "open": [55.0, 220.0], "high": [56.0, 222.0],
+            "low": [54.0, 219.0], "close": [55.0, 220.0],
+            "volume": [1000, 1000], "source": ["yfinance"] * 2,
+        }
+    )
+    monkeypatch.setattr(prices, "_fetch_yfinance", lambda *a, **k: df)
+    monkeypatch.setattr(prices, "upsert_dataframe", lambda written_df, table, conflict_cols: len(written_df))
+
+    alerted = []
+    monkeypatch.setattr(prices, "alert_pipeline_failure", lambda job, detail: alerted.append((job, detail)))
+
+    ingest_prices(["SPLITCO"], pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-05").date())
+
+    extreme_alerts = [a for a in alerted if a[0] == "price_ingest_extreme_move"]
+    assert len(extreme_alerts) == 1
+    assert "SPLITCO" in extreme_alerts[0][1]
+
+
+def test_ingest_prices_does_not_alert_on_an_extreme_move_for_ordinary_data(monkeypatch):
+    df = pd.DataFrame(
+        {
+            "symbol": ["SPY", "SPY"],
+            "ts": pd.to_datetime(["2026-01-02", "2026-01-05"], utc=True),
+            "open": [500.0, 503.0], "high": [505.0, 508.0],
+            "low": [495.0, 498.0], "close": [502.0, 505.0],
+            "volume": [1000, 1000], "source": ["yfinance"] * 2,
+        }
+    )
+    monkeypatch.setattr(prices, "_fetch_yfinance", lambda *a, **k: df)
+    monkeypatch.setattr(prices, "upsert_dataframe", lambda written_df, table, conflict_cols: len(written_df))
+
+    alerted = []
+    monkeypatch.setattr(prices, "alert_pipeline_failure", lambda job, detail: alerted.append((job, detail)))
+
+    ingest_prices(["SPY"], pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-05").date())
+
+    assert [a for a in alerted if a[0] == "price_ingest_extreme_move"] == []

@@ -22,7 +22,7 @@ import pandas as pd
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
 from data.ingest.universe import resolve_symbols
-from data.validators.checks import check_nonpositive_prices, run_all_validators
+from data.validators.checks import check_extreme_single_day_moves, check_nonpositive_prices, run_all_validators
 from monitoring.alerts import alert_pipeline_failure
 
 
@@ -49,11 +49,31 @@ def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.Data
     # failed ("possibly delisted") before this fix.
     yf_symbol = {s: s.replace(".", "-") for s in symbols}
 
+    # auto_adjust=True, not False: split/dividend-adjusted OHLC, not the raw
+    # traded price. This is not a style preference -- every rolling-return
+    # and volatility feature in this repo (rolling_return(), zscore(), RSI,
+    # ATR, realized_vol) is a plain pct_change()/diff() over `close`, with no
+    # awareness of corporate actions. Fed a RAW close series, a stock's own
+    # ordinary split (forward or reverse) reads as a real, enormous one-day
+    # price move: a 4-for-1 forward split shows as a fake ~-75% day, a
+    # 1-for-4 reverse split as a fake ~+300% day -- and that one bad day
+    # then poisons every rolling window that includes it (a 20-day return
+    # reading "+252.7%", a 20-day realized vol reading "144% annualized")
+    # for as long as it stays in the window, which is exactly the reasoning
+    # a client flagged as obviously wrong. Adjusted OHLC keeps the whole
+    # series internally consistent across the corporate action instead, the
+    # same total-return basis institutional return/vol calculations use.
+    # Hit live 2026-09-03: this was still False, and had been since this
+    # file was first written -- every symbol that ever split while in the
+    # universe was carrying this exact bug in every rolling feature that
+    # touched the split date. See scripts/audit_bad_prices.py for finding
+    # and scripts/rebackfill_prices.py for fixing whatever this already
+    # wrote to `prices`/`features` before this line was corrected.
     raw = yf.download(
         list(yf_symbol.values()),
         start=start.isoformat(),
         end=end.isoformat(),
-        auto_adjust=False,
+        auto_adjust=True,
         group_by="ticker",
         progress=False,
     )
@@ -89,6 +109,7 @@ def _fetch_yfinance(symbols: list[str], start: dt.date, end: dt.date) -> pd.Data
 
 
 def _fetch_alpaca(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
+    from alpaca.data.enums import Adjustment
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
@@ -99,6 +120,12 @@ def _fetch_alpaca(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFr
         timeframe=TimeFrame.Day,
         start=dt.datetime.combine(start, dt.time.min),
         end=dt.datetime.combine(end, dt.time.min),
+        # Same reasoning as _fetch_yfinance's auto_adjust=True just above:
+        # Alpaca's default (unset) is "raw", unadjusted for splits or
+        # dividends -- Adjustment.ALL matches the total-return-adjusted
+        # basis every rolling-return/volatility feature in this repo
+        # assumes `close` is already on.
+        adjustment=Adjustment.ALL,
     )
     bars = client.get_stock_bars(req).df.reset_index()
     bars = bars.rename(columns={"timestamp": "ts"})
@@ -140,6 +167,20 @@ def ingest_prices(symbols: list[str], start: dt.date, end: dt.date, source: str 
         print(f"[validator] {len(issues)} issue(s) found in this batch — review before downstream use:")
         for issue in issues:
             print(f"  - {issue}")
+
+    # A print() nobody's tailing the logs will ever see isn't a real alert.
+    # check_gaps/check_staleness/check_duplicates routinely fire on normal,
+    # expected conditions (a holiday, a symbol newly added to the universe)
+    # -- alerting on every one of those would be exactly the kind of noise
+    # that trains a team to stop reading alerts. An extreme single-day move
+    # is different: it's specifically the signature an unhandled corporate
+    # action (or a vendor error) leaves behind, and it's what silently
+    # produced wrong reasoning on the dashboard before this check existed
+    # (see check_extreme_single_day_moves' docstring) -- worth surfacing on
+    # its own rather than letting it blend into routine validator chatter.
+    extreme_moves = check_extreme_single_day_moves(df)
+    if extreme_moves:
+        alert_pipeline_failure("price_ingest_extreme_move", "; ".join(extreme_moves))
 
     return n
 
