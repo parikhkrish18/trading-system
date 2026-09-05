@@ -8,12 +8,11 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
 
-    # A couple of tests (tests/test_db.py) intentionally hit a real Postgres
-    # connection rather than faking one -- upsert_dataframe relies on
-    # Postgres-specific ON CONFLICT syntax that SQLite's parser doesn't
-    # handle for the INSERT...SELECT form, so a real connection is the only
-    # faithful way to test it. Matches config/settings.py's defaults so no
-    # env vars need to be set explicitly.
+    # Several integration tests intentionally hit real Postgres because the
+    # ingest path uses Postgres-specific INSERT ... SELECT ... ON CONFLICT
+    # semantics. The service container starts empty, so CI must apply the
+    # same ordered schema migrations production/local setup uses before
+    # pytest touches tables such as news_events and universe.
     services:
       postgres:
         image: postgres:17
@@ -39,6 +38,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+
+      - name: Initialize database schema
+        env:
+          PGPASSWORD: change_me_locally
+        run: |
+          for migration in data/schema/*.sql; do
+            echo "Applying ${migration}"
+            psql -v ON_ERROR_STOP=1 -h localhost -U trading -d trading -f "${migration}"
+          done
 
       - name: Lint
         run: ruff check .
