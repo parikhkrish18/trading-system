@@ -1,14 +1,14 @@
 """
 When a position deserves to be closed — and, more importantly, when it
 doesn't. Weekly shortlist membership controls thesis/rotation exits, while
-stop-loss and take-profit levels are hard risk/execution boundaries that
-apply to every held position, including a symbol the fresh screen re-picked.
+explicit per-position stop-loss and take-profit levels are hard execution
+boundaries that apply even when the fresh screen re-picks the symbol.
 
 A held position is closed when any real exit condition fires:
 
-  1. Its own stop-loss or take-profit is hit. These are hard exits and take
-     precedence over shortlist membership — re-picking a name cannot waive
-     the terms the position was opened with.
+  1. Its recorded stop-loss or take-profit is hit. These are hard exits and
+     take precedence over shortlist membership — re-picking a name cannot
+     waive the terms the position was opened with.
   2. It has missed the shortlist for HOLD_MAX_MISSED_CYCLES consecutive
      weekly cycles.
   3. The model's fresh prediction points against the held side by at least
@@ -16,9 +16,12 @@ A held position is closed when any real exit condition fires:
   4. The hourly contradiction monitor flags it (that path lives in
      execution/contradiction_monitor.py).
 
-A symbol that made this cycle's shortlist resets its consecutive-miss
-counter, but only suppresses shortlist/forecast-rotation exits. It does not
-suppress a stop or target that has already been reached.
+Positions created before per-trade exit levels existed retain the legacy
+fallback behavior on a weekly re-pick: shortlist membership resets the miss
+counter and keeps them. The hourly monitor still evaluates those legacy
+positions against the global fallback stop/target every market hour. This
+keeps historical positions compatible without allowing a position that has
+an explicit approved target to sit beyond it.
 """
 from __future__ import annotations
 
@@ -48,7 +51,7 @@ def check_stop_or_target(
     fallback_stop_loss_pct: float,
     fallback_take_profit_pct: float,
 ) -> StopTargetHit | None:
-    """Return the hard exit hit, if any, using the position's recorded levels first."""
+    """Return the exit hit, if any, using recorded levels before global fallbacks."""
     if pnl_pct is None:
         return None
     stop = levels.stop_loss_pct if levels else fallback_stop_loss_pct
@@ -81,26 +84,21 @@ def evaluate_holds(
     levels_by_symbol: dict[str, ExitLevels] | None = None,
     min_flip_return: float = DEFAULT_MIN_FLIP_RETURN,
 ) -> list[HoldDecision]:
-    """
-    Pure exit policy. Stop/target checks are evaluated before shortlist
-    handling because they are hard boundaries. A re-picked position resets
-    its miss counter but still closes if its own stop or target fired.
-    """
+    """Pure exit policy, with explicit per-position stop/targets treated as hard exits."""
     levels_by_symbol = levels_by_symbol or {}
     decisions: list[HoldDecision] = []
     for symbol, qty in positions.items():
         if qty == 0:
             continue
 
-        hit = check_stop_or_target(
-            pnl_pct.get(symbol),
-            levels_by_symbol.get(symbol),
-            stop_loss_pct,
-            take_profit_pct,
-        )
-        if hit:
-            decisions.append(HoldDecision(symbol=symbol, close=True, missed_cycles=0, reasons=[hit.message]))
-            continue
+        levels = levels_by_symbol.get(symbol)
+        # Explicitly approved levels are contractual exit boundaries. Check
+        # them before shortlist membership so a re-pick cannot waive them.
+        if levels is not None:
+            hit = check_stop_or_target(pnl_pct.get(symbol), levels, stop_loss_pct, take_profit_pct)
+            if hit:
+                decisions.append(HoldDecision(symbol=symbol, close=True, missed_cycles=0, reasons=[hit.message]))
+                continue
 
         if symbol in shortlist:
             decisions.append(HoldDecision(symbol=symbol, close=False, missed_cycles=0, reasons=[]))
@@ -119,6 +117,14 @@ def evaluate_holds(
         prediction = predictions.get(symbol)
         if prediction is not None and sign * prediction < 0 and abs(prediction) >= min_flip_return:
             reasons.append(f"model now predicts {prediction:+.2%} against the {side} position")
+
+        # Legacy position with no stored levels: still apply the global
+        # fallback once it is no longer being actively re-picked. The hourly
+        # monitor applies the fallback regardless of shortlist membership.
+        if levels is None:
+            hit = check_stop_or_target(pnl_pct.get(symbol), None, stop_loss_pct, take_profit_pct)
+            if hit:
+                reasons.append(hit.message)
 
         decisions.append(HoldDecision(symbol=symbol, close=bool(reasons), missed_cycles=missed, reasons=reasons))
     return decisions
