@@ -31,14 +31,12 @@ _MIN_REBALANCE_FRACTION = 0.05
 
 
 def _latest_prices(engine, symbols: list[str]) -> dict[str, float]:
-    # Import lazily to avoid a module-level cycle with contradiction_monitor.
     from execution.contradiction_monitor import _latest_prices as latest_prices
 
     return latest_prices(engine, symbols)
 
 
 def _freed_capital_fraction(broker, engine) -> float:
-    # Import lazily for the same reason as _latest_prices.
     from execution.contradiction_monitor import _freed_capital_fraction as freed_capital_fraction
 
     return freed_capital_fraction(broker, engine)
@@ -54,12 +52,24 @@ def rebalance_after_exit(
     log_displaced_close: Callable[[str, str | None], None] | None = None,
 ) -> None:
     """Re-optimize the whole master book after confirmed capital is freed."""
+    excluded = set(excluded_symbols)
+    current_positions = {s: q for s, q in broker.get_positions().items() if q != 0}
+
+    # The close order may be queued or partially filled. Never size a fresh
+    # book against capital that has not actually been released, and never
+    # submit a second close through the rebalance path for the same symbol.
+    still_exiting = excluded.intersection(current_positions)
+    if still_exiting:
+        logger.info(
+            "Post-exit rebalance deferred: %s still present at the broker; waiting for the close to settle.",
+            ", ".join(sorted(still_exiting)),
+        )
+        return
+
     freed_fraction = _freed_capital_fraction(broker, engine)
     if freed_fraction < _MIN_REBALANCE_FRACTION:
         return
 
-    excluded = set(excluded_symbols)
-    current_positions = {s: q for s, q in broker.get_positions().items() if q != 0}
     universe = [s for s in load_active_universe() if s not in excluded]
     if not universe:
         return
@@ -69,9 +79,6 @@ def rebalance_after_exit(
         settings.max_concentrated_positions if settings.strategy_mode == "concentrated" else None
     )
     try:
-        # This is deliberately a FULL-book screen. The old implementation
-        # passed only the freed fraction and excluded every currently-held
-        # symbol, which made a close behave like filling an empty slot.
         candidates = run_screen(
             settings.feature_set_id,
             universe,
