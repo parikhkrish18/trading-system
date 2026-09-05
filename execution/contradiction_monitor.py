@@ -341,24 +341,45 @@ def _log_reactivation(
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
 
-def _attempt_reactivation(broker, engine, request_fn=None) -> None:
+def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None) -> None:
     """
-    After a contradiction close, checks whether meaningful capital is now
-    sitting idle and, if so, immediately re-screens for new candidate(s) to
-    redeploy it -- same confidence bar and selection logic as the weekly
-    cycle (models.screener.run_screen), just scoped to the freed fraction of
-    capital instead of the whole book, and restricted to symbols not
-    currently held. No-ops if the freed slice is too small to bother with,
-    or nothing confident turns up.
+    After a confirmed mid-cycle exit, production calls this with the symbols
+    that just closed. That path delegates to the whole-book optimizer so
+    surviving positions can grow, shrink, or be displaced rather than an
+    empty slot merely being refilled.
 
-    In concentrated mode (STRATEGY_MODE=concentrated) this also caps how
-    many NEW names it will pick at how many slots are actually open --
-    settings.max_concentrated_positions minus what's still held after the
-    close(s) -- so a mid-week close on a 3-name book tops back up to 3
-    rather than adding a fresh 2-3 on top of whatever survived. This is what
-    keeps the book at its target count continuously instead of only at the
-    next weekly cycle.
+    Calls without `excluded_symbols` retain the historical slice-only path.
+    That keeps direct tooling/backward-compatible callers stable while the
+    real post-exit path gets the stronger whole-book semantics.
     """
+    if excluded_symbols is not None:
+        from execution.full_book_rebalance import rebalance_after_exit
+
+        def _log_displaced_close(symbol: str, approval_status: str | None) -> None:
+            result = ContradictionResult(
+                symbol=symbol,
+                side="long",
+                closed=True,
+                reasons=[
+                    {
+                        "signal": "portfolio_rebalance",
+                        "value": None,
+                        "detail": "position displaced by a higher-conviction full-book rebalance after another exit",
+                    }
+                ],
+            )
+            _log_closure(result, broker.mode, 0.0, approval_status=approval_status or "approved")
+
+        rebalance_after_exit(
+            broker,
+            engine,
+            excluded_symbols=excluded_symbols,
+            request_fn=request_fn,
+            log_candidate=_log_reactivation,
+            log_displaced_close=_log_displaced_close,
+        )
+        return
+
     freed_fraction = _freed_capital_fraction(broker, engine)
     if freed_fraction < _MIN_REACTIVATION_FRACTION:
         return
@@ -651,7 +672,12 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         send_followup(outcome_message)  # Telegram's post-trade update — see approval_gate module docstring
 
     if closed_any:
-        _attempt_reactivation(broker, engine, request_fn=request_fn)
+        _attempt_reactivation(
+            broker,
+            engine,
+            request_fn=request_fn,
+            excluded_symbols=set(closed),
+        )
 
     return results
 
