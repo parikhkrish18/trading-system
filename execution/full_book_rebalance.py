@@ -170,9 +170,7 @@ def rebalance_after_exit(
             logger.warning("%s", allocation.reason)
         send_followup(_allocation_confirmation(allocation, approved_candidates))
 
-    target_pct_by_symbol: dict[str, float] = {
-        symbol: 0.0 for symbol in approved_close_symbols
-    }
+    target_pct_by_symbol: dict[str, float] = dict.fromkeys(approved_close_symbols, 0.0)
     target_pct_by_symbol.update(
         {c.symbol: c.target_position_pct or 0.0 for c in approved_candidates}
     )
