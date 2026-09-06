@@ -1,16 +1,15 @@
 """Regression coverage for the historical news_events duplicate repair."""
 
-from pathlib import Path
-
 from data.ingest.db import get_engine
 
 
-_MIGRATION = Path("data/schema/014_news_id_unique.sql")
+_MIGRATION = "data/schema/014_news_id_unique.sql"
 
 
 def test_news_id_migration_deduplicates_and_preserves_scoring_fields():
     """A corrected timestamp must not make the id-only PK migration fail."""
-    sql = _MIGRATION.read_text(encoding="utf-8")
+    with open(_MIGRATION, encoding="utf-8") as migration_file:
+        sql = migration_file.read()
     engine = get_engine()
 
     with engine.begin() as conn:
