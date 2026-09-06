@@ -2,7 +2,6 @@
 
 from data.ingest.db import get_engine
 
-
 _MIGRATION = "data/schema/014_news_id_unique.sql"
 
 
