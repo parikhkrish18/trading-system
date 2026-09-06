@@ -12,7 +12,8 @@
     <div class="topbar-right">
       <span id="mode-badge" class="badge">…</span>
       <button id="refresh-btn" class="btn">Refresh</button>
-      <a id="logout-link" class="btn btn-secondary" href="/logout">Log out</a>
+      <a id="client-portal-link" class="btn btn-secondary" href="/portal" target="_blank" rel="noopener">Client Portal</a>
+      <a id="logout-link" class="btn btn-secondary" href="/logout">Operator log out</a>
     </div>
   </header>
 
@@ -155,6 +156,7 @@
     <div id="tab-clients" class="tab-panel" hidden>
       <section id="add-client-section">
         <h2>Add Client <span class="muted" id="client-trading-badge"></span></h2>
+        <p class="muted">Client passwords are for the separate <a href="/portal" target="_blank" rel="noopener">Client Portal</a>, not the operator login page.</p>
         <form id="add-client-form" class="filter-row" style="flex-wrap: wrap;">
           <input id="client-name" placeholder="Client name" required />
           <input id="client-alpaca-key" placeholder="Alpaca API key" required />
