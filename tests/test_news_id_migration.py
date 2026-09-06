@@ -13,8 +13,11 @@ def test_news_id_migration_deduplicates_and_preserves_scoring_fields():
 
     with engine.begin() as conn:
         # A temp table shadows production/public.news_events for this one
-        # connection, so the migration can be exercised against the exact
+        # transaction, so the migration can be exercised against the exact
         # pre-014 shape without disturbing the schema initialized by CI.
+        # ON COMMIT DROP matters with SQLAlchemy's connection pool: without
+        # it the temp table can survive the transaction and shadow the real
+        # table for unrelated tests that later reuse this DB connection.
         conn.exec_driver_sql(
             """
             CREATE TEMP TABLE news_events (
@@ -29,7 +32,7 @@ def test_news_id_migration_deduplicates_and_preserves_scoring_fields():
                 sentiment_reason TEXT,
                 sentiment_relevant BOOLEAN,
                 CONSTRAINT news_events_pkey PRIMARY KEY (id, ts)
-            )
+            ) ON COMMIT DROP
             """
         )
         conn.exec_driver_sql(
