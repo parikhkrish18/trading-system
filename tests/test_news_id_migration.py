@@ -1,4 +1,5 @@
 """Regression coverage for the historical news_events duplicate repair."""
+
 from __future__ import annotations
 
 from pathlib import Path
