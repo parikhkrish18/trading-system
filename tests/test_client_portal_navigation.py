@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 INDEX_HTML = Path("monitoring/dashboard/static/index.html")
 
 
