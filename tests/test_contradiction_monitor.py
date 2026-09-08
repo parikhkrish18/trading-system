@@ -91,6 +91,19 @@ def _no_slack(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_equity_writes(monkeypatch):
+    """
+    record_equity_snapshot ultimately hits a real DB via monitoring/equity.py's
+    own get_engine() (independent of cm.get_engine, which most tests here
+    monkeypatch instead) -- left un-mocked, the hourly equity snapshot the
+    check now records on every open-market pass would try a real connection
+    in every test. Individual tests that care about this call assert on it
+    via their own capturing lambda instead.
+    """
+    monkeypatch.setattr(cm, "record_equity_snapshot", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
 def _gate_wide_open(monkeypatch):
     """
     Pre-existing tests exercise detection and execution, not the gate — give
@@ -158,6 +171,85 @@ def test_no_open_positions_is_a_clean_noop(monkeypatch):
     results = cm.run_contradiction_check()
 
     assert results == []
+
+
+# --- hourly equity snapshot (dashboard equity/drawdown chart resolution) ----
+
+
+def test_hourly_check_records_an_equity_snapshot_when_the_book_is_flat(monkeypatch):
+    """
+    Recorded even with nothing held: a quiet, flat hour is still a real
+    point on the equity curve (see the comment at the call site) -- this is
+    what densifies the dashboard's chart from once-a-week to hourly.
+    """
+    broker = _FakeBroker({}, portfolio_value=105_000.0)
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    calls = []
+    monkeypatch.setattr(cm, "record_equity_snapshot", lambda value, mode: calls.append((value, mode)))
+
+    cm.run_contradiction_check()
+
+    assert calls == [(105_000.0, "paper")]
+
+
+def test_hourly_check_records_an_equity_snapshot_alongside_a_normal_pass(monkeypatch):
+    broker = _FakeBroker({"AAPL": 10}, portfolio_value=98_500.0)
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    calls = []
+    monkeypatch.setattr(cm, "record_equity_snapshot", lambda value, mode: calls.append((value, mode)))
+
+    cm.run_contradiction_check()
+
+    assert calls == [(98_500.0, "paper")]
+
+
+def test_no_snapshot_recorded_while_the_market_is_closed(monkeypatch):
+    broker = _FakeBroker({"AAPL": 10}, is_open=False)
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    calls = []
+    monkeypatch.setattr(cm, "record_equity_snapshot", lambda *a, **k: calls.append(1))
+
+    cm.run_contradiction_check()
+
+    assert calls == []  # skipped before reaching the market-open gate's downstream work
+
+
+def test_no_snapshot_recorded_when_the_lock_is_already_held(monkeypatch):
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "advisory_lock", _busy_lock)
+    calls = []
+    monkeypatch.setattr(cm, "record_equity_snapshot", lambda *a, **k: calls.append(1))
+
+    cm.run_contradiction_check()
+
+    assert calls == []
+
+
+def test_snapshot_failure_does_not_abort_the_rest_of_the_check(monkeypatch):
+    """A DB hiccup recording the snapshot must not take down the actual contradiction check."""
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(cm, "record_equity_snapshot", _boom)
+
+    results = cm.run_contradiction_check()
+
+    assert len(results) == 1  # the position was still checked despite the snapshot failure
 
 
 def test_negative_sentiment_closes_a_long_position(monkeypatch):

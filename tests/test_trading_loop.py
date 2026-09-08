@@ -940,6 +940,107 @@ def test_miss_counter_advances_and_persists_for_held_positions(monkeypatch):
     assert stored["counts"]["NEW"] == 0  # fresh open starts clean
 
 
+# --- concentrated-mode position cap (weekly refresh must not overshoot it) --
+
+
+def test_concentrated_refresh_does_not_open_beyond_the_position_cap(monkeypatch):
+    """
+    The bug this guards against: an already-held book gets fresh, unrelated
+    top picks proposed on top of it every Monday instead of only filling
+    whatever slots are actually open. Book already holds 2 of a max of 2 —
+    a screen returning 2 brand-new candidates should propose neither as an
+    open (HELD1/HELD2 aren't in the shortlist here, but stay held below
+    their miss limit).
+    """
+    broker = _FakeBroker(positions={"HELD1": 10.0, "HELD2": 5.0})
+    monkeypatch.setattr(trading_loop.settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(trading_loop.settings, "max_concentrated_positions", 2)
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 3)
+    candidates = [_candidate("NEW1", "long", 0.5, pred_return=0.05), _candidate("NEW2", "long", 0.5, pred_return=0.04)]
+    _wire_basic_cycle(monkeypatch, broker, candidates, {"NEW1": 100.0, "NEW2": 100.0})
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"HELD1": 0, "HELD2": 0})
+
+    gate_called = []
+
+    def gate(proposals, *, context, **kwargs):
+        gate_called.append(list(proposals))
+        return _approve_all(proposals, context=context)
+
+    result = trading_loop.run_cycle("v3", ["NEW1", "NEW2", "HELD1", "HELD2"], request_fn=gate)
+
+    # Both candidates get trimmed away (no open slots) and nothing needs
+    # closing, so there's nothing left to ask a human about at all.
+    assert result.status == "no_candidates"
+    assert gate_called == []
+    assert broker.submitted == []  # nothing new was ever sent to the broker
+
+
+def test_concentrated_refresh_fills_only_the_open_slots_highest_conviction_first(monkeypatch):
+    """One slot freed by a close should go to the single best new pick, not all of them."""
+    broker = _FakeBroker(positions={"OLD": 10.0})
+    monkeypatch.setattr(trading_loop.settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(trading_loop.settings, "max_concentrated_positions", 1)
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 1)  # OLD's miss closes it this cycle
+    candidates = [
+        _candidate("BEST", "long", 0.5, pred_return=0.05),
+        _candidate("WORSE", "long", 0.5, pred_return=0.02),
+    ]
+    _wire_basic_cycle(monkeypatch, broker, candidates, {"BEST": 100.0, "WORSE": 100.0})
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {})
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["BEST", "WORSE", "OLD"], request_fn=gate)
+
+    open_proposals = [p.symbol for p in seen["proposals"] if p.action == "open"]
+    assert open_proposals == ["BEST"]  # OLD's one freed slot goes to the higher-conviction pick
+
+
+def test_concentrated_refresh_leaves_an_already_held_resize_untouched(monkeypatch):
+    """A currently-held symbol re-picked by the screen is a resize, not a new slot -- the cap must not drop it."""
+    broker = _FakeBroker(positions={"HELD": 10.0})
+    monkeypatch.setattr(trading_loop.settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(trading_loop.settings, "max_concentrated_positions", 1)
+    candidates = [_candidate("HELD", "long", 1.0, pred_return=0.05)]
+    _wire_basic_cycle(monkeypatch, broker, candidates, {"HELD": 100.0})
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["HELD"], request_fn=gate)
+
+    open_proposals = [p.symbol for p in seen["proposals"] if p.action == "open"]
+    assert open_proposals == ["HELD"]  # still resized/re-proposed, not dropped as if it needed a new slot
+
+
+def test_diversified_mode_is_unaffected_by_the_concentrated_cap(monkeypatch):
+    """The cap only applies under STRATEGY_MODE=concentrated -- diversified books keep their normal top-k behavior."""
+    broker = _FakeBroker(positions={"HELD1": 10.0, "HELD2": 5.0})
+    monkeypatch.setattr(trading_loop.settings, "strategy_mode", "diversified")
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 3)
+    candidates = [_candidate("NEW1", "long", 0.5), _candidate("NEW2", "long", 0.5)]
+    _wire_basic_cycle(monkeypatch, broker, candidates, {"NEW1": 100.0, "NEW2": 100.0})
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {"HELD1": 0, "HELD2": 0})
+
+    seen = {}
+
+    def gate(proposals, *, context, **kwargs):
+        seen["proposals"] = list(proposals)
+        return _approve_all(proposals, context=context)
+
+    trading_loop.run_cycle("v3", ["NEW1", "NEW2", "HELD1", "HELD2"], request_fn=gate)
+
+    open_proposals = {p.symbol for p in seen["proposals"] if p.action == "open"}
+    assert open_proposals == {"NEW1", "NEW2"}  # both proposed -- no concentrated cap in this mode
+
+
 def test_market_regime_data_gap_alerts_loudly_instead_of_failing_silent(monkeypatch):
     """The CHOP fallback on missing proxy history must page someone — it hid for weeks as a silent warning."""
     monkeypatch.setattr(trading_loop.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["ts", "high", "low", "close"]))

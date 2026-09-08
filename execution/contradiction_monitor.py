@@ -68,6 +68,7 @@ from features.quant.momentum import rolling_return
 from models.screener import run_screen
 from monitoring import reasoning
 from monitoring.alerts import configure_file_logging, send_slack_alert
+from monitoring.equity import record_equity_snapshot
 from risk.sizing import allocate_by_conviction
 
 logger = logging.getLogger(__name__)
@@ -551,8 +552,21 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     breaker_triggers = _run_breaker_check(broker, engine)
     if breaker_triggers:
         reasons = "; ".join(r.reason for r in breaker_triggers)
-        _flatten_and_alert(broker, reasons)
+        _flatten_and_alert(broker, reasons)  # already snapshots equity post-flatten, see trading_loop._flatten_and_alert
         return []
+
+    # A snapshot every hour the market's open, not just once a week from
+    # trading_loop.run_cycle -- without this, the dashboard's equity/
+    # drawdown chart had exactly one real data point per week (this monitor
+    # runs 6-7x/day and can close positions on its own, none of which used
+    # to leave a mark). Recorded here rather than only after a close so a
+    # quiet hour still contributes a point -- a flat book recovering from
+    # drawdown is as real a data point as one that moved. Best-effort: a
+    # missed snapshot shouldn't take down the actual contradiction check.
+    try:
+        record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
+    except Exception:
+        logger.exception("Could not record this hour's equity snapshot — continuing with the rest of the check.")
 
     # Client self-service risk controls (max-drawdown auto-close,
     # profit-target auto-secure — see execution/client_risk_controls.py)

@@ -589,6 +589,37 @@ def run_cycle(
         held_summary = ", ".join(f"{d.symbol} ({d.missed_cycles} missed cycle(s))" for d in held_decisions)
         logger.info("Holding despite missing the shortlist — no exit condition fired: %s", held_summary)
 
+    # Cap total book size at settings.max_concentrated_positions: `candidates`
+    # is the top-N shortlist by conviction across the WHOLE universe,
+    # computed with no regard to what's already held (that's deliberate —
+    # it's also the rotation signal evaluate_holds just used above). Left
+    # alone, every candidate not already held would be proposed as a fresh
+    # open on top of whatever survived the hold evaluation, so a book that
+    # already holds 2 positions could end up with 5 after 3 more open. Any
+    # candidate that's already held is a resize, not a new slot, and passes
+    # through untouched; only genuinely new picks compete for whatever slots
+    # remain, highest conviction first (candidates is already sorted that
+    # way — see select_concentrated_trades). Mirrors the same cap
+    # execution/contradiction_monitor.py's _attempt_reactivation applies
+    # mid-week via max_positions_override, just enforced here post-hoc since
+    # the weekly screen needs the full universe scored for hold evaluation
+    # regardless of open slots.
+    if settings.strategy_mode == "concentrated" and candidates:
+        remaining_open_symbols = {
+            s for s, qty in current_positions.items() if qty != 0 and s not in set(closing_symbols)
+        }
+        open_slots = max(0, settings.max_concentrated_positions - len(remaining_open_symbols))
+        new_picks = [c for c in candidates if c.symbol not in remaining_open_symbols]
+        if len(new_picks) > open_slots:
+            keep_new_symbols = {c.symbol for c in new_picks[:open_slots]}
+            dropped = [c.symbol for c in new_picks[open_slots:]]
+            logger.info(
+                "Concentrated book already holds %d of %d target position(s) after this cycle's closes — "
+                "capping new opens to %d slot(s), dropping %s rather than exceeding the position limit.",
+                len(remaining_open_symbols), settings.max_concentrated_positions, open_slots, ", ".join(dropped),
+            )
+            candidates = [c for c in candidates if c.symbol in remaining_open_symbols or c.symbol in keep_new_symbols]
+
     if not candidates and not closing_symbols:
         logger.info("No candidates cleared the confidence bar, and no exit condition fired — holding the book as-is.")
         send_slack_alert("No confident candidates this cycle — nothing traded, existing positions held.", severity="info")
