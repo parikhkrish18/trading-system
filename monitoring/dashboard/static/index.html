@@ -37,6 +37,27 @@
 
   <main>
     <div id="tab-overview" class="tab-panel">
+    <section id="account-section">
+      <h2>Account Overview <span class="muted">(cash vs. deployed into open positions)</span></h2>
+      <div id="account-summary" class="summary-row"></div>
+      <div id="account-alloc-bar"></div>
+    </section>
+
+    <section id="equity-section">
+      <h2>Equity &amp; Drawdown <span class="muted">(background shading = CHOP regime — hover a chart for the value at a point)</span></h2>
+      <div class="summary-row" id="equity-summary"></div>
+      <div class="chart-pair">
+        <div class="chart-box">
+          <h3>Equity</h3>
+          <div id="equity-chart"></div>
+        </div>
+        <div class="chart-box">
+          <h3>Drawdown</h3>
+          <div id="drawdown-chart"></div>
+        </div>
+      </div>
+    </section>
+
     <section id="positions-section">
       <h2>Positions <span class="muted" id="positions-count"></span></h2>
       <div id="positions-summary" class="summary-row"></div>
@@ -56,21 +77,6 @@
           </thead>
           <tbody></tbody>
         </table>
-      </div>
-    </section>
-
-    <section id="equity-section">
-      <h2>Equity &amp; Drawdown <span class="muted">(background shading = CHOP regime)</span></h2>
-      <div class="summary-row" id="equity-summary"></div>
-      <div class="chart-pair">
-        <div class="chart-box">
-          <h3>Equity</h3>
-          <div id="equity-chart"></div>
-        </div>
-        <div class="chart-box">
-          <h3>Drawdown</h3>
-          <div id="drawdown-chart"></div>
-        </div>
       </div>
     </section>
 

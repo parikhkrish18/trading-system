@@ -1290,3 +1290,93 @@ def test_market_clock_passes_through_broker_response_when_closed(monkeypatch, cl
     body = resp.json()
     assert body["is_open"] is False
     assert body["next_open"] == "2026-08-31T13:30:00+00:00"
+
+
+# ---------- /api/account (cash vs. invested overview) ----------
+
+
+class _FakeAccountBroker:
+    def __init__(self, positions, portfolio_value, account=None, mode="paper"):
+        self._positions = positions
+        self._portfolio_value = portfolio_value
+        self._account = account
+        self.mode = mode
+
+    def get_positions_detailed(self):
+        return self._positions
+
+    def get_portfolio_value(self):
+        return self._portfolio_value
+
+    def get_account(self):
+        if self._account is None:
+            raise RuntimeError("get_account not supported")
+        return self._account
+
+
+def test_account_prefers_the_brokers_own_cash_figure_when_available(monkeypatch, client):
+    """Alpaca-style broker: get_account()'s 'cash' is authoritative, not the derived one."""
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeAccountBroker(
+            [{"symbol": "TSLA", "market_value": 21000.0}],
+            portfolio_value=100_000.0,
+            account={"cash": 79500.0, "buying_power": 159000.0},
+        ),
+    )
+    resp = client.get("/api/account")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cash"] == pytest.approx(79500.0)  # broker's own figure, not 100000 - 21000
+    assert body["invested"] == pytest.approx(21000.0)
+    assert body["portfolio_value"] == pytest.approx(100_000.0)
+    assert body["buying_power"] == pytest.approx(159000.0)
+    assert body["invested_pct"] == pytest.approx(0.21)
+    assert body["mode"] == "paper"
+
+
+def test_account_derives_cash_when_the_broker_has_no_cash_figure(monkeypatch, client):
+    """IBKR-style broker (or any get_account() failure): fall back to portfolio_value - invested."""
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeAccountBroker(
+            [{"symbol": "AAPL", "market_value": 30000.0}],
+            portfolio_value=100_000.0,
+            account=None,  # get_account() raises
+        ),
+    )
+    resp = client.get("/api/account")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["invested"] == pytest.approx(30000.0)
+    assert body["cash"] == pytest.approx(70000.0)
+    assert body["buying_power"] is None
+
+
+def test_account_nets_short_market_value_against_cash(monkeypatch, client):
+    """A short's negative market_value nets against cash so cash + invested == portfolio_value."""
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeAccountBroker(
+            [{"symbol": "TSLA", "market_value": 20000.0}, {"symbol": "GME", "market_value": -5000.0}],
+            portfolio_value=100_000.0,
+            account=None,
+        ),
+    )
+    resp = client.get("/api/account")
+    body = resp.json()
+    assert body["invested"] == pytest.approx(15000.0)
+    assert body["cash"] == pytest.approx(85000.0)
+    assert body["cash"] + body["invested"] == pytest.approx(body["portfolio_value"])
+
+
+def test_account_with_no_open_positions_is_all_cash(monkeypatch, client):
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeAccountBroker([], portfolio_value=50_000.0, account=None),
+    )
+    resp = client.get("/api/account")
+    body = resp.json()
+    assert body["invested"] == pytest.approx(0.0)
+    assert body["cash"] == pytest.approx(50_000.0)
+    assert body["n_positions"] == 0

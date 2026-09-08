@@ -317,6 +317,57 @@ def _clean_records(df: pd.DataFrame) -> list[dict]:
     return json.loads(df.where(pd.notna(df), None).to_json(orient="records", date_format="iso"))
 
 
+@app.get("/api/account")
+def get_account() -> dict:
+    """
+    Cash vs. invested breakdown for the operator overview: how much of the
+    book sits in cash right now vs. deployed into open positions.
+
+    invested/cash are derived from get_portfolio_value() and
+    get_positions_detailed() — both implemented uniformly by AlpacaBroker
+    and IBKRBroker — rather than from get_account()'s raw dict, whose keys
+    differ entirely between the two (Alpaca: cash/equity/buying_power;
+    IBKR: raw accountSummary tags like NetLiquidation/TotalCashValue), so
+    this stays correct under either BROKER setting. Where get_account()
+    does report a genuine 'cash' figure (Alpaca), that's preferred over the
+    derived one since it is the broker's own settled-cash number rather
+    than an equity/positions arithmetic approximation; a get_account()
+    failure (network hiccup, or IBKR's non-matching keys) just falls back
+    to the derived figure rather than failing the whole endpoint.
+    """
+    broker = get_broker()
+    portfolio_value = broker.get_portfolio_value()
+    positions = broker.get_positions_detailed()
+    # Signed, not gross: a short's market_value is already negative (Alpaca
+    # and IBKR both report it that way), so this sum is net exposure and
+    # cash + invested == portfolio_value holds exactly, long or short.
+    invested = sum(p["market_value"] for p in positions)
+
+    cash = None
+    buying_power = None
+    try:
+        account = broker.get_account() or {}
+        raw_cash = account.get("cash")
+        cash = float(raw_cash) if raw_cash is not None else None
+        raw_bp = account.get("buying_power")
+        buying_power = float(raw_bp) if raw_bp is not None else None
+    except Exception:
+        logger.warning("Could not read get_account() for cash/buying_power — using the derived figure instead.")
+    if cash is None:
+        cash = portfolio_value - invested
+
+    return {
+        "portfolio_value": portfolio_value,
+        "cash": cash,
+        "invested": invested,
+        "invested_pct": (invested / portfolio_value) if portfolio_value else None,
+        "cash_pct": (cash / portfolio_value) if portfolio_value else None,
+        "buying_power": buying_power,
+        "n_positions": len(positions),
+        "mode": broker.mode,
+    }
+
+
 @app.get("/api/positions")
 def get_positions() -> list[dict]:
     broker = get_broker()

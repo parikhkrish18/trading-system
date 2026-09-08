@@ -219,6 +219,44 @@ h3 { font-size: 13px; color: var(--text-muted); margin: 0 0 8px; font-weight: 60
 }
 .chart-box svg { width: 100%; height: auto; display: block; }
 
+/* Hoverable line charts (renderLineChart in app.js): the wrapper is the
+   positioning context for the floating tooltip, the guide line/dot live
+   inside the SVG itself (toggled via opacity so no extra DOM churn on
+   every mousemove) and track the nearest data point to the cursor. */
+.chart-hover-wrap { position: relative; cursor: crosshair; }
+.line-chart-svg .hover-guide { pointer-events: none; }
+.line-chart-svg .hover-dot { pointer-events: none; }
+.chart-tooltip {
+  position: absolute;
+  transform: translate(-50%, -100%) translateY(-10px);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  pointer-events: none;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  z-index: 5;
+}
+.chart-tooltip.tooltip-left { transform: translate(-90%, -100%) translateY(-10px); }
+.chart-tooltip.tooltip-right { transform: translate(-10%, -100%) translateY(-10px); }
+.chart-tooltip-value { font-weight: 700; font-variant-numeric: tabular-nums; }
+.chart-tooltip-time { color: var(--text-muted); font-size: 11px; margin-top: 1px; }
+
+/* --- Account overview: cash vs. invested --- */
+.alloc-bar {
+  display: flex;
+  height: 20px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+}
+.alloc-bar-invested { background: var(--accent); }
+.alloc-bar-cash { background: var(--text-muted); opacity: 0.5; }
+.alloc-bar-legend { display: flex; gap: 18px; margin-top: 8px; font-size: 12px; color: var(--text-muted); }
+
 .breakers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
 .breaker-card {
   border-radius: var(--radius);

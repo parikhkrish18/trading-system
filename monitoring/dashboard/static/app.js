@@ -39,7 +39,19 @@ async function fetchJSON(url, opts) {
 // 'chop'|'trend'|null -- when given, shades the background behind each
 // point-to-point segment so regime is visible directly on the chart instead
 // of only in a separate table.
-function renderLineChart(container, points, { color = "#5b8cff", height = 160, zeroLine = false, regimeAt = null } = {}) {
+// `valueFmt(y)` formats a point's y-value for the hover tooltip (defaults to
+// 2-decimal number) -- callers pass fmt.money/fmt.pct so the tooltip reads
+// in the same units as the chart (dollars for equity, % for drawdown, etc).
+// Hovering (mouse or touch) tracks the nearest point to the pointer and
+// shows it via a guide line + dot drawn into the SVG plus a floating
+// tooltip with that point's exact value and timestamp -- the two summary
+// numbers in the header only ever show the latest/peak, so this is the
+// only way to read any other point's value without a table alongside it.
+function renderLineChart(
+  container,
+  points,
+  { color = "#5b8cff", height = 160, zeroLine = false, regimeAt = null, valueFmt = (v) => fmt.num(v, 2) } = {}
+) {
   container.innerHTML = "";
   if (!points || points.length < 2) {
     container.innerHTML = '<div class="empty-state">Not enough data yet.</div>';
@@ -80,16 +92,80 @@ function renderLineChart(container, points, { color = "#5b8cff", height = 160, z
   }
 
   const svg = `
-    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-      ${bandsSvg}
-      ${zeroLine ? `<line x1="${pad}" y1="${zeroY}" x2="${width - pad}" y2="${zeroY}" stroke="#8b92a6" stroke-dasharray="3,3" stroke-width="1" />` : ""}
-      <path d="${path}" fill="none" stroke="${color}" stroke-width="2" />
-    </svg>
+    <div class="chart-hover-wrap">
+      <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" class="line-chart-svg">
+        ${bandsSvg}
+        ${zeroLine ? `<line x1="${pad}" y1="${zeroY}" x2="${width - pad}" y2="${zeroY}" stroke="#8b92a6" stroke-dasharray="3,3" stroke-width="1" />` : ""}
+        <path d="${path}" fill="none" stroke="${color}" stroke-width="2" />
+        <line class="hover-guide" x1="0" y1="0" x2="0" y2="${height}" stroke="#8b92a6" stroke-width="1" stroke-dasharray="2,2" opacity="0" />
+        <circle class="hover-dot" r="4" fill="${color}" stroke="#fff" stroke-width="1.5" opacity="0" />
+      </svg>
+      <div class="chart-tooltip" hidden></div>
+    </div>
     <div class="muted" style="display:flex;justify-content:space-between;font-size:11px;margin-top:4px;">
       <span>${fmt.time(points[0].label)}</span>
       <span>${fmt.time(points[points.length - 1].label)}</span>
     </div>`;
   container.innerHTML = svg;
+
+  const wrap = container.querySelector(".chart-hover-wrap");
+  const svgEl = container.querySelector(".line-chart-svg");
+  const guide = container.querySelector(".hover-guide");
+  const dot = container.querySelector(".hover-dot");
+  const tooltip = container.querySelector(".chart-tooltip");
+
+  function indexForClientX(clientX) {
+    const rect = svgEl.getBoundingClientRect();
+    if (!rect.width) return 0;
+    const relX = ((clientX - rect.left) / rect.width) * width;
+    const idx = Math.round((relX - pad) / xStep);
+    return Math.min(points.length - 1, Math.max(0, idx));
+  }
+
+  function showAt(idx) {
+    const [x, y] = coords[idx];
+    guide.setAttribute("x1", x.toFixed(1));
+    guide.setAttribute("x2", x.toFixed(1));
+    guide.setAttribute("opacity", "1");
+    dot.setAttribute("cx", x.toFixed(1));
+    dot.setAttribute("cy", y.toFixed(1));
+    dot.setAttribute("opacity", "1");
+
+    const pctX = x / width;
+    const pctY = y / height;
+    tooltip.hidden = false;
+    tooltip.classList.toggle("tooltip-left", pctX > 0.75);
+    tooltip.classList.toggle("tooltip-right", pctX < 0.25);
+    tooltip.style.left = `${(pctX * 100).toFixed(2)}%`;
+    tooltip.style.top = `${(pctY * 100).toFixed(2)}%`;
+    tooltip.innerHTML = `
+      <div class="chart-tooltip-value">${valueFmt(points[idx].y)}</div>
+      <div class="chart-tooltip-time">${fmt.time(points[idx].label)}</div>`;
+  }
+
+  function hide() {
+    guide.setAttribute("opacity", "0");
+    dot.setAttribute("opacity", "0");
+    tooltip.hidden = true;
+  }
+
+  wrap.addEventListener("mousemove", (e) => showAt(indexForClientX(e.clientX)));
+  wrap.addEventListener("mouseleave", hide);
+  wrap.addEventListener(
+    "touchstart",
+    (e) => {
+      if (e.touches.length) showAt(indexForClientX(e.touches[0].clientX));
+    },
+    { passive: true }
+  );
+  wrap.addEventListener(
+    "touchmove",
+    (e) => {
+      if (e.touches.length) showAt(indexForClientX(e.touches[0].clientX));
+    },
+    { passive: true }
+  );
+  wrap.addEventListener("touchend", hide);
 }
 
 // Grouped bar chart for the report card — same hand-rolled SVG approach as
@@ -415,7 +491,7 @@ async function loadEquity() {
   renderLineChart(
     document.getElementById("equity-chart"),
     rows.map((r) => ({ y: r.equity_value, label: r.ts })),
-    { color: "#5b8cff", regimeAt: sortedRegimes.length ? regimeAt : null }
+    { color: "#5b8cff", regimeAt: sortedRegimes.length ? regimeAt : null, valueFmt: fmt.money }
   );
 
   // Same "don't fake a 0%" rule as the summary tile above, applied point by
@@ -428,7 +504,51 @@ async function loadEquity() {
       return runningPeak > 0 ? { y: r.equity_value / runningPeak - 1, label: r.ts } : null;
     })
     .filter((p) => p !== null);
-  renderLineChart(document.getElementById("drawdown-chart"), ddPoints, { color: "#e5484d", zeroLine: true });
+  renderLineChart(document.getElementById("drawdown-chart"), ddPoints, {
+    color: "#e5484d",
+    zeroLine: true,
+    valueFmt: (v) => fmt.pct(v, 2),
+  });
+}
+
+// ---------- Account overview: cash vs. invested ----------
+async function loadAccountOverview() {
+  const summary = document.getElementById("account-summary");
+  const bar = document.getElementById("account-alloc-bar");
+  let account;
+  try {
+    account = await fetchJSON("/api/account");
+  } catch (e) {
+    summary.innerHTML = `<div class="empty-state">Could not load account overview: ${e.message}</div>`;
+    bar.innerHTML = "";
+    return;
+  }
+
+  const investedPct = account.invested_pct;
+  const cashPct = account.cash_pct;
+  summary.innerHTML = `
+    <div class="stat-card"><div class="value">${fmt.money(account.portfolio_value)}</div><div class="label">Total portfolio value</div></div>
+    <div class="stat-card"><div class="value">${fmt.money(account.cash)}</div><div class="label">Cash${cashPct === null ? "" : ` (${fmt.pct(cashPct, 1)})`}</div></div>
+    <div class="stat-card"><div class="value">${fmt.money(account.invested)}</div><div class="label">Invested in equities${investedPct === null ? "" : ` (${fmt.pct(investedPct, 1)})`}</div></div>
+    <div class="stat-card"><div class="value">${account.n_positions}</div><div class="label">Open positions</div></div>
+    ${account.buying_power === null ? "" : `<div class="stat-card"><div class="value">${fmt.money(account.buying_power)}</div><div class="label">Buying power</div></div>`}
+  `;
+
+  // Clamped to [0,1] for the bar's width math -- a net-short book can push
+  // invested_pct negative or above 1, which is real and shown correctly in
+  // the stat card above, but has no sane bar-segment width. The bar is a
+  // rough visual proportion, not the source of truth for those numbers.
+  const investedFrac = investedPct === null ? 0 : Math.max(0, Math.min(1, investedPct));
+  const cashFrac = 1 - investedFrac;
+  bar.innerHTML = `
+    <div class="alloc-bar">
+      <div class="alloc-bar-invested" style="width:${(investedFrac * 100).toFixed(1)}%" title="Invested: ${fmt.money(account.invested)}"></div>
+      <div class="alloc-bar-cash" style="width:${(cashFrac * 100).toFixed(1)}%" title="Cash: ${fmt.money(account.cash)}"></div>
+    </div>
+    <div class="alloc-bar-legend">
+      <span><span class="legend-swatch" style="background:var(--accent)"></span>Invested ${fmt.pct(investedFrac, 1)}</span>
+      <span><span class="legend-swatch" style="background:var(--text-muted)"></span>Cash ${fmt.pct(cashFrac, 1)}</span>
+    </div>`;
 }
 
 // ---------- Closed trades ----------
@@ -512,7 +632,7 @@ async function loadDrift() {
   renderLineChart(
     document.getElementById("drift-accuracy-chart"),
     result.weekly.map((w) => ({ y: w.hit_rate, label: w.week_start })),
-    { color: flag && flag.flagged ? "#e5484d" : "#5b8cff", zeroLine: false }
+    { color: flag && flag.flagged ? "#e5484d" : "#5b8cff", zeroLine: false, valueFmt: (v) => fmt.pct(v, 1) }
   );
 
   if (!result.feature_drag || result.feature_drag.length === 0) {
@@ -581,7 +701,7 @@ async function loadAnalysis() {
   renderLineChart(
     document.getElementById("analysis-chart"),
     rows.filter((r) => r.directional_accuracy !== null).map((r) => ({ y: r.directional_accuracy, label: r.start_time })),
-    { color: "#26a65b", zeroLine: false }
+    { color: "#26a65b", zeroLine: false, valueFmt: (v) => fmt.pct(v, 1) }
   );
 }
 
@@ -971,6 +1091,7 @@ async function loadAll() {
     loadPositions(),
     loadClosedTrades(),
     loadEquity(),
+    loadAccountOverview(),
     loadBreakers(),
     loadAnalysis(),
     loadReportCard(),
@@ -995,13 +1116,17 @@ document.getElementById("news-symbol-filter").addEventListener("keydown", (e) =>
 // itself: if someone leaves the News tab open to watch headlines arrive,
 // it should actually update on its own rather than freezing at whatever
 // was on screen when they switched to it. loadEquity() (the equity curve /
-// drawdown chart) is a much slower-moving, once-per-cycle-ish series, so it
-// rides this same 60s tick rather than needing its own.
+// drawdown chart) and loadAccountOverview() (cash vs. invested) are both
+// much slower-moving, once-per-cycle-ish figures, so they ride this same
+// 60s tick rather than needing their own.
 setInterval(() => {
   loadNewsStatus();
   loadMarketStatus();
   if (activeTab === "news") loadLiveNews(currentNewsFilter());
-  if (activeTab === "overview") loadEquity();
+  if (activeTab === "overview") {
+    loadEquity();
+    loadAccountOverview();
+  }
 }, 60_000);
 
 // Current price and unrealized P/L (loadPositions()) get their own, much
