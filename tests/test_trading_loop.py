@@ -164,6 +164,46 @@ def test_log_decisions_builds_full_phase_reasoning_for_candidates_and_closures(m
     assert old1_phases == [1, 4, 5, 6, 7]  # no 2/3 -- no fresh forecast for a symbol that wasn't screened as a pick
 
 
+def test_log_decisions_records_a_closed_symbol_as_zero_even_when_the_broker_has_forgotten_it(monkeypatch):
+    """
+    Regression test: a fully-closed position is simply ABSENT from
+    broker.get_positions() (both AlpacaBroker and IBKRBroker only return
+    open positions, see execution/broker_alpaca.py / broker_ibkr.py) --
+    it is never present with qty 0.0. `executed` here is exactly that
+    dict (run_cycle passes broker.get_positions() straight through as
+    `executed`), so a real close leaves OLD1 with no key at all, not a
+    0.0 value.
+
+    Before the fix, `executed.get(symbol)` with no default stored `None`
+    for executed_position on a close -- and /api/trades/closed's
+    round-trip reconstruction explicitly skips a None executed_position,
+    so the "flattened to zero" event it looks for never registered and
+    the trade never showed up as closed. It must be recorded as 0.0.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+
+    _real_log_decisions(
+        candidates=[],
+        closing_symbols=["OLD1"],
+        executed={},  # OLD1 fully closed -- not a key here, exactly like a real broker.get_positions() read
+        intended_shares={"OLD1": 0.0},
+        feature_set_id="v3",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+    )
+
+    rows = {r["symbol"]: r for r in captured["rows"]}
+    assert rows["OLD1"]["executed_position"] == 0.0
+
+
 def test_run_cycle_flattens_and_skips_trading_on_pretrade_breaker(monkeypatch):
     broker = _FakeBroker()
     monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
