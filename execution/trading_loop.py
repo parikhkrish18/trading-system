@@ -465,7 +465,17 @@ def _log_decisions(
         phase6 = phase6_by_symbol.get(symbol) or reasoning.phase_reconciliation(symbol, 0.0, executed.get(symbol, 0.0), False)
         phase7 = reasoning.phase_ongoing_monitoring(closed=True)
         full_reasoning = reasoning.combine_phases(phase1, phase4, phase5, phase6, phase7)
-        rows.append(_row(symbol, None, 0.0, executed.get(symbol), None, full_reasoning))
+        # executed.get(symbol) without a default would store None here: a
+        # fully-closed symbol is simply absent from broker.get_positions()
+        # (both AlpacaBroker and IBKRBroker only return open positions), not
+        # present with qty 0. That None used to make it into executed_position
+        # on this row, and /api/trades/closed's round-trip reconstruction
+        # explicitly skips a None executed_position -- so the "flattened to
+        # zero" event it looks for to close out an episode never registered,
+        # and the trade silently never appeared in the Closed Trades table.
+        # 0.0 is unambiguous here: this symbol is in closing_symbols, i.e. a
+        # close was just approved and submitted for it.
+        rows.append(_row(symbol, None, 0.0, executed.get(symbol, 0.0), None, full_reasoning))
 
     for c in rejected_candidates:
         status = statuses.get(c.symbol, "rejected")
