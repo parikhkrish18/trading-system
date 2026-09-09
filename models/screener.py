@@ -533,6 +533,7 @@ def _attach_reasoning(
     candidates: list[TradeCandidate],
     ensemble: EnsembleForecastModel,
     latest_features: pd.DataFrame,
+    raw_features: pd.DataFrame,
     feature_cols: list[str],
     scored: pd.DataFrame,
     regime: str,
@@ -551,12 +552,25 @@ def _attach_reasoning(
     genuine per-prediction attribution, not just global feature importance.
     Phase 4 wording follows the strategy: the concentrated split story for
     the 2-trade mode, the top-k book story for the diversified default.
+
+    `latest_features` vs `raw_features`: in TARGET_MODE=relative,
+    `latest_features` is cross-sectionally z-scored (see
+    load_latest_features) — that's what the model actually scored on, so
+    it's what predict_contributions needs to match training. But showing
+    a z-score to a human as if it were the real number is exactly how a
+    mom_ret_20d z-score of -0.575 (mildly below the day's average) got
+    narrated as "sold off sharply (-57.5%)": the formatter in
+    monitoring/reasoning.py assumes a literal percent/ATR-in-points/ratio,
+    not a standard-deviation count. `raw_features` (always unscaled,
+    straight from the features table) supplies the value actually shown
+    per top feature; only the model-facing X below uses `latest_features`.
     """
     if not candidates:
         return
 
     symbols = [c.symbol for c in candidates]
     rows = latest_features.set_index("symbol").loc[symbols]
+    raw_rows = raw_features.set_index("symbol").loc[symbols]
     X = rows.reindex(columns=feature_cols)
     contributions = ensemble.predict_contributions(X)
     n_confident = int(scored["confident"].sum())
@@ -567,7 +581,7 @@ def _attach_reasoning(
         top_features = [
             {
                 "feature_name": feat,
-                "value": None if pd.isna(rows.loc[candidate.symbol, feat]) else float(rows.loc[candidate.symbol, feat]),
+                "value": None if pd.isna(raw_rows.loc[candidate.symbol, feat]) else float(raw_rows.loc[candidate.symbol, feat]),
                 "contribution": float(contrib_row[feat]),
             }
             for feat in top_feature_names
@@ -749,6 +763,13 @@ def run_screen_with_scores(
     ensemble.fit(train_df[feature_cols], train_df["target"])
 
     latest = load_latest_features(feature_set_id, symbols)
+    # _attach_reasoning needs the unscaled values for its human-readable
+    # narrative — reuse `latest` when it's already unscaled (target_mode
+    # "absolute"), otherwise fetch it separately rather than reuse the
+    # cross-sectionally z-scored `latest` for display (see its docstring).
+    raw_latest = latest if settings.target_mode == "absolute" else load_latest_features(
+        feature_set_id, symbols, target_mode="absolute"
+    )
     scored = score_universe(ensemble, latest, feature_cols, min_abs_return)
 
     # Computed once, up front, so it can inform BOTH which candidates get
@@ -852,6 +873,7 @@ def run_screen_with_scores(
         candidates,
         ensemble,
         latest,
+        raw_latest,
         feature_cols,
         scored,
         regime,

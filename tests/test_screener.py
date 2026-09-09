@@ -631,7 +631,7 @@ def test_attach_reasoning_picks_top_features_by_absolute_contribution():
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
 
     _attach_reasoning(
-        candidates, ensemble, latest, feature_cols=["f1", "f2", "f3"], scored=scored, regime=TREND,
+        candidates, ensemble, latest, latest, feature_cols=["f1", "f2", "f3"], scored=scored, regime=TREND,
         max_leg_pct=0.70, min_leg_floor_fraction=0.6, top_n=2,
     )
 
@@ -642,10 +642,44 @@ def test_attach_reasoning_picks_top_features_by_absolute_contribution():
     assert "f3" not in lines
 
 
+def test_attach_reasoning_displays_raw_values_not_the_zscored_model_input():
+    """
+    Regression test: in TARGET_MODE=relative, `latest_features` (what the
+    model actually scored on) is cross-sectionally z-scored -- e.g. a
+    mom_ret_20d z-score of -0.575 is a mild, unremarkable reading, not a
+    real 20-day return. Formatting that z-score as if it were the literal
+    feature value produced a Phase 2 card claiming "sold off sharply
+    (-57.5%)" for a stock that hadn't. `top_features["value"]` must come
+    from `raw_features` (the unscaled frame), never from `latest_features`,
+    even though `latest_features` is still what feeds predict_contributions.
+    """
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
+    # z-scored -- what the model actually saw and must drive contributions.
+    latest = pd.DataFrame({"symbol": ["AAPL"], "mom_ret_20d": [-0.575]})
+    # unscaled -- the real 20-day return, wildly different from the z-score above.
+    raw = pd.DataFrame({"symbol": ["AAPL"], "mom_ret_20d": [-0.012]})
+    contributions = pd.DataFrame(
+        {"mom_ret_20d": [0.02], "base_value": [0.0]}, index=pd.Index(["AAPL"], name="symbol")
+    )
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
+
+    _attach_reasoning(
+        candidates, ensemble, latest, raw, feature_cols=["mom_ret_20d"], scored=scored, regime=TREND,
+        max_leg_pct=0.70, min_leg_floor_fraction=0.6, top_n=1,
+    )
+
+    phases = {p["phase"]: p for p in candidates[0].reasoning}
+    top_features = phases[2]["lines"]
+    # Displayed value is the raw return (-1.2%), never the z-score (-0.575).
+    assert any("-1.2%" in line for line in top_features)
+    assert not any("-57.5%" in line for line in top_features)
+
+
 def test_attach_reasoning_empty_candidates_is_noop():
     ensemble = _FakeEnsemble(mean_prediction=[], direction_agreement=[])
     _attach_reasoning(
-        [], ensemble, pd.DataFrame(), feature_cols=[], scored=pd.DataFrame({"confident": []}),
+        [], ensemble, pd.DataFrame(), pd.DataFrame(), feature_cols=[], scored=pd.DataFrame({"confident": []}),
         regime=TREND, max_leg_pct=0.70, min_leg_floor_fraction=0.6,    )  # should not raise
 
 
@@ -859,7 +893,7 @@ def test_attach_reasoning_diversified_wording_tells_the_topk_story():
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
 
     _attach_reasoning(
-        candidates, ensemble, latest, feature_cols=["f1"], scored=scored, regime=TREND,
+        candidates, ensemble, latest, latest, feature_cols=["f1"], scored=scored, regime=TREND,
         max_leg_pct=0.70, min_leg_floor_fraction=0.6,        strategy="diversified", top_k=10,
     )
 
