@@ -593,6 +593,35 @@ def test_attempt_reactivation_opens_a_confident_candidate(monkeypatch):
     assert run_screen_calls[0]["total_deploy_pct"] == pytest.approx(1.0)
 
 
+def test_attempt_reactivation_uses_the_configured_feature_set_id(monkeypatch):
+    """
+    Regression test: this used to hardcode "v3" directly, so bumping
+    settings.feature_set_id (e.g. after a new feature ships) would leave
+    reactivation screening on the old feature set forever, silently
+    diverging from the weekly cycle's own --feature-set-id. Must read the
+    same setting everything else does.
+    """
+    from models.screener import TradeCandidate
+
+    broker = _FakeBroker({}, portfolio_value=100_000.0)
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["AAPL"], "close": [50.0]}))
+    monkeypatch.setattr(cm.settings, "feature_set_id", "v9-test")
+
+    candidate = TradeCandidate(
+        symbol="AAPL", side="long", predicted_return=0.03, direction_agreement=0.9,
+        conviction_score=0.027, target_position_pct=0.6,
+        reasoning=[{"phase": 4, "title": "Candidate Selection & Sizing", "summary": "AAPL: long, 60.0% of capital.", "lines": ["some line"]}],
+    )
+    run_screen_calls = []
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: (run_screen_calls.append(a), [candidate])[1])
+    monkeypatch.setattr(cm, "_log_reactivation", lambda *a, **k: None)
+
+    cm._attempt_reactivation(broker, engine=object())
+
+    assert run_screen_calls[0][0] == "v9-test"
+
+
 def test_attempt_reactivation_excludes_currently_held_symbols(monkeypatch):
     broker = _FakeBroker({"MSFT": 10}, portfolio_value=100_000.0)
     monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL", "MSFT"])

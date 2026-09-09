@@ -20,6 +20,11 @@ import pandas as pd
 
 from data.ingest.db import get_engine, symbol_in_clause, upsert_dataframe
 from data.ingest.universe import resolve_symbols
+from features.qualitative.macro_sentiment import (
+    MACRO_PROXY_SYMBOLS,
+    build_macro_interaction_features,
+    build_macro_sentiment_features,
+)
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
 from features.quant.momentum import adx, rolling_return
 from features.quant.volatility import atr, realized_vol, vol_of_vol
@@ -234,14 +239,36 @@ def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int
     fundamentals = pd.read_sql(
         f"SELECT symbol, ts, metric, value FROM fundamentals WHERE symbol IN ({symbol_list})", engine  # noqa: S608 — symbols validated via symbol_in_clause
     )
+    # Separate from `news` above: MACRO_PROXY_SYMBOLS (broad-market + sector
+    # ETFs) are never part of the tradeable universe, so they'd never be in
+    # `symbol_list` -- a dedicated query against the fixed, small proxy list
+    # instead. Coverage for these depends on news ingestion explicitly
+    # subscribing/pulling them (see data/ingest/news_stream.py and
+    # scripts/run_weekly_cycle.py), not on being incidentally co-tagged in
+    # some other symbol's story.
+    macro_news = pd.read_sql(
+        f"SELECT symbol, ts, sentiment, sentiment_relevant FROM news_events "  # noqa: S608 — MACRO_PROXY_SYMBOLS is a fixed constant, not user input
+        f"WHERE symbol IN ({symbol_in_clause(MACRO_PROXY_SYMBOLS)})",
+        engine,
+    )
+    sector_by_symbol = dict(
+        pd.read_sql(
+            f"SELECT symbol, gics_sector FROM universe WHERE symbol IN ({symbol_list})",  # noqa: S608 — symbols validated via symbol_in_clause
+            engine,
+        ).itertuples(index=False, name=None)
+    )
 
+    qualitative_features = build_qualitative_features(prices, news)
+    macro_features = build_macro_sentiment_features(prices, macro_news, sector_by_symbol)
     feature_frames = [
         frame
         for frame in (
             build_quant_features(prices),
-            build_qualitative_features(prices, news),
+            qualitative_features,
             build_event_risk_features(prices, macro_calendar),
             build_fundamentals_features(prices, fundamentals),
+            macro_features,
+            build_macro_interaction_features(macro_features, qualitative_features),
         )
         if not frame.empty
     ]

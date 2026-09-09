@@ -1,18 +1,22 @@
 """
-data/ingest/news_stream.py's testable half: article_to_rows (pure) and
-NewsStreamBuffer (injectable writer/clock, no websocket needed). run_stream
-itself is a thin, hard-to-unit-test shell around NewsStreamBuffer and isn't
-covered here — the lazy alpaca-py import and outer reconnect loop are the
-kind of thing you'd want a live/paper key to exercise, not a unit test.
+data/ingest/news_stream.py's testable half: article_to_rows (pure),
+NewsStreamBuffer (injectable writer/clock, no websocket needed), and
+main()'s symbol-list construction (run_stream itself is mocked out here).
+run_stream's actual body is a thin, hard-to-unit-test shell around
+NewsStreamBuffer and isn't covered here — the lazy alpaca-py import and
+outer reconnect loop are the kind of thing you'd want a live/paper key to
+exercise, not a unit test.
 """
 from __future__ import annotations
 
 import asyncio
+import sys
 import types
 
 import pandas as pd
 import pytest
 
+from data.ingest import news_stream
 from data.ingest.news_stream import (
     DEFAULT_FLUSH_INTERVAL_SECONDS,
     DEFAULT_FLUSH_MAX_BATCH,
@@ -20,6 +24,7 @@ from data.ingest.news_stream import (
     _stream_stable_id,
     article_to_rows,
 )
+from features.qualitative.macro_sentiment import MACRO_PROXY_SYMBOLS
 
 
 def _article(**overrides):
@@ -236,3 +241,43 @@ class TestNewsStreamBuffer:
         assert n == 1
         assert len(writes[0]) == 1
         assert writes[0].iloc[0]["ts"] == pd.Timestamp("2026-08-20T15:00:00Z")
+
+
+class TestMainSubscribesMacroProxies:
+    """
+    features/qualitative/macro_sentiment.py's market/sector features need
+    MACRO_PROXY_SYMBOLS reliably subscribed, not just incidentally caught
+    when a broad-market story also happens to name a subscribed stock --
+    main() must union them in regardless of --symbols/--universe.
+    """
+
+    def test_universe_flag_still_gets_the_macro_proxies_too(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(news_stream, "resolve_symbols", lambda symbols, use_universe: ["AAPL", "MSFT"])
+        monkeypatch.setattr(news_stream, "run_stream", lambda symbols, **kwargs: captured.update(symbols=symbols))
+        monkeypatch.setattr(sys, "argv", ["news_stream", "--universe"])
+
+        news_stream.main()
+
+        assert set(captured["symbols"]) == {"AAPL", "MSFT", *MACRO_PROXY_SYMBOLS}
+
+    def test_explicit_symbols_still_get_the_macro_proxies_too(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(news_stream, "resolve_symbols", lambda symbols, use_universe: ["AAPL"])
+        monkeypatch.setattr(news_stream, "run_stream", lambda symbols, **kwargs: captured.update(symbols=symbols))
+        monkeypatch.setattr(sys, "argv", ["news_stream", "--symbols", "AAPL"])
+
+        news_stream.main()
+
+        assert set(captured["symbols"]) == {"AAPL", *MACRO_PROXY_SYMBOLS}
+
+    def test_a_macro_proxy_explicitly_requested_is_not_duplicated(self, monkeypatch):
+        """SPY is both a --symbols entry and a market proxy -- must appear once, not twice."""
+        captured = {}
+        monkeypatch.setattr(news_stream, "resolve_symbols", lambda symbols, use_universe: ["AAPL", "SPY"])
+        monkeypatch.setattr(news_stream, "run_stream", lambda symbols, **kwargs: captured.update(symbols=symbols))
+        monkeypatch.setattr(sys, "argv", ["news_stream", "--symbols", "AAPL,SPY"])
+
+        news_stream.main()
+
+        assert captured["symbols"].count("SPY") == 1

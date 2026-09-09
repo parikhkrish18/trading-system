@@ -85,6 +85,8 @@ def test_explain_feature_all_known_features_produce_narratives_for_typical_value
         "fund_revenue_actual_latest": 1_000_000.0, "fund_net_income_latest": 500_000.0,
         "fund_gross_profit_latest": 700_000.0, "fund_total_assets_latest": 5_000_000.0,
         "fund_total_liabilities_latest": 2_000_000.0,
+        "macro_mkt_sentiment": 0.2, "macro_sector_sentiment": -0.1,
+        "macro_mkt_x_own_sentiment": 0.15, "macro_sector_x_own_sentiment": -0.15,
     }
     assert set(sample_values) == set(reasoning._NARRATIVE_FNS)
     for feature_name, value in sample_values.items():

@@ -172,6 +172,71 @@ def test_build_and_store_lookback_years_is_configurable(monkeypatch):
     assert "interval '1 years'" in captured["queries"][0]
 
 
+def test_build_and_store_wires_macro_sentiment_and_interaction_features(monkeypatch):
+    """
+    End-to-end: build_and_store must (1) query macro_news for
+    MACRO_PROXY_SYMBOLS specifically -- not the stock universe's own
+    symbol_list -- (2) look up gics_sector from the universe table, and
+    (3) get macro_mkt_sentiment/macro_sector_sentiment and their
+    interaction-with-AAPL's-own-sentiment columns into the final upsert.
+    """
+    from features.qualitative.macro_sentiment import MACRO_PROXY_SYMBOLS
+
+    monkeypatch.setattr(build_features, "get_engine", lambda: object())
+
+    def fake_read_sql(query, engine, **kwargs):
+        if "FROM prices" in query:
+            return pd.DataFrame(
+                {
+                    "symbol": ["AAPL"],
+                    "ts": pd.to_datetime(["2026-01-10"], utc=True),
+                    "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1],
+                }
+            )
+        if "FROM universe" in query:
+            return pd.DataFrame({"symbol": ["AAPL"], "gics_sector": ["Information Technology"]})
+        if "FROM news_events" in query and all(s in query for s in MACRO_PROXY_SYMBOLS):
+            return pd.DataFrame(
+                {
+                    "symbol": ["SPY", "XLK"],
+                    "ts": pd.to_datetime(["2026-01-09T20:00:00Z", "2026-01-09T20:00:00Z"], utc=True),
+                    "sentiment": [0.6, 0.8],
+                    "sentiment_relevant": [True, True],
+                }
+            )
+        if "FROM news_events" in query:  # the stock-universe news query -- AAPL's own sentiment
+            return pd.DataFrame(
+                {
+                    "symbol": ["AAPL"],
+                    "ts": pd.to_datetime(["2026-01-09"], utc=True),
+                    "sentiment": [-0.5],
+                    "sentiment_relevant": [True],
+                }
+            )
+        if "FROM macro_calendar" in query:
+            return pd.DataFrame(columns=["ts", "category"])
+        if "FROM fundamentals" in query:
+            return pd.DataFrame(columns=["symbol", "ts", "metric", "value"])
+        raise AssertionError(f"unexpected query: {query}")
+
+    monkeypatch.setattr(build_features.pd, "read_sql", fake_read_sql)
+    captured = {}
+
+    def fake_upsert(df, table, conflict_cols):
+        captured["features"] = df
+        return len(df)
+
+    monkeypatch.setattr(build_features, "upsert_dataframe", fake_upsert)
+
+    build_features.build_and_store(["AAPL"], "v4")
+
+    names = set(captured["features"]["feature_name"])
+    assert "macro_mkt_sentiment" in names
+    assert "macro_sector_sentiment" in names
+    assert "macro_mkt_x_own_sentiment" in names
+    assert "macro_sector_x_own_sentiment" in names
+
+
 def test_main_universe_flag_builds_the_active_universe(monkeypatch):
     """
     --universe was documented in the README and in data/ingest/universe.py's

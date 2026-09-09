@@ -47,6 +47,10 @@ FEATURE_LABELS = {
     "fund_gross_profit_latest": "latest reported gross profit",
     "fund_total_assets_latest": "latest reported total assets",
     "fund_total_liabilities_latest": "latest reported total liabilities",
+    "macro_mkt_sentiment": "broad-market news sentiment",
+    "macro_sector_sentiment": "this stock's sector news sentiment",
+    "macro_mkt_x_own_sentiment": "this stock's news vs. the broad market (aligned or fighting it)",
+    "macro_sector_x_own_sentiment": "this stock's news vs. its sector (aligned or fighting it)",
 }
 
 _PCT_PREFIXES = ("mom_ret", "vol_realized", "sentiment_mean", "sentiment_momentum")
@@ -243,6 +247,40 @@ def _fundamentals_narrative(label: str) :
     return fn
 
 
+def _macro_sentiment_narrative(label: str) :
+    def fn(value: float | None) -> str:
+        if value is None:
+            return f"{label[0].upper()}{label[1:]} data was unavailable."
+        level = _bucket(
+            value,
+            [(-0.3, "clearly negative"), (-0.1, "mildly negative"), (0.1, "mixed/neutral"), (0.3, "mildly positive")],
+            default="clearly positive",
+        )
+        # Heavily recency-weighted (see features/qualitative/macro_sentiment.py --
+        # roughly a same-day-to-two-day read, not a flat multi-day average like
+        # the per-stock sentiment_mean_3d/10d), so this reflects the very
+        # recent tape, not the week's overall mood.
+        return f"{label[0].upper()}{label[1:]} reads {level} right now (sentiment {value:+.2f})."
+
+    return fn
+
+
+def _macro_interaction_narrative(against_label: str) :
+    def fn(value: float | None) -> str:
+        if value is None:
+            return f"This stock's news vs. {against_label} was unavailable."
+        if abs(value) < 0.02:
+            return f"This stock's own news isn't meaningfully aligned or fighting {against_label} right now."
+        stance = "aligned with" if value > 0 else "fighting"
+        magnitude = "strongly" if abs(value) >= 0.3 else "mildly"
+        return (
+            f"This stock's own recent news is {magnitude} {stance} {against_label} "
+            f"({value:+.2f}) — {'a compounding' if value > 0 else 'a conflicting'} signal, not just this stock in isolation."
+        )
+
+    return fn
+
+
 _NARRATIVE_FNS = {
     "mom_ret_5d": _momentum_narrative("5 days"),
     "mom_ret_20d": _momentum_narrative("20 days"),
@@ -266,6 +304,10 @@ _NARRATIVE_FNS = {
     "fund_gross_profit_latest": _fundamentals_narrative("Gross profit"),
     "fund_total_assets_latest": _fundamentals_narrative("Total assets"),
     "fund_total_liabilities_latest": _fundamentals_narrative("Total liabilities"),
+    "macro_mkt_sentiment": _macro_sentiment_narrative("broad-market news sentiment"),
+    "macro_sector_sentiment": _macro_sentiment_narrative("this stock's sector news sentiment"),
+    "macro_mkt_x_own_sentiment": _macro_interaction_narrative("the broad market"),
+    "macro_sector_x_own_sentiment": _macro_interaction_narrative("its sector"),
 }
 
 

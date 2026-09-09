@@ -429,7 +429,7 @@ def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
     try:
         candidates = run_screen(
-            "v3", candidate_pool, is_shortable_fn=is_shortable_fn,
+            settings.feature_set_id, candidate_pool, is_shortable_fn=is_shortable_fn,
             total_deploy_pct=freed_fraction, max_positions_override=max_positions_override,
         )
     except Exception:
