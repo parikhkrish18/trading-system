@@ -146,7 +146,33 @@ def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
 
     for start in range(0, len(headlines), _BATCH_SIZE):
         batch = headlines.iloc[start : start + _BATCH_SIZE]
-        id_to_result = _score_batch(client, batch)
+        try:
+            id_to_result = _score_batch(client, batch)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            # Claude occasionally hands back text that doesn't parse into
+            # the expected shape at all -- not just one row's optional
+            # field missing (the per-id .get() calls in _score_batch
+            # already handle that gracefully), but the whole response
+            # failing json.loads (a stray unescaped quote in a "reason"
+            # string is the usual culprit), or a required field like "id"/
+            # "sentiment" missing entirely. Left uncaught, this used to
+            # raise straight out of score_sentiment and take every OTHER
+            # batch in this same call down with it -- backfill_unscored_news
+            # never reaches its DB-write loop, so up to 24 already-
+            # successful, already-paid-for batches got thrown away because
+            # one later batch in the same run failed to parse. Skip just
+            # this one batch instead: its rows keep the pd.NA this
+            # function initializes every row to, so backfill_unscored_news's
+            # existing pd.isna(...) check leaves them sentiment IS NULL --
+            # naturally retried next run, same as a single missing id
+            # already was, while every sibling batch's real results still
+            # make it back to the caller and get written.
+            logger.warning(
+                "Could not parse Claude's response for a batch of %d headlines (ids %s) -- "
+                "leaving them unscored for the next backfill run.",
+                len(batch), list(batch["id"]), exc_info=True,
+            )
+            continue
         for row_id, (score, reason, relevant) in id_to_result.items():
             scored.loc[scored["id"] == row_id, "sentiment"] = score
             scored.loc[scored["id"] == row_id, "sentiment_reason"] = reason
