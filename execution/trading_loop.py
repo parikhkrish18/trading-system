@@ -744,6 +744,16 @@ def run_cycle(
     for symbol in rejected_close_symbols:
         intended_shares[symbol] = current_positions.get(symbol, 0.0)
 
+    # Same reasoning for a position held with no exit condition fired but
+    # that missed this cycle's shortlist (held_decisions, line ~593) --
+    # nothing above ever writes an entry for these, so reconcile_positions'
+    # intended.get(symbol, 0.0) silently defaulted them to 0 and reported a
+    # perfectly fine, untouched holding as "diverged: intended 0, actual
+    # <full position>" every single cycle it wasn't re-shortlisted. The
+    # position was never wrong; only the recorded intent was missing.
+    for d in held_decisions:
+        intended_shares[d.symbol] = current_positions.get(d.symbol, 0.0)
+
     # Populated only for an approved candidate that never got an order for a
     # reason that isn't "the human said no" -- read by _log_decisions so the
     # permanent record explains a nonzero target_position next to 0 shares
