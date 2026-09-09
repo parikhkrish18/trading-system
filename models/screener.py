@@ -442,8 +442,18 @@ def _bounded_conviction_weights(
             break
 
         for i in below_floor:
-            weights[i] = min_leg_pct
-            target -= min_leg_pct
+            # min() against max_leg_pct: if min_leg_pct itself exceeds
+            # max_leg_pct (a floor/cap combination that leaves no room
+            # between them -- not reachable with today's settings, but
+            # nothing validates that it can't be configured that way),
+            # pinning to the unclamped floor would push this leg's weight
+            # above the hard cap the docstring above promises "never above
+            # max_leg_pct ... regardless." Clamping here keeps that
+            # guarantee true unconditionally; the shortfall this creates
+            # still surfaces via the total<1.0 warning below.
+            pinned = min(min_leg_pct, max_leg_pct)
+            weights[i] = pinned
+            target -= pinned
         free_idx = [i for i in free_idx if i not in below_floor]
     else:
         return [equal_share] * n

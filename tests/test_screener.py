@@ -619,6 +619,28 @@ class TestBoundedConvictionWeights:
         assert sum(weights) < 1.0 - 1e-9  # genuinely under-deployed, not just capped exactly at 1.0
         assert any("under-deployed" in r.message for r in caplog.records)
 
+    def test_the_floor_can_never_pin_a_leg_above_the_cap(self, caplog):
+        """
+        Regression test: when min_leg_floor_fraction is configured high
+        enough (relative to leg count) that the derived min_leg_pct itself
+        exceeds max_leg_pct, the old code pinned every under-floor leg
+        straight to min_leg_pct with no check against the cap -- e.g.
+        max_leg_pct=0.40, min_leg_floor_fraction=1.0, 2 legs derives
+        min_leg_pct = 1.0 * (1/2) = 0.50, and both legs (correctly capped
+        to 0.40 in phase 1) then got re-pinned to 0.50 in phase 2, ending
+        at [0.5, 0.5] -- 10 points over the documented "never above
+        max_leg_pct ... regardless" hard cap. Not reachable with production
+        defaults (max=0.70, floor_fraction=0.6), but nothing should let it
+        happen at any setting.
+        """
+        with caplog.at_level("WARNING"):
+            weights = _bounded_conviction_weights([1.0, 1.0], max_leg_pct=0.40, min_leg_floor_fraction=1.0)
+
+        assert all(w <= 0.40 + 1e-9 for w in weights)  # the hard cap must hold even though the floor can't
+        assert sum(weights) <= 1.0 + 1e-9
+        assert sum(weights) < 1.0 - 1e-9  # can't be fully deployed either, given the conflict
+        assert any("under-deployed" in r.message for r in caplog.records)
+
 
 def test_attach_reasoning_picks_top_features_by_absolute_contribution():
     scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])

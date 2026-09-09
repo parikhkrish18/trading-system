@@ -82,6 +82,54 @@ def test_fetch_fomc_events_falls_back_to_date_range_for_future_meetings(monkeypa
     assert len(sep_2026) == 1
 
 
+def test_fetch_fomc_events_future_meeting_spanning_a_month_boundary(monkeypatch):
+    """
+    Regression test: a two-day meeting can straddle a month boundary (e.g.
+    April 30-May 1) -- the Fed's markup gives only the START month
+    ("April"), with the date range itself ("30-1*") showing the wrap. The
+    old code always built the date from `month` (April) + the range's last
+    number (1), landing on April 1st -- three weeks early -- instead of
+    May 1st.
+    """
+    html = """
+    <html><body>
+    <div class="panel panel-default">
+      <div class="panel-heading"><h4><a id="1">2026 FOMC Meetings</a></h4></div>
+      <div class="row fomc-meeting">
+        <div class="fomc-meeting__month"><strong>April</strong></div>
+        <div class="fomc-meeting__date">30-1*</div>
+      </div>
+    </div>
+    </body></html>
+    """
+    monkeypatch.setattr(macro_calendar.requests, "get", lambda *a, **k: _FakeResponse(text=html))
+
+    df = macro_calendar.fetch_fomc_events()
+
+    # Must resolve to May 1st (the following month), not April 1st.
+    assert (df["ts"] == pd.Timestamp("2026-05-01T18:00:00Z")).all()
+
+
+def test_fetch_fomc_events_future_meeting_within_one_month_is_unaffected(monkeypatch):
+    """A normal same-month range ("15-16*") must still resolve to the last day within `month` -- the month-boundary fix must not change this ordinary case."""
+    html = """
+    <html><body>
+    <div class="panel panel-default">
+      <div class="panel-heading"><h4><a id="1">2026 FOMC Meetings</a></h4></div>
+      <div class="row fomc-meeting">
+        <div class="fomc-meeting__month"><strong>June</strong></div>
+        <div class="fomc-meeting__date">15-16*</div>
+      </div>
+    </div>
+    </body></html>
+    """
+    monkeypatch.setattr(macro_calendar.requests, "get", lambda *a, **k: _FakeResponse(text=html))
+
+    df = macro_calendar.fetch_fomc_events()
+
+    assert (df["ts"] == pd.Timestamp("2026-06-16T18:00:00Z")).all()
+
+
 def test_fetch_fred_events_requires_api_key(monkeypatch):
     monkeypatch.setattr(macro_calendar.settings, "fred_api_key", "")
     with pytest.raises(RuntimeError):
@@ -91,7 +139,9 @@ def test_fetch_fred_events_requires_api_key(monkeypatch):
 def test_fetch_fred_events_resolves_release_ids_and_filters_dates(monkeypatch):
     monkeypatch.setattr(macro_calendar.settings, "fred_api_key", "test-key")
 
-    today = dt.date.today()
+    # A fixed `today` (rather than dt.date.today()) makes this deterministic
+    # regardless of what time the test happens to run.
+    today = dt.date(2026, 6, 1)
     in_window = today + dt.timedelta(days=10)
     out_of_window = today + dt.timedelta(days=400)
 
@@ -117,12 +167,52 @@ def test_fetch_fred_events_resolves_release_ids_and_filters_dates(monkeypatch):
 
     monkeypatch.setattr(macro_calendar.requests, "get", fake_get)
 
-    df = macro_calendar.fetch_fred_events(months_ahead=6)
+    df = macro_calendar.fetch_fred_events(months_ahead=6, today=today)
 
     assert set(df["category"]) == {"CPI", "JOBS"}
     # The out-of-window CPI date (400 days out) should be excluded by the horizon filter.
     assert len(df) == 2
     assert (df["ts"].dt.date == in_window).all()
+
+
+def test_fetch_fred_events_today_defaults_to_eastern_not_server_local(monkeypatch):
+    """
+    Regression test: `today` used to be dt.date.today() (server-local --
+    UTC on the real deployment), inconsistent with every other date in this
+    file being Eastern-anchored via _eastern_to_utc. Near UTC midnight
+    (~7-8pm ET), that would already read as tomorrow while it's still
+    today in Eastern time, silently excluding a same-day release.
+
+    Simulates the server clock reading 2026-01-02 02:00 UTC -- already
+    Jan 2 in UTC, but still 2026-01-01 21:00 in Eastern (EST, UTC-5). A
+    release scheduled for 2026-01-01 must still be included: the old
+    dt.date.today() (UTC) would read "today" as Jan 2 and exclude it
+    (Jan 1 < Jan 2); the fix reads "today" as Jan 1 via the Eastern clock
+    and includes it.
+    """
+    monkeypatch.setattr(macro_calendar.settings, "fred_api_key", "test-key")
+
+    fake_now = dt.datetime(2026, 1, 2, 2, 0, tzinfo=dt.UTC)
+
+    class _FakeDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fake_now.astimezone(tz) if tz else fake_now
+
+    monkeypatch.setattr(macro_calendar.dt, "datetime", _FakeDatetime)
+
+    def fake_get(url, params=None, timeout=None):
+        if url == macro_calendar.FRED_RELEASES_URL:
+            return _FakeResponse({"releases": [{"id": 10, "name": "Consumer Price Index"}]})
+        if url == macro_calendar.FRED_RELEASE_DATES_URL:
+            return _FakeResponse({"release_dates": [{"date": "2026-01-01"}]})
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(macro_calendar.requests, "get", fake_get)
+
+    df = macro_calendar.fetch_fred_events(months_ahead=1)  # no `today` override -- exercises the real default
+
+    assert len(df) == 1  # the Jan-1 release must survive the window filter, not be excluded as "in the past"
 
 
 def test_eastern_to_utc_uses_edt_offset_in_summer():
