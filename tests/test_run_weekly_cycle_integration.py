@@ -55,6 +55,7 @@ def _wire_happy_path(monkeypatch, calls, symbols=("AAPL", "MSFT")):
         rwc, "run_guarded_trading_cycle", _recorder(calls, "trading_cycle", return_value="cycle-done")
     )
     monkeypatch.setattr(rwc, "alert_pipeline_failure", _recorder(calls, "alert"))
+    monkeypatch.setattr(rwc, "alert_pipeline_progress", _recorder(calls, "progress"))
 
 
 def _run_main(monkeypatch, argv_extra=()):
@@ -74,7 +75,9 @@ def test_full_cycle_runs_every_job_in_order(monkeypatch, _calls):
 
     _run_main(monkeypatch)
 
-    job_order = [name for name, _args, _kwargs in _calls]
+    # "progress" (one per successful run_job call) is interleaved with the
+    # real job names — filter it out here, it gets its own test below.
+    job_order = [name for name, _args, _kwargs in _calls if name != "progress"]
     assert job_order == [
         "universe_refresh",
         "price_ingest",
@@ -85,6 +88,34 @@ def test_full_cycle_runs_every_job_in_order(monkeypatch, _calls):
         "build_features",
         "trading_cycle",
     ]
+
+
+def test_every_successful_job_sends_a_telegram_progress_update(monkeypatch, _calls):
+    """The user wants to be 'in the loop for every little thing' — every job
+    that finishes without raising must post a progress update, not just
+    failures. Counts get a readable label (e.g. "312 headlines scored"),
+    matching _JOB_RESULT_LABELS in scripts/run_weekly_cycle.py."""
+    _wire_happy_path(monkeypatch, _calls)
+    monkeypatch.setattr(rwc, "backfill_unscored_news", _recorder(_calls, "sentiment_backfill", return_value=312))
+    monkeypatch.setattr(rwc, "ingest_news", _recorder(_calls, "news_ingest", return_value=57))
+
+    _run_main(monkeypatch)
+
+    progress_details = [c[1] for c in _calls if c[0] == "progress"]
+    assert ("sentiment_backfill", "312 headlines scored") in progress_details
+    assert ("news_ingest", "57 news articles ingested") in progress_details
+    # The overall run gets its own bookend messages too, start and finish.
+    assert ("weekly_cycle", "started") in progress_details
+    assert any(job == "weekly_cycle" and detail.startswith("finished") for job, detail in progress_details)
+
+
+def test_dry_run_start_message_says_so(monkeypatch, _calls):
+    _wire_happy_path(monkeypatch, _calls)
+
+    _run_main(monkeypatch, argv_extra=["--dry-run"])
+
+    started = next(c[1] for c in _calls if c[0] == "progress" and c[1][0] == "weekly_cycle")
+    assert "dry run" in started[1]
 
 
 def test_price_ingest_includes_the_regime_proxy_and_active_universe(monkeypatch, _calls):

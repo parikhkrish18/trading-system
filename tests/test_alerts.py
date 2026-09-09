@@ -98,6 +98,26 @@ def test_slack_network_error_then_telegram_error_still_no_raise(slack_configured
     assert alerts.send_slack_alert("worst case", post_fn=exploding_post, telegram_send_fn=exploding_send) is False
 
 
+def test_alert_pipeline_progress_sends_info_severity(slack_configured, telegram_configured, monkeypatch):
+    """alert_pipeline_progress is the 'in the loop' counterpart to
+    alert_pipeline_failure — same transport, but info severity (ℹ️), not
+    critical (🚨), and it must include the job name and the caller's detail."""
+    seen = {}
+
+    def fake_send_slack_alert(message, severity="warning", **kwargs):
+        seen["message"] = message
+        seen["severity"] = severity
+        return True
+
+    monkeypatch.setattr(alerts, "send_slack_alert", fake_send_slack_alert)
+
+    alerts.alert_pipeline_progress("news_ingest", "312 news articles ingested")
+
+    assert seen["severity"] == "info"
+    assert "news_ingest" in seen["message"]
+    assert "312 news articles ingested" in seen["message"]
+
+
 # --------------------------------------------------------------------------
 # configure_file_logging
 # --------------------------------------------------------------------------
