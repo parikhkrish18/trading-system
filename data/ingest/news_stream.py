@@ -46,6 +46,7 @@ import pandas as pd
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
 from data.ingest.universe import resolve_symbols
+from features.qualitative.macro_sentiment import MACRO_PROXY_SYMBOLS
 
 logger = logging.getLogger(__name__)
 
@@ -260,7 +261,12 @@ def main() -> None:
     parser.add_argument("--flush-interval", type=float, default=DEFAULT_FLUSH_INTERVAL_SECONDS)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    symbols = resolve_symbols(args.symbols, args.universe)
+    # Always subscribed regardless of --symbols/--universe: the market/
+    # sector sentiment features (features/qualitative/macro_sentiment.py)
+    # need reliable coverage of these proxies, not just the incidental
+    # tagging a broad-market story gets when it also happens to name a
+    # subscribed stock.
+    symbols = sorted(set(resolve_symbols(args.symbols, args.universe)) | set(MACRO_PROXY_SYMBOLS))
     run_stream(symbols, flush_interval=args.flush_interval)
 
 

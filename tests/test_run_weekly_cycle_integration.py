@@ -128,6 +128,21 @@ def test_price_ingest_includes_the_regime_proxy_and_active_universe(monkeypatch,
     assert set(symbols_arg) == {"AAPL", "MSFT", "SPY"}  # _REGIME_PROXY = "SPY"
 
 
+def test_news_ingest_includes_the_macro_proxy_symbols(monkeypatch, _calls):
+    """
+    features/qualitative/macro_sentiment.py's market/sector features need
+    MACRO_PROXY_SYMBOLS' news deliberately pulled every cycle, not just
+    incidentally co-tagged onto some other symbol's story.
+    """
+    _wire_happy_path(monkeypatch, _calls, symbols=("AAPL", "MSFT"))
+
+    _run_main(monkeypatch)
+
+    news_ingest_call = next(c for c in _calls if c[0] == "news_ingest")
+    symbols_arg = news_ingest_call[1][0]
+    assert set(symbols_arg) == {"AAPL", "MSFT", *rwc.MACRO_PROXY_SYMBOLS}
+
+
 def test_default_backfill_is_a_seven_day_top_up_not_a_full_history_pull(monkeypatch, _calls):
     """--backfill-years defaults to 0, meaning 'just top up the last week', not a fresh full backfill."""
     _wire_happy_path(monkeypatch, _calls)

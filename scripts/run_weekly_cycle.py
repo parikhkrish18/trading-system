@@ -35,6 +35,7 @@ from data.ingest.universe import load_active_universe, refresh_universe
 from data.validators.checks import check_staleness
 from execution.trading_loop import run_cycle
 from features.build_features import build_and_store
+from features.qualitative.macro_sentiment import MACRO_PROXY_SYMBOLS
 from features.qualitative.sentiment import backfill_unscored_news
 from monitoring.alerts import alert_pipeline_failure, alert_pipeline_progress, configure_file_logging
 
@@ -172,7 +173,11 @@ def main() -> None:
     price_start = today.replace(year=today.year - args.backfill_years) if args.backfill_years else today - dt.timedelta(days=7)
     run_job("price_ingest", ingest_prices, [*symbols, _REGIME_PROXY], price_start, today, "yfinance")
     run_job("fundamentals_ingest", ingest_fundamentals, symbols)
-    run_job("news_ingest", ingest_news, symbols, args.since_hours)
+    # MACRO_PROXY_SYMBOLS (broad-market + sector ETFs): never part of the
+    # tradeable universe, but features/qualitative/macro_sentiment.py needs
+    # their news deliberately pulled, not just incidentally co-tagged onto
+    # some other symbol's story.
+    run_job("news_ingest", ingest_news, [*symbols, *MACRO_PROXY_SYMBOLS], args.since_hours)
     run_job("sentiment_backfill", backfill_unscored_news, 5000)
     run_job("macro_calendar_refresh", refresh_macro_calendar)
     run_job("build_features", build_and_store, symbols, args.feature_set_id)
