@@ -36,12 +36,33 @@ from data.validators.checks import check_staleness
 from execution.trading_loop import run_cycle
 from features.build_features import build_and_store
 from features.qualitative.sentiment import backfill_unscored_news
-from monitoring.alerts import alert_pipeline_failure, configure_file_logging
+from monitoring.alerts import alert_pipeline_failure, alert_pipeline_progress, configure_file_logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _REGIME_PROXY = "SPY"  # not part of the tradeable universe, only used for the market-wide regime read
+
+# Human-readable noun for each job's int return value, so a Telegram update
+# reads "312 headlines scored" rather than a bare, unexplained "312" — only
+# jobs whose result is a plain row/symbol count belong here; trading_cycle's
+# result is a richer object and gets no entry, falling back to str(result).
+_JOB_RESULT_LABELS = {
+    "universe_refresh": "active symbols",
+    "price_ingest": "price rows upserted",
+    "fundamentals_ingest": "fundamentals rows upserted",
+    "news_ingest": "news articles ingested",
+    "sentiment_backfill": "headlines scored",
+    "macro_calendar_refresh": "macro calendar rows upserted",
+    "build_features": "feature rows built",
+}
+
+
+def _progress_detail(name: str, result) -> str:
+    label = _JOB_RESULT_LABELS.get(name)
+    if label is not None and isinstance(result, int):
+        return f"{result} {label}"
+    return str(result) if result is not None else "done"
 
 
 def run_job(name: str, fn, *args, **kwargs):
@@ -50,6 +71,7 @@ def run_job(name: str, fn, *args, **kwargs):
         logger.info("Running job: %s", name)
         result = fn(*args, **kwargs)
         logger.info("Finished job: %s", name)
+        alert_pipeline_progress(name, _progress_detail(name, result))
         return result
     except Exception as e:
         logger.exception("Job failed: %s", name)
@@ -138,6 +160,7 @@ def main() -> None:
     args = parser.parse_args()
 
     configure_file_logging()  # logs survive the console closing
+    alert_pipeline_progress("weekly_cycle", "started" + (" (dry run)" if args.dry_run else ""))
     run_job("universe_refresh", refresh_universe)
     symbols = load_active_universe()
     if not symbols:
@@ -156,6 +179,7 @@ def main() -> None:
 
     result = run_job("trading_cycle", run_guarded_trading_cycle, args.feature_set_id, symbols, args.dry_run)
     logger.info("Weekly cycle result: %s", result)
+    alert_pipeline_progress("weekly_cycle", f"finished — {result}")
 
 
 if __name__ == "__main__":

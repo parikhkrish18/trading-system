@@ -148,5 +148,15 @@ def alert_pipeline_failure(job_name: str, error: str) -> None:
     send_slack_alert(f"Pipeline job '{job_name}' failed: {error}", severity="critical")
 
 
+def alert_pipeline_progress(job_name: str, detail: str) -> None:
+    """
+    A job finished successfully — the "still in the loop" counterpart to
+    alert_pipeline_failure. info severity, so it never carries the same
+    urgency as a real failure; same fire-and-forget contract (never raises,
+    logged and dropped if neither channel is configured).
+    """
+    send_slack_alert(f"'{job_name}' done: {detail}", severity="info")
+
+
 def alert_risk_limit_exceeded(symbol: str, detail: str) -> None:
     send_slack_alert(f"Risk limit exceeded for {symbol}: {detail}", severity="warning")
