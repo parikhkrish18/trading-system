@@ -280,6 +280,37 @@ def test_run_cycle_closes_positions_not_in_new_candidate_set(monkeypatch):
     assert result.orders_placed == 3
 
 
+def test_run_cycle_reconciles_a_held_but_not_reshortlisted_position_correctly(monkeypatch):
+    """
+    Regression test: a position that's open, has no exit condition fired,
+    but simply missed this cycle's shortlist by fewer than
+    hold_max_missed_cycles (evaluate_holds' `close=False` case) got no
+    entry written into intended_shares at all -- reconcile_positions'
+    intended.get(symbol, 0.0) then defaulted it to 0 and flagged it
+    "diverged: intended 0, actual <full position>" every cycle it wasn't
+    re-shortlisted, even though the position was exactly right and nothing
+    was ever supposed to change. Hit live: a real weekly-cycle run reported
+    two perfectly healthy holdings (MNST, VEEV) as diverged this way.
+    """
+    broker = _FakeBroker(positions={"MNST": 321.5, "TSLA": 3.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("TSLA", "long", 0.5)]))
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"TSLA": 100.0})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    # MNST's first miss this cycle (1 < 2) -- held, not closed; TSLA is
+    # this cycle's only real candidate.
+    monkeypatch.setattr(trading_loop, "load_missed_cycles", lambda engine: {})
+
+    result = trading_loop.run_cycle("v3", ["TSLA", "MNST"])
+
+    assert "MNST" not in {s for s, _ in broker.submitted}  # held, no order -- exactly the case the bug affected
+    assert "diverged" not in result.reconciliation_summary.lower()
+    assert "reconciled" in result.reconciliation_summary.lower()
+
+
 def test_run_cycle_proposals_carry_reasoning_and_close_pnl(monkeypatch):
     """
     The human on the phone must see WHY: open proposals carry the
