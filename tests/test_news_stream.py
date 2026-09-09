@@ -61,6 +61,15 @@ class TestArticleToRows:
         assert all(r["source"] == "alpaca_stream" for r in rows)
         assert all(pd.isna(r["sentiment"]) and pd.isna(r["surprise"]) for r in rows)
         assert all(r["headline"] == "Some Company beats on earnings" for r in rows)
+        assert all(r["summary"] == "" for r in rows)  # _article()'s default carries no summary attribute
+
+    def test_captures_the_articles_summary_alongside_the_headline(self):
+        rows = article_to_rows(_article(summary="Q3 revenue and EPS both beat consensus estimates."))
+        assert all(r["summary"] == "Q3 revenue and EPS both beat consensus estimates." for r in rows)
+
+    def test_html_entities_in_the_summary_are_decoded_too(self):
+        rows = article_to_rows(_article(summary="The CEO called it &#39;a turning point&#39;."))
+        assert rows[0]["summary"] == "The CEO called it 'a turning point'."
 
     def test_html_entities_in_the_headline_are_decoded(self):
         """Benzinga's content sometimes comes through with literal HTML

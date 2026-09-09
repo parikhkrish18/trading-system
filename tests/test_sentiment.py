@@ -73,6 +73,55 @@ def test_score_sentiment_merges_scores_back_onto_rows(monkeypatch):
     }
 
 
+def test_score_sentiment_includes_the_summary_in_the_request_when_present(monkeypatch):
+    seen_items = []
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        seen_items.extend(items)
+        return json.dumps([{"id": item["id"], "sentiment": 0.0, "reason": "", "relevant": True} for item in items])
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+
+    headlines = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "ts": pd.to_datetime(["2026-07-27", "2026-07-27"], utc=True),
+            "symbol": ["SPY", "AAPL"],
+            "headline": ["headline with a summary", "headline with no summary"],
+            "summary": ["Revenue beat estimates by a wide margin.", None],
+        }
+    )
+
+    sentiment.score_sentiment(headlines)
+
+    by_id = {item["id"]: item for item in seen_items}
+    assert by_id[1]["summary"] == "Revenue beat estimates by a wide margin."
+    assert by_id[2]["summary"] == ""  # NaN in the DataFrame must not reach the API as NaN/None
+
+
+def test_score_sentiment_works_without_a_summary_column_at_all(monkeypatch):
+    """Callers that never pass 'summary' (older code paths, tests) must not break."""
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        assert all(item["summary"] == "" for item in items)
+        return json.dumps([{"id": item["id"], "sentiment": 0.0, "reason": "", "relevant": True} for item in items])
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+    headlines = pd.DataFrame(
+        {
+            "id": [1],
+            "ts": pd.to_datetime(["2026-07-27"], utc=True),
+            "symbol": ["SPY"],
+            "headline": ["headline"],
+        }
+    )
+
+    scored = sentiment.score_sentiment(headlines)
+    assert list(scored["sentiment"]) == [0.0]
+
+
 def test_score_sentiment_flags_a_mistagged_symbol_as_not_relevant(monkeypatch):
     """A news vendor mistagging a symbol onto a story (e.g. an MSFT story tagged NYT)
     should come back with relevant=False rather than a fabricated sentiment reading."""

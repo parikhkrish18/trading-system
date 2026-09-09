@@ -82,6 +82,16 @@ _REACTIVATION_MODEL_VERSION = "ensemble_v1"
 _SENTIMENT_LOOKBACK_HOURS = 24
 _MIN_NEWS_COUNT = 2
 _SENTIMENT_CONTRADICTION_THRESHOLD = 0.4  # mean sentiment must be this strongly opposite to trigger
+# _recent_sentiment weights each headline's contribution by exp(-age/half_life)
+# rather than a flat mean over the lookback window, so a headline from the
+# last hour dominates the read and one from many hours ago barely registers
+# -- a flat mean over 24h treats a fresh headline and a 23-hour-old one as
+# equally informative about what's true RIGHT NOW, which is exactly backwards
+# for an hourly check meant to catch news that just broke. At half_life=1.0h:
+# 1h old carries half the weight of a fresh one, 6h old ~1.6%, 24h old
+# ~6e-8 (effectively zero) -- the 24h lookback above still bounds which rows
+# are read at all, this only changes how they're combined once read.
+_SENTIMENT_RECENCY_HALF_LIFE_HOURS = 1.0
 
 _MOMENTUM_WINDOW_DAYS = 5
 # The trigger size is config, not a constant — see
@@ -108,9 +118,18 @@ class ContradictionResult:
 
 
 def _recent_sentiment(engine, symbol: str) -> tuple[float | None, int]:
+    """
+    Recency-weighted mean sentiment over the trailing _SENTIMENT_LOOKBACK_HOURS:
+    each headline's contribution decays exponentially with age (see
+    _SENTIMENT_RECENCY_HALF_LIFE_HOURS) instead of a flat mean, so a
+    headline from the last hour dominates and a day-old one barely counts.
+    The returned count is a plain, unweighted count of qualifying headlines
+    -- still just "is there enough signal at all" (_MIN_NEWS_COUNT), not
+    itself recency-weighted.
+    """
     since = dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=_SENTIMENT_LOOKBACK_HOURS)
     df = pd.read_sql(
-        "SELECT sentiment FROM news_events WHERE symbol = %(symbol)s AND ts >= %(since)s AND sentiment IS NOT NULL "
+        "SELECT sentiment, ts FROM news_events WHERE symbol = %(symbol)s AND ts >= %(since)s AND sentiment IS NOT NULL "
         # A headline a news vendor mistagged onto this symbol (see
         # data/schema/010_news_sentiment_relevance.sql) must not be able to
         # trigger closing a real position -- IS NOT FALSE is the NULL-safe
@@ -121,7 +140,11 @@ def _recent_sentiment(engine, symbol: str) -> tuple[float | None, int]:
     )
     if df.empty:
         return None, 0
-    return float(df["sentiment"].mean()), len(df)
+    ts = pd.to_datetime(df["ts"], utc=True)
+    age_hours = (dt.datetime.now(tz=dt.UTC) - ts).dt.total_seconds() / 3600.0
+    weights = 0.5 ** (age_hours / _SENTIMENT_RECENCY_HALF_LIFE_HOURS)
+    weighted_mean = float((df["sentiment"] * weights).sum() / weights.sum())
+    return weighted_mean, len(df)
 
 
 def _recent_momentum(engine, symbol: str) -> float | None:

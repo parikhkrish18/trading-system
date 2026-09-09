@@ -475,10 +475,13 @@ def test_recent_sentiment_query_excludes_mistagged_symbols(monkeypatch):
     must never be able to trigger closing a real position -- see
     data/schema/010_news_sentiment_relevance.sql."""
     queries = []
+    now = pd.Timestamp.now(tz="UTC")
 
     def fake_read_sql(query, engine, params=None):
         queries.append(query)
-        return pd.DataFrame({"sentiment": [-0.8, -0.9]})
+        # Same ts for both rows -- identical recency weight, so this is
+        # still exercising a plain average, just via the weighted-mean path.
+        return pd.DataFrame({"sentiment": [-0.8, -0.9], "ts": [now, now]})
 
     monkeypatch.setattr(cm.pd, "read_sql", fake_read_sql)
 
@@ -491,12 +494,55 @@ def test_recent_sentiment_query_excludes_mistagged_symbols(monkeypatch):
 
 
 def test_recent_sentiment_empty_when_no_relevant_news(monkeypatch):
-    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"sentiment": []}))
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"sentiment": [], "ts": []}))
 
     mean, count = cm._recent_sentiment(engine=object(), symbol="AAPL")
 
     assert mean is None
     assert count == 0
+
+
+def test_recent_sentiment_weights_a_fresh_headline_over_an_old_one(monkeypatch):
+    """The whole point of the recency weighting: an hour-old headline
+    should dominate the read, not average flatly against an equally
+    extreme but much older one."""
+    now = pd.Timestamp.now(tz="UTC")
+
+    def fake_read_sql(query, engine, params=None):
+        return pd.DataFrame(
+            {
+                "sentiment": [0.9, -0.9],  # fresh: strongly positive; 20h old: strongly negative
+                "ts": [now, now - pd.Timedelta(hours=20)],
+            }
+        )
+
+    monkeypatch.setattr(cm.pd, "read_sql", fake_read_sql)
+
+    mean, count = cm._recent_sentiment(engine=object(), symbol="AAPL")
+
+    assert mean > 0.8  # the fresh headline dominates despite the old one being equally extreme in sign
+    assert count == 2
+
+
+def test_recent_sentiment_half_life_math_is_exact(monkeypatch):
+    """Locks in the actual decay formula: a headline exactly one half-life
+    old carries exactly half the weight of a fresh one."""
+    now = pd.Timestamp.now(tz="UTC")
+
+    def fake_read_sql(query, engine, params=None):
+        return pd.DataFrame(
+            {
+                "sentiment": [1.0, 0.0],
+                "ts": [now, now - pd.Timedelta(hours=cm._SENTIMENT_RECENCY_HALF_LIFE_HOURS)],
+            }
+        )
+
+    monkeypatch.setattr(cm.pd, "read_sql", fake_read_sql)
+
+    mean, _count = cm._recent_sentiment(engine=object(), symbol="AAPL")
+
+    # weight(fresh)=1.0, weight(1 half-life old)=0.5 -> (1.0*1.0 + 0.0*0.5) / 1.5
+    assert mean == pytest.approx(1.0 / 1.5, abs=1e-6)
 
 
 def test_freed_capital_fraction_with_no_positions_is_fully_idle():
