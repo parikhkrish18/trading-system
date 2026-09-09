@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_FLUSH_INTERVAL_SECONDS = 15.0
 DEFAULT_FLUSH_MAX_BATCH = 200
 
-_NEWS_EVENTS_COLUMNS = ["id", "symbol", "ts", "headline", "source", "sentiment", "surprise"]
+_NEWS_EVENTS_COLUMNS = ["id", "symbol", "ts", "headline", "summary", "source", "sentiment", "surprise"]
 
 
 def _stream_stable_id(article_id: str, symbol: str) -> int:
@@ -98,11 +98,18 @@ def article_to_rows(article: Any) -> list[dict]:
     article_id = _get("id")
     created_at = _get("created_at")
     # Benzinga's content (delivered via this stream) sometimes comes through
-    # with literal HTML entities in the headline text -- e.g. an apostrophe
-    # as "&#39;" rather than "'" -- left over from wherever Benzinga last
-    # rendered it as HTML. Decode once here, at ingest, rather than leaving
-    # every reader (the dashboard, sentiment scoring) to notice and handle it.
+    # with literal HTML entities in the headline/summary text -- e.g. an
+    # apostrophe as "&#39;" rather than "'" -- left over from wherever
+    # Benzinga last rendered it as HTML. Decode once here, at ingest, rather
+    # than leaving every reader (the dashboard, sentiment scoring) to notice
+    # and handle it.
     headline = html.unescape(_get("headline") or "")
+    # alpaca.data.models.news.News.summary: "Summary text for the article
+    # (may be first sentence of content)" -- present on both the parsed News
+    # object and the raw-dict form the stream can also deliver. Genuinely
+    # optional (some articles carry an empty summary), so this falls back to
+    # "" like headline does rather than surfacing None downstream.
+    summary = html.unescape(_get("summary") or "")
     if not symbols or article_id is None or created_at is None:
         return []
 
@@ -116,6 +123,7 @@ def article_to_rows(article: Any) -> list[dict]:
             "symbol": symbol,
             "ts": ts,
             "headline": headline,
+            "summary": summary,
             "source": "alpaca_stream",
             "sentiment": float("nan"),
             "surprise": float("nan"),

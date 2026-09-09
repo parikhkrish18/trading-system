@@ -57,11 +57,61 @@ def test_fetch_news_shapes_polygon_response(monkeypatch):
 
     df = news.fetch_news(["SPY", "QQQ"], since_hours=24)
 
-    assert list(df.columns) == ["id", "symbol", "ts", "headline", "source"]
+    assert list(df.columns) == ["id", "symbol", "ts", "headline", "summary", "source"]
     assert len(df) == 2
     assert set(df["symbol"]) == {"SPY", "QQQ"}
     assert (df["source"] == "polygon").all()
     assert pd.api.types.is_datetime64_any_dtype(df["ts"])
+    assert (df["summary"] == "").all()  # no "description" in this fixture's payload -- falls back to "", not None
+
+
+def test_fetch_news_captures_polygons_description_as_summary(monkeypatch):
+    """The article's short blurb -- alongside the bare headline -- gives
+    sentiment scoring more than a one-line title to judge a story from."""
+
+    def fake_get(url, params=None, timeout=None):
+        return _FakeResponse(
+            {
+                "results": [
+                    {
+                        "id": "article-with-summary-1",
+                        "published_utc": "2026-07-27T12:00:00Z",
+                        "title": "Company beats on earnings",
+                        "description": "Revenue and EPS both topped analyst estimates for the quarter.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(news, "polygon_get", fake_get)
+    monkeypatch.setattr(news.settings, "polygon_api_key", "test-key")
+
+    df = news.fetch_news(["SPY"], since_hours=24)
+
+    assert df.iloc[0]["summary"] == "Revenue and EPS both topped analyst estimates for the quarter."
+
+
+def test_fetch_news_decodes_html_entities_in_the_description_too(monkeypatch):
+    def fake_get(url, params=None, timeout=None):
+        return _FakeResponse(
+            {
+                "results": [
+                    {
+                        "id": "article-entities-summary-1",
+                        "published_utc": "2026-08-30T12:00:00Z",
+                        "title": "ok",
+                        "description": "The CEO said it &#39;exceeded expectations&#39;.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(news, "polygon_get", fake_get)
+    monkeypatch.setattr(news.settings, "polygon_api_key", "test-key")
+
+    df = news.fetch_news(["SPY"], since_hours=24)
+
+    assert df.iloc[0]["summary"] == "The CEO said it 'exceeded expectations'."
 
 
 def test_fetch_news_decodes_html_entities_in_the_title(monkeypatch):
@@ -206,7 +256,7 @@ def test_fetch_news_empty_results_returns_empty_dataframe(monkeypatch):
 
     df = news.fetch_news(["SPY"], since_hours=24)
     assert df.empty
-    assert list(df.columns) == ["id", "symbol", "ts", "headline", "source"]
+    assert list(df.columns) == ["id", "symbol", "ts", "headline", "summary", "source"]
 
 
 def test_ingest_news_adds_null_sentiment_and_surprise(monkeypatch):

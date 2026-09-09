@@ -1,10 +1,11 @@
 """
 Phase 2 qualitative features.
 
-Turns raw headlines/filing text (from `news_events`) into a numeric
-sentiment score per (symbol, day), via batched calls to Claude (cheap model —
-this is a high-volume, low-value-per-call task, so cost matters more than
-for the core forecast model).
+Turns raw headlines (plus each article's short summary, when the vendor
+gave one -- see data/schema/016_news_summary.sql) from `news_events` into a
+numeric sentiment score per (symbol, day), via batched calls to Claude
+(cheap model -- this is a high-volume, low-value-per-call task, so cost
+matters more than for the core forecast model).
 
 Kept as a separate pass from ingestion (see data/ingest/news.py) so you can
 re-score historical news with a better model without re-pulling raw data.
@@ -26,26 +27,33 @@ _MODEL = "claude-haiku-4-5"
 _BATCH_SIZE = 20
 
 _SYSTEM_PROMPT = (
-    "You are scoring financial news headlines for sentiment, one headline "
-    "paired with one ticker symbol it was tagged with by a news vendor. "
+    "You are scoring financial news stories for sentiment, one story paired "
+    "with one ticker symbol it was tagged with by a news vendor. Each story "
+    "gives a headline and, when the vendor provided one, a short summary -- "
+    "use the summary whenever it's present: a bare headline alone is often "
+    "ambiguous or even misleading about actual direction (e.g. a headline "
+    "that reads negatively but whose summary reveals the number still beat "
+    "expectations), and the summary is there specifically to resolve that. "
+    "An empty summary just means none was available; judge from the "
+    "headline alone in that case. "
     "News vendors sometimes mistag a symbol onto a story that isn't "
-    "actually about that company -- check this first: is the headline "
+    "actually about that company -- check this first: is the story "
     "genuinely, substantively about THIS symbol's company, or is the tag "
     "wrong/incidental (a passing mention, an unrelated company with a "
     "similar name, or a clear vendor tagging error)? Set \"relevant\" to "
     "false for the latter case. "
-    "For each headline, assign a sentiment score from -1.0 (very negative for "
+    "For each story, assign a sentiment score from -1.0 (very negative for "
     "the stock) to 1.0 (very positive for the stock), 0.0 for neutral/mixed -- "
     "if relevant is false, still give your best-guess sentiment, it just won't "
     "be used. "
     "Also give a one-sentence, plain-English reason a trader could read at "
-    "a glance explaining why THIS symbol is affected by THIS headline (under "
+    "a glance explaining why THIS symbol is affected by THIS story (under "
     "25 words) -- e.g. 'Direct competitor's product launch threatens market "
     "share' or 'Company beat EPS estimates by a wide margin'; if relevant is "
     "false, the reason should say what the story is actually about instead. "
     "Respond with ONLY a JSON array of objects: "
     '[{"id": <id>, "sentiment": <float>, "reason": <string>, "relevant": '
-    "<bool>}, ...], one entry per headline, in the same order given. No "
+    "<bool>}, ...], one entry per story, in the same order given. No "
     "other text."
 )
 
@@ -61,7 +69,20 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, tuple[float, str, bool]]:
-    items = [{"id": int(row["id"]), "symbol": row["symbol"], "headline": row["headline"]} for _, row in batch.iterrows()]
+    items = [
+        {
+            "id": int(row["id"]),
+            "symbol": row["symbol"],
+            "headline": row["headline"],
+            # "" (not omitted) for a row with no summary -- older rows
+            # ingested before 016_news_summary.sql, or an article the
+            # vendor simply gave none for -- so every item has the same
+            # shape and the prompt's "empty summary" instruction applies
+            # uniformly rather than the model having to notice a missing key.
+            "summary": row["summary"] if "summary" in batch.columns and pd.notna(row.get("summary")) else "",
+        }
+        for _, row in batch.iterrows()
+    ]
     resp = client.messages.create(
         model=_MODEL,
         # 20 headlines x (id + sentiment + a <=25-word reason + relevant) can
@@ -101,7 +122,9 @@ def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, tuple[floa
 
 def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
     """
-    Input: dataframe with at least ['id', 'ts', 'symbol', 'headline'].
+    Input: dataframe with at least ['id', 'ts', 'symbol', 'headline'], plus
+    an optional 'summary' column -- when absent, or NaN/empty on a given
+    row, that row is scored off its headline alone (see _score_batch).
     Output: same rows plus 'sentiment' (float, [-1, 1]), 'sentiment_reason'
     (a short plain-English explanation of why that symbol is affected), and
     'sentiment_relevant' (False when the vendor's symbol tag doesn't
@@ -136,7 +159,7 @@ def backfill_unscored_news(batch_size: int = 500) -> int:
     """Pull rows from news_events where sentiment IS NULL, score them, write back."""
     engine = get_engine()
     query = """
-        SELECT id, ts, symbol, headline FROM news_events
+        SELECT id, ts, symbol, headline, summary FROM news_events
         WHERE sentiment IS NULL
         ORDER BY ts
         LIMIT %(limit)s

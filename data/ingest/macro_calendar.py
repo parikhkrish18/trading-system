@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import logging
 import re
 from zoneinfo import ZoneInfo
 
@@ -29,6 +30,8 @@ from bs4 import BeautifulSoup
 
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
+
+logger = logging.getLogger(__name__)
 
 FOMC_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 
@@ -200,7 +203,15 @@ def scrape_macro_calendar(months_ahead: int = 6) -> pd.DataFrame:
     if settings.fred_api_key:
         frames.append(fetch_fred_events(months_ahead=months_ahead))
     else:
-        print("FRED_API_KEY not set — skipping CPI/Jobs dates, scraping FOMC only.")
+        # logger.warning, not print: this call runs unattended (the weekly
+        # cycle and, self-hosted, a monthly systemd timer -- see
+        # infra/systemd/macro-calendar-refresh.*) with nobody watching
+        # stdout. A blank FRED_API_KEY means days_to_next_cpi/days_to_next_jobs
+        # (features/build_features.py::build_event_risk_features) silently
+        # never exist as features at all, every single week -- worth
+        # showing up in the logs a deploy actually gets alerted on, not
+        # just a print() line buried in routine job output.
+        logger.warning("FRED_API_KEY not set — skipping CPI/Jobs dates, scraping FOMC only.")
     return pd.concat(frames, ignore_index=True)
 
 

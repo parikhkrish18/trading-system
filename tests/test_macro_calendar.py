@@ -190,12 +190,21 @@ def test_fetch_fred_events_uses_dst_aware_offset_in_winter(monkeypatch):
     assert df.iloc[0]["ts"] == expected
 
 
-def test_scrape_macro_calendar_skips_fred_when_no_api_key(monkeypatch):
+def test_scrape_macro_calendar_skips_fred_when_no_api_key(monkeypatch, caplog):
+    """
+    A blank FRED_API_KEY means CPI/Jobs macro-calendar rows never populate
+    at all, every single week -- days_to_next_cpi/days_to_next_jobs
+    (features/build_features.py) then silently never exist as features.
+    That must show up as a real log warning (not a print() only stdout
+    catches) since this call runs unattended.
+    """
     monkeypatch.setattr(macro_calendar.settings, "fred_api_key", "")
     monkeypatch.setattr(macro_calendar, "fetch_fomc_events", lambda: pd.DataFrame(
         {"event_name": ["FOMC Decision"], "ts": [pd.Timestamp("2026-01-28T18:00:00Z")], "category": ["FOMC"], "notes": [""]}
     ))
 
-    df = macro_calendar.scrape_macro_calendar()
+    with caplog.at_level("WARNING"):
+        df = macro_calendar.scrape_macro_calendar()
 
     assert (df["category"] == "FOMC").all()
+    assert "FRED_API_KEY" in caplog.text

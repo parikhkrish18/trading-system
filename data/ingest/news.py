@@ -7,7 +7,7 @@ features/qualitative/sentiment.py as a separate pass, so re-scoring with a
 better model later doesn't require re-pulling raw news.
 
 Expected output shape:
-    symbol | ts | headline | source
+    symbol | ts | headline | summary | source
 
 Usage:
     python -m data.ingest.news --symbols SPY,QQQ --since-hours 24
@@ -79,7 +79,7 @@ def fetch_news(symbols: list[str], since_hours: int, sleep_seconds: float = DEFA
             "Sentiment features will be absent, which the model tolerates.",
             len(symbols),
         )
-        return pd.DataFrame(columns=["id", "symbol", "ts", "headline", "source"])
+        return pd.DataFrame(columns=["id", "symbol", "ts", "headline", "summary", "source"])
 
     since = dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=since_hours)
     rows: list[dict] = []
@@ -115,11 +115,16 @@ def fetch_news(symbols: list[str], since_hours: int, sleep_seconds: float = DEFA
                     "ts": article["published_utc"],
                     # Polygon (like Benzinga via Alpaca's stream, see
                     # news_stream.py's article_to_rows) sometimes hands back
-                    # title text with literal HTML entities in it (an
-                    # apostrophe as "&#39;", not "'") -- decode here, once, at
-                    # ingest, so nothing downstream (the dashboard, sentiment
-                    # scoring reading the headline text) has to know that.
+                    # title/description text with literal HTML entities in it
+                    # (an apostrophe as "&#39;", not "'") -- decode here,
+                    # once, at ingest, so nothing downstream (the dashboard,
+                    # sentiment scoring) has to know that.
                     "headline": html.unescape(article.get("title") or ""),
+                    # Polygon's short article blurb -- optional (can be
+                    # empty on some articles), gives sentiment scoring more
+                    # than a bare headline to judge a story from. See
+                    # data/schema/016_news_summary.sql.
+                    "summary": html.unescape(article.get("description") or ""),
                     "source": "polygon",
                 }
                 for article in payload.get("results", [])
@@ -143,7 +148,7 @@ def fetch_news(symbols: list[str], since_hours: int, sleep_seconds: float = DEFA
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
 
-    df = pd.DataFrame(rows, columns=["id", "symbol", "ts", "headline", "source"])
+    df = pd.DataFrame(rows, columns=["id", "symbol", "ts", "headline", "summary", "source"])
     if not df.empty:
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
         # Belt-and-suspenders against any other source of within-batch id
