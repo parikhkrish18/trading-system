@@ -35,6 +35,16 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> 
     minus_di = 100 * minus_dm.ewm(alpha=1 / window, min_periods=window).mean() / atr
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)
+    # plus_di + minus_di == 0 only when both are exactly zero (both are
+    # non-negative sums), i.e. genuinely zero directional movement in
+    # either direction over the whole smoothing window (a flat/stale price
+    # series) -- the strongest possible non-trending reading, not missing
+    # data. Same class of bug as RSI's 0/0 case (mean_reversion.py::rsi):
+    # the .replace(0, pd.NA) guard above exists only to avoid a division
+    # by zero and ends up turning this into NaN instead of the correct
+    # DX=0. Unlike RSI's undefined-direction 50, there's no ambiguity here
+    # -- no movement at all means no directional dominance, unambiguously.
+    dx = dx.mask((plus_di == 0) & (minus_di == 0), 0.0)
     return dx.ewm(alpha=1 / window, min_periods=window).mean()
 
 

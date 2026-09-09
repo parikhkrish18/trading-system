@@ -54,9 +54,13 @@ def test_adx_is_nan_during_warmup_and_finite_once_the_window_fills():
 
 def test_adx_flat_price_series_does_not_raise_on_the_zero_denominator():
     """
-    plus_di + minus_di can be exactly 0 on a perfectly flat series (no
-    directional movement at all) -- the .replace(0, pd.NA) guard exists for
-    this; confirm it actually produces NaN rather than raising or a stray inf.
+    A perfectly flat series (high == low == close, unchanged every day)
+    makes true range itself 0, so ATR is also 0 and plus_di/minus_di are
+    each their own 0/0 (NaN) before dx's own division even runs -- dx stays
+    NaN here, which is correct: there's no usable trend/range information
+    at all, not even "zero movement within a stable range" (see the
+    dx-specifically-zero case below). This test only confirms the deeper
+    0/0 doesn't raise or produce a stray inf.
     """
     n = 40
     idx = pd.date_range("2024-01-01", periods=n, freq="B")
@@ -67,6 +71,32 @@ def test_adx_flat_price_series_does_not_raise_on_the_zero_denominator():
     result = momentum.adx(high, low, close, window=14)
 
     assert not np.isinf(result.dropna()).any()
+
+
+def test_adx_reads_zero_not_nan_when_range_is_stable_but_undirected():
+    """
+    Regression test: a stock trading within an unchanged daily high/low
+    band (no new highs, no new lows -- zero directional movement) but with
+    a real, nonzero range (so ATR > 0, unlike the fully-flat case above)
+    makes plus_di and minus_di both cleanly 0.0, not NaN. The old code's
+    `.replace(0, pd.NA)` guard on dx's own denominator turned this into
+    NaN -- silently dropping ADX's single most informative "definitely not
+    trending" reading into missing data, the same shape of bug already
+    fixed for RSI's 0/0 case. It must read 0.0.
+    """
+    n = 60
+    idx = pd.date_range("2024-01-01", periods=n, freq="B")
+    high = pd.Series([101.0] * n, index=idx)  # unchanged day over day
+    low = pd.Series([99.0] * n, index=idx)  # unchanged day over day
+    # Oscillates within [low, high] so true range is a real, nonzero 2.0
+    # every day (ATR > 0) without high/low ever making a new extreme.
+    close = pd.Series([99.5, 100.5] * (n // 2), index=idx)
+
+    result = momentum.adx(high, low, close, window=14)
+
+    valid = result.dropna()
+    assert len(valid) > 0  # the window-fill warmup must actually clear at some point in 60 rows
+    assert (valid == 0.0).all()
 
 
 def test_cross_sectional_rank_is_bounded_in_zero_one_and_orders_correctly():

@@ -100,11 +100,25 @@ def _parse_fomc_row(row, year: int) -> dict | None:
         # published date range (e.g. "17-18*" -> 18th), approximate the
         # statement release as 2pm ET (converted to UTC below, DST-aware).
         digits_only = re.sub(r"[^\d-]", "", date_el.get_text(strip=True))
+        day_parts = digits_only.split("-")
         try:
-            last_day = int(digits_only.split("-")[-1])
+            first_day = int(day_parts[0])
+            last_day = int(day_parts[-1])
         except ValueError:
             return None
-        decision_date = dt.date(year, month, last_day)
+        # A two-day meeting can span a month boundary (e.g. "30-1*" for an
+        # April 30-May 1 meeting) -- the Fed's markup gives `month` as the
+        # meeting's START month only. When the range's second number is
+        # smaller than the first, the last day falls in the FOLLOWING
+        # month, not `month` itself; treating it as day `last_day` of
+        # `month` would put the decision date weeks early (April 1st
+        # instead of May 1st).
+        if last_day < first_day:
+            decision_date = (
+                dt.date(year + 1, 1, last_day) if month == 12 else dt.date(year, month + 1, last_day)
+            )
+        else:
+            decision_date = dt.date(year, month, last_day)
 
     return {
         "event_name": "FOMC Decision",
@@ -138,16 +152,26 @@ def fetch_fomc_events() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["event_name", "ts", "category", "notes"])
 
 
-def fetch_fred_events(months_ahead: int = 6) -> pd.DataFrame:
+def fetch_fred_events(months_ahead: int = 6, today: dt.date | None = None) -> pd.DataFrame:
     """
     Pull upcoming CPI / Employment Situation release dates from FRED.
     Requires FRED_API_KEY. Returns event_name, ts, category, notes.
+
+    `today`: injectable for tests; defaults to the current Eastern calendar
+    date -- not dt.date.today(), which is server-local (UTC on this
+    deployment) and would already read as tomorrow during the last several
+    hours of the Eastern trading day (~7-8pm ET), silently excluding a
+    same-day release from the `today <= release_date <= horizon` window
+    below. Every other date in this file is already Eastern-anchored via
+    _eastern_to_utc; this keeps `today` consistent with that.
     """
     if not settings.fred_api_key:
         raise RuntimeError(
             "FRED_API_KEY not set. Get a free key at "
             "https://fred.stlouisfed.org/docs/api/api_key.html and add it to .env."
         )
+    if today is None:
+        today = dt.datetime.now(_EASTERN).date()
 
     resp = requests.get(
         FRED_RELEASES_URL, params={"api_key": settings.fred_api_key, "file_type": "json"}, timeout=30
@@ -156,7 +180,6 @@ def fetch_fred_events(months_ahead: int = 6) -> pd.DataFrame:
     releases = resp.json().get("releases", [])
     release_id_by_name = {r["name"].strip().lower(): r["id"] for r in releases}
 
-    today = dt.date.today()
     horizon = today + dt.timedelta(days=30 * months_ahead)
     rows: list[dict] = []
 
