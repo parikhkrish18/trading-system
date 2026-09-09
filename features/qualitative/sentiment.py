@@ -64,8 +64,23 @@ def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, tuple[floa
     items = [{"id": int(row["id"]), "symbol": row["symbol"], "headline": row["headline"]} for _, row in batch.iterrows()]
     resp = client.messages.create(
         model=_MODEL,
-        max_tokens=1024,
-        system=_SYSTEM_PROMPT,
+        # 20 headlines x (id + sentiment + a <=25-word reason + relevant) can
+        # run past 1024 on a batch where most reasons land near the cap --
+        # the response is JSON, so a truncation mid-object doesn't just lose
+        # the tail, it fails json.loads() for the WHOLE batch (see the except
+        # around backfill_unscored_news()'s caller), burning those output
+        # tokens for nothing and leaving all 20 rows unscored for a retry
+        # next hour. 1600 gives headroom without materially changing cost --
+        # actual output rarely approaches even the old cap.
+        max_tokens=1600,
+        # Cached: this string is byte-identical on every call (see the
+        # docstring/prompt above), and backfill_unscored_news() fans this
+        # out into up to 25 of these calls back-to-back in a single run (500
+        # rows / 20 per batch) -- ephemeral's default 5-minute TTL comfortably
+        # covers that whole run, so only the first call of each hourly pass
+        # pays full price for these ~320 tokens instead of every call paying
+        # it. See response.usage.cache_read_input_tokens to confirm hits.
+        system=[{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": json.dumps(items)}],
     )
     text = _strip_code_fence(resp.content[0].text)
