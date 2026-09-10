@@ -667,6 +667,15 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     # Collected rather than announced one at a time: the human already saw
     # the proposal message naming each of these, so what they need
     # afterwards is one line saying how it ended.
+    #
+    # APPROVAL_MODE=auto (the default) never sends the pre-trade proposal
+    # message at all (see approval_gate.request_approval) -- this follow-up
+    # is the ONLY thing that reaches Telegram for a contradiction close, so
+    # it has to carry the actual reason, not just the symbol. The detail
+    # text is already sitting on result.reasons; skipping it here was the
+    # only thing standing between "SNDK closed" and "SNDK closed because
+    # mean sentiment -0.55 over the last 24h contradicts the long."
+    reason_by_symbol = {r.symbol: "; ".join(x["detail"] for x in r.reasons) for r in flagged}
     closed: list[str] = []
     kept: list[str] = []
     closed_any = False
@@ -700,9 +709,11 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 
     parts = []
     if closed:
-        parts.append(f"🔻 Closed mid-week: {', '.join(closed)}")
+        lines = "\n".join(f"  • {s}: {reason_by_symbol[s]}" for s in closed)
+        parts.append(f"🔻 Closed mid-week:\n{lines}")
     if kept:
-        parts.append(f"🤝 Flagged but kept open on your call: {', '.join(kept)}")
+        lines = "\n".join(f"  • {s}: {reason_by_symbol[s]}" for s in kept)
+        parts.append(f"🤝 Flagged but kept open on your call:\n{lines}")
     if parts:
         outcome_message = "Contradiction check done.\n" + "\n".join(parts)
         send_slack_alert(outcome_message, severity="warning")

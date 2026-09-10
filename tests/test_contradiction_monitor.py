@@ -270,6 +270,58 @@ def test_negative_sentiment_closes_a_long_position(monkeypatch):
     assert results[0].reasons[0]["signal"] == "news_sentiment"
 
 
+def test_close_followup_message_includes_the_reason_not_just_the_symbol(monkeypatch):
+    """
+    APPROVAL_MODE=auto (the default) never sends the pre-trade proposal
+    message at all -- see approval_gate.request_approval -- so this
+    follow-up is the ONLY thing that reaches Telegram for a contradiction
+    close. It has to carry the actual signal ("mean sentiment -0.55 ..."),
+    not just the bare symbol, or a human reading their phone has no way to
+    tell why a position closed without opening the dashboard.
+    """
+    broker = _FakeBroker({"SNDK": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.55, 5))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    (message,) = followups
+    assert "SNDK" in message
+    assert "-0.55" in message
+    assert "contradicts long position" in message
+
+
+def test_multiple_closes_in_one_followup_each_get_their_own_reason(monkeypatch):
+    """Two positions closing the same hour for two DIFFERENT reasons must not blur into one line."""
+    broker = _FakeBroker({"AAPL": 10, "TSLA": -20})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5) if symbol == "AAPL" else (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: _past_the_brake() if symbol == "TSLA" else None)
+    monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    (message,) = followups
+    assert "AAPL: mean sentiment" in message
+    assert "TSLA: 5d return" in message
+
+
 def test_reversed_momentum_closes_a_short_position(monkeypatch):
     broker = _FakeBroker({"TSLA": -20})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
