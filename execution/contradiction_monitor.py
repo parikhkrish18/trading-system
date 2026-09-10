@@ -571,8 +571,15 @@ def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None
             logger.exception("Failed to open reactivation position %s.", c.symbol)
             continue
 
-        executed = broker.get_positions().get(c.symbol, 0.0)
-        _log_reactivation(c, executed, broker.mode, target_shares, approval_status=status_by_symbol.get(c.symbol) or "approved")
+        # target_shares, not a live re-query -- the same settlement race as
+        # the closure logging above (see the comment there), but on the
+        # open side: a get_positions() read this soon after submission can
+        # still show 0 shares for a fill that hasn't posted yet. Logging
+        # that as executed_position would make the round-trip
+        # reconstruction skip this row as a candidate entry entirely
+        # (it only starts an episode on a nonzero executed_position), so a
+        # reactivation buy could vanish from Closed Trades on both ends.
+        _log_reactivation(c, target_shares, broker.mode, target_shares, approval_status=status_by_symbol.get(c.symbol) or "approved")
         reopened.append(f"{c.symbol} {target_shares:+,.2f} sh")
         reopened_target_pct[c.symbol] = c.target_position_pct or 0.0
 
@@ -597,10 +604,14 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     side it's held on, then asks a human (one batched proposal message)
     before closing anything that tripped a threshold. Approved closes are
     submitted and logged; rejected ones are logged as flagged-but-kept and
-    alerted. If anything actually closed, immediately attempts to redeploy
-    the freed capital (_attempt_reactivation, itself gated the same way)
-    rather than leaving it idle until next week. No-ops cleanly if nothing
-    is held or nothing contradicts.
+    alerted. Every pass then attempts to redeploy any freed capital
+    (_attempt_reactivation, itself gated the same way) rather than leaving it
+    idle until next week -- called every cycle, not just one that closed
+    something itself, since a prior cycle's attempt can defer (the closed
+    symbol was still settling at the broker) with nothing else to retry it
+    otherwise; rebalance_after_exit's own freed_fraction gate makes this a
+    cheap no-op the rest of the time. No-ops cleanly if nothing is held or
+    nothing contradicts.
 
     Runs under advisory_lock(_CONTRADICTION_LOCK_KEY): this fires hourly, and
     a slow pass (e.g. the news backfill call below) can run long enough to
@@ -720,6 +731,10 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
             logger.warning("Contradiction detected for %s (%s). %s", symbol, result.side, detail)
 
     if not flagged:
+        # A quiet cycle -- nothing to close -- still deserves a shot at
+        # redeploying any capital an EARLIER cycle froze in cash (see the
+        # matching call, and its comment, at the end of this function).
+        _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set())
         return results
 
     gate = request_fn if request_fn is not None else request_approval
@@ -754,7 +769,6 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     reason_by_symbol = {r.symbol: "; ".join(x["detail"] for x in r.reasons) for r in flagged}
     closed: list[str] = []
     kept: list[str] = []
-    closed_any = False
     for result in flagged:
         status = status_by_symbol.get(result.symbol)
         if result.symbol not in approved_symbols:
@@ -770,9 +784,18 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
             logger.exception("Failed to close contradicted position %s.", result.symbol)
             continue
 
-        closed_any = True
-        executed = broker.get_positions().get(result.symbol, 0.0)
-        _log_closure(result, broker.mode, executed, approval_status=status or "approved")
+        # 0.0, not a re-query: submit_target_position(0.0) always means a
+        # full flatten, but broker.get_positions() read back this soon can
+        # still show the pre-fill quantity (paper fills settle with a
+        # delay -- the SAME race full_book_rebalance's "still present at
+        # the broker" deferral log exists to guard against). Logging that
+        # stale nonzero here as executed_position previously made
+        # /api/trades/closed's round-trip reconstruction -- which only
+        # treats executed_position == 0 as a close -- never see the exit,
+        # so the trade silently never appeared in the Closed Trades table.
+        # trading_loop.py's _log_decisions hardcodes 0.0 for the same
+        # reason; mirror that here.
+        _log_closure(result, broker.mode, 0.0, approval_status=status or "approved")
         closed.append(result.symbol)
 
         # Every client holding this symbol exits it too, on their own
@@ -795,13 +818,20 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         send_slack_alert(outcome_message, severity="warning")
         send_followup(outcome_message)  # Telegram's post-trade update — see approval_gate module docstring
 
-    if closed_any:
-        _attempt_reactivation(
-            broker,
-            engine,
-            request_fn=request_fn,
-            excluded_symbols=set(closed),
-        )
+    # Not gated on closed_any: a rebalance deferred by an earlier cycle (the
+    # excluded symbol was still settling, or the check simply lost the race
+    # against a slow fill) previously had no other trigger to retry it --
+    # nothing else ever called this once that cycle's own attempt returned,
+    # so freed capital could sit in cash indefinitely until some unrelated
+    # symbol happened to close later. Calling this every cycle is cheap when
+    # there is nothing to do: rebalance_after_exit's own freed_fraction gate
+    # (and, this cycle, an empty excluded_symbols) makes it a quick no-op.
+    _attempt_reactivation(
+        broker,
+        engine,
+        request_fn=request_fn,
+        excluded_symbols=set(closed),
+    )
 
     return results
 
