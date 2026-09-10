@@ -350,12 +350,9 @@ function positionCardHTML(p, idx, newsBySymbol) {
 
   const watcherNote = `
     <div class="muted" style="font-size:11px;margin-top:4px;">
-      Watched hourly during market hours — a close is proposed automatically (same human approval
-      gate as every other trade) the moment any of these fire: fresh news sentiment or 5-day price
-      momentum turning against this position, or the position's own take-profit/stop-loss above
-      being hit. That last one is the swing-trade exit: it doesn't wait for the weekly cycle, so a
-      volatile stock's target can close in a few days and a calmer one's can take longer, on its
-      own timeline (execution/contradiction_monitor.py).
+      Watched hourly during market hours. A close is proposed (same approval gate as any trade) if
+      news sentiment or 5-day momentum turns against this position, or its take-profit/stop-loss
+      above is hit — exits don't wait for the weekly cycle.
     </div>`;
 
   return `

@@ -209,6 +209,36 @@ def build_fundamentals_features(prices: pd.DataFrame, fundamentals: pd.DataFrame
     return pd.concat(frames, ignore_index=True)
 
 
+def fundamentals_prior_context(fundamentals: pd.DataFrame) -> dict[tuple[str, str], dict]:
+    """
+    For each (symbol, metric) in `fundamentals`, the two most recently filed
+    values -- so a narrative can say a reported number moved, not just state
+    it in isolation. A single filing level (e.g. "net income is $0.19")
+    carries no directional information on its own; what a model — or a
+    human — can actually read something into is whether it grew or shrank
+    from the filing before it.
+
+    Keyed by the same feature name build_fundamentals_features assigns the
+    latest value (fund_<metric>_latest), so a caller already holding that
+    feature name can look its context up directly. Display-only: this never
+    touches the `features` table, so it can't accidentally become a new
+    model input the way adding a row there would (see
+    models.train.feature_columns, which takes every features-table column
+    as a training feature).
+    """
+    if fundamentals.empty:
+        return {}
+    context: dict[tuple[str, str], dict] = {}
+    for (symbol, metric), group in fundamentals.groupby(["symbol", "metric"]):
+        rows = group.sort_values("ts").tail(2)
+        if len(rows) < 2:
+            continue
+        prior_value, latest_value = (float(v) for v in rows["value"])
+        pct_change = None if prior_value == 0 else (latest_value - prior_value) / abs(prior_value)
+        context[(symbol, f"fund_{metric}_latest")] = {"prior_value": prior_value, "pct_change": pct_change}
+    return context
+
+
 # How far back feature computation looks, regardless of how much price
 # history the `prices` table actually holds. Hit live: an unbounded pull of
 # the full 5-year backfill (503 symbols x ~5yrs) produced a features batch

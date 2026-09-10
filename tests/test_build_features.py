@@ -10,6 +10,7 @@ from features.build_features import (
     build_event_risk_features,
     build_fundamentals_features,
     build_qualitative_features,
+    fundamentals_prior_context,
 )
 
 
@@ -134,6 +135,81 @@ def test_build_fundamentals_features_as_of_joins_latest_known_value():
 
 def test_build_fundamentals_features_empty_inputs():
     assert build_fundamentals_features(pd.DataFrame(), pd.DataFrame()).empty
+
+
+def test_fundamentals_prior_context_reports_change_from_the_previous_filing():
+    fundamentals = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "ts": pd.to_datetime(["2026-05-01", "2026-08-01"], utc=True),
+            "metric": ["net_income", "net_income"],
+            "value": [100.0, 150.0],
+        }
+    )
+
+    context = fundamentals_prior_context(fundamentals)
+
+    assert context[("AAPL", "fund_net_income_latest")] == {"prior_value": 100.0, "pct_change": pytest.approx(0.5)}
+
+
+def test_fundamentals_prior_context_handles_a_decline():
+    fundamentals = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "ts": pd.to_datetime(["2026-05-01", "2026-08-01"], utc=True),
+            "metric": ["net_income", "net_income"],
+            "value": [100.0, 60.0],
+        }
+    )
+
+    context = fundamentals_prior_context(fundamentals)
+
+    assert context[("AAPL", "fund_net_income_latest")]["pct_change"] == pytest.approx(-0.4)
+
+
+def test_fundamentals_prior_context_zero_prior_value_has_no_pct_change():
+    """A prior filing of exactly zero makes a % change undefined, not a divide-by-zero crash."""
+    fundamentals = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "ts": pd.to_datetime(["2026-05-01", "2026-08-01"], utc=True),
+            "metric": ["net_income", "net_income"],
+            "value": [0.0, 60.0],
+        }
+    )
+
+    context = fundamentals_prior_context(fundamentals)
+
+    assert context[("AAPL", "fund_net_income_latest")] == {"prior_value": 0.0, "pct_change": None}
+
+
+def test_fundamentals_prior_context_no_prior_filing_is_omitted():
+    """Only one filing on record (e.g. a recent IPO) -- nothing to compare it to, so no entry at all."""
+    fundamentals = pd.DataFrame(
+        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-08-01"], utc=True), "metric": ["net_income"], "value": [60.0]}
+    )
+
+    assert fundamentals_prior_context(fundamentals) == {}
+
+
+def test_fundamentals_prior_context_keeps_metrics_and_symbols_independent():
+    fundamentals = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL", "AAPL", "MSFT", "MSFT"],
+            "ts": pd.to_datetime(["2026-05-01", "2026-08-01", "2026-08-01", "2026-05-01", "2026-08-01"], utc=True),
+            "metric": ["net_income", "net_income", "eps_actual", "net_income", "net_income"],
+            "value": [100.0, 150.0, 3.0, 200.0, 220.0],
+        }
+    )
+
+    context = fundamentals_prior_context(fundamentals)
+
+    assert set(context) == {("AAPL", "fund_net_income_latest"), ("MSFT", "fund_net_income_latest")}
+    assert context[("MSFT", "fund_net_income_latest")]["prior_value"] == 200.0
+
+
+def test_fundamentals_prior_context_empty_input():
+    assert fundamentals_prior_context(pd.DataFrame()) == {}
 
 
 def test_build_and_store_defaults_to_a_bounded_lookback_window(monkeypatch):

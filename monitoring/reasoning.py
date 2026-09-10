@@ -239,10 +239,21 @@ def _event_narrative(label: str) :
 
 
 def _fundamentals_narrative(label: str) :
-    def fn(value: float | None) -> str:
+    def fn(value: float | None, context: dict | None = None) -> str:
         if value is None:
             return f"{label} data was unavailable."
-        return f"Latest reported {label.lower()} is {value:,.2f} (from the most recent filed report)."
+        base = f"Latest reported {label.lower()} is {value:,.2f}"
+        prior_value = (context or {}).get("prior_value")
+        if prior_value is None:
+            # No earlier filing to compare against (e.g. a recent IPO) —
+            # say so rather than let a bare, incomparable level read as if
+            # it meant something on its own.
+            return f"{base}, with no prior filing on record to compare it to — this reading alone carries limited signal."
+        pct_change = (context or {}).get("pct_change")
+        if pct_change is None:  # prior filing was exactly zero — % change is undefined
+            return f"{base}, versus {prior_value:,.2f} in the prior filing."
+        direction = "up" if pct_change >= 0 else "down"
+        return f"{base}, {direction} {abs(pct_change):.1%} from the prior filing ({prior_value:,.2f})."
 
     return fn
 
@@ -311,17 +322,33 @@ _NARRATIVE_FNS = {
 }
 
 
-def explain_feature(feature_name: str, value: float | None, contribution: float) -> str:
+_CONTEXT_AWARE_FEATURES = {
+    "fund_eps_actual_latest",
+    "fund_revenue_actual_latest",
+    "fund_net_income_latest",
+    "fund_gross_profit_latest",
+    "fund_total_assets_latest",
+    "fund_total_liabilities_latest",
+}
+
+
+def explain_feature(feature_name: str, value: float | None, contribution: float, context: dict | None = None) -> str:
     """
     One plain-English, value-aware sentence for a single SHAP feature
     contribution — describes what the raw value actually implies about the
     stock (e.g. "sold off sharply", "RSI is overbought"), then states which
     way the model weighted it, so the reasoning reads like something a
     person with basic investing knowledge would say, not a raw number dump.
+
+    `context`: only meaningful for _CONTEXT_AWARE_FEATURES (currently the
+    fund_*_latest features) — a single filing level has no direction on its
+    own, so those narratives compare it against the prior filing instead of
+    reporting the number in isolation (see models.screener._attach_reasoning
+    / features.build_features.fundamentals_prior_context).
     """
     narrative_fn = _NARRATIVE_FNS.get(feature_name)
     if narrative_fn is not None:
-        narrative = narrative_fn(value)
+        narrative = narrative_fn(value, context) if feature_name in _CONTEXT_AWARE_FEATURES else narrative_fn(value)
     else:
         label = feature_name.replace("_", " ")
         label = label[0].upper() + label[1:]
@@ -369,7 +396,7 @@ def phase_signals(regime: str | None, top_features: list[dict]) -> dict:
     lines = []
     if regime:
         lines.append(f"Market regime read as {regime.upper()} (based on trend strength on SPY).")
-    lines += [explain_feature(f["feature_name"], f.get("value"), f["contribution"]) for f in top_features]
+    lines += [explain_feature(f["feature_name"], f.get("value"), f["contribution"], f.get("context")) for f in top_features]
     top_label = FEATURE_LABELS.get(top_features[0]["feature_name"], top_features[0]["feature_name"]) if top_features else "n/a"
     return {
         "phase": 2,

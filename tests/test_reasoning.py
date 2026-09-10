@@ -67,6 +67,34 @@ def test_explain_feature_event_narrative_preserves_acronym_capitalization():
     assert "cpi" not in line
 
 
+def test_explain_feature_fundamentals_narrative_without_context_flags_the_gap():
+    """
+    A bare filing level has no direction on its own -- absent a prior
+    filing to compare it to, the narrative has to say that, not imply the
+    number itself explains the forecast.
+    """
+    line = reasoning.explain_feature("fund_net_income_latest", 0.19, contribution=0.01)
+    assert "0.19" in line
+    assert "no prior filing" in line
+
+
+def test_explain_feature_fundamentals_narrative_with_context_reports_the_change():
+    line = reasoning.explain_feature(
+        "fund_net_income_latest", 150.0, contribution=0.01,
+        context={"prior_value": 100.0, "pct_change": 0.5},
+    )
+    assert "up 50.0%" in line
+    assert "100.00" in line
+
+
+def test_explain_feature_fundamentals_narrative_with_context_reports_a_decline():
+    line = reasoning.explain_feature(
+        "fund_eps_actual_latest", 1.0, contribution=-0.01,
+        context={"prior_value": 2.0, "pct_change": -0.5},
+    )
+    assert "down 50.0%" in line
+
+
 def test_explain_feature_sentiment_narrative_reflects_polarity():
     negative = reasoning.explain_feature("sentiment_mean_3d", -0.5, contribution=-0.01)
     assert "clearly negative" in negative
