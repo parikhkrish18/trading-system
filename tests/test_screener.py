@@ -698,6 +698,53 @@ def test_attach_reasoning_displays_raw_values_not_the_zscored_model_input():
     assert not any("-57.5%" in line for line in top_features)
 
 
+def test_attach_reasoning_threads_fundamentals_context_onto_the_matching_top_feature():
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
+    latest = pd.DataFrame({"symbol": ["AAPL"], "fund_net_income_latest": [150.0]})
+    contributions = pd.DataFrame(
+        {"fund_net_income_latest": [0.02], "base_value": [0.0]}, index=pd.Index(["AAPL"], name="symbol")
+    )
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
+    context = {("AAPL", "fund_net_income_latest"): {"prior_value": 100.0, "pct_change": 0.5}}
+
+    _attach_reasoning(
+        candidates, ensemble, latest, latest, feature_cols=["fund_net_income_latest"], scored=scored, regime=TREND,
+        max_leg_pct=0.70, min_leg_floor_fraction=0.6, top_n=1, fundamentals_context=context,
+    )
+
+    top_features = next(p for p in candidates[0].reasoning if p["phase"] == 2)["top_features"]
+    assert top_features[0]["context"] == {"prior_value": 100.0, "pct_change": 0.5}
+
+
+def test_attach_reasoning_missing_fundamentals_context_is_none_not_a_crash():
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}])
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [1.5]})
+    contributions = pd.DataFrame({"f1": [0.02], "base_value": [0.0]}, index=pd.Index(["AAPL"], name="symbol"))
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], contributions=contributions)
+
+    _attach_reasoning(
+        candidates, ensemble, latest, latest, feature_cols=["f1"], scored=scored, regime=TREND,
+        max_leg_pct=0.70, min_leg_floor_fraction=0.6, top_n=1,
+    )  # no fundamentals_context passed at all -- must default cleanly, not raise
+
+    top_features = next(p for p in candidates[0].reasoning if p["phase"] == 2)["top_features"]
+    assert top_features[0]["context"] is None
+
+
+def test_load_fundamentals_context_empty_symbols_skips_the_query(monkeypatch):
+    """No candidates this cycle -> nothing to look up, and no DB round-trip to make."""
+    import models.screener as scr
+
+    def _boom(*a, **k):
+        raise AssertionError("should not query the database for an empty symbol list")
+
+    monkeypatch.setattr(scr.pd, "read_sql", _boom)
+
+    assert scr._load_fundamentals_context([]) == {}
+
+
 def test_attach_reasoning_empty_candidates_is_noop():
     ensemble = _FakeEnsemble(mean_prediction=[], direction_agreement=[])
     _attach_reasoning(
@@ -749,6 +796,7 @@ def _run_screen_harness(monkeypatch, mode, *, full_deployment=False, diversified
     ))
     monkeypatch.setattr(scr, "build_correlation_matrix", lambda *a, **k: pd.DataFrame())
     monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
 
     calls = {}
 
@@ -840,6 +888,32 @@ def test_run_screen_diversified_honors_full_deployment(monkeypatch):
     assert result[0].target_position_pct == pytest.approx(0.25)
 
 
+def test_run_screen_loads_fundamentals_context_for_the_selected_candidates_only(monkeypatch):
+    """
+    The fundamentals lookup only needs to cover symbols that actually made
+    the shortlist -- not the whole screened universe -- so it stays a small
+    query regardless of how many symbols run_screen was given.
+    """
+    from models.screener import TradeCandidate
+
+    candidate = TradeCandidate(
+        symbol="A", side="long", predicted_return=0.05, direction_agreement=1.0,
+        conviction_score=0.05, target_position_pct=0.20,
+    )
+    scr, _calls = _run_screen_harness(monkeypatch, "diversified", diversified_result=[candidate])
+    captured = {}
+
+    def _fake_load_fundamentals_context(symbols):
+        captured["symbols"] = symbols
+        return {}
+
+    monkeypatch.setattr(scr, "_load_fundamentals_context", _fake_load_fundamentals_context)
+
+    scr.run_screen("v3", ["A"])
+
+    assert captured["symbols"] == ["A"]
+
+
 def test_run_screen_diversified_threads_current_positions_to_select_trades(monkeypatch):
     """run_screen_with_scores must pass its caller's current_positions through to select_trades, not default it away."""
     scr, calls = _run_screen_harness(monkeypatch, "diversified")
@@ -893,6 +967,7 @@ def test_run_screen_diversified_skips_screening_on_nan_forecast_scale(monkeypatc
     called = {}
     monkeypatch.setattr(scr, "select_trades", lambda *a, **k: called.setdefault("ran", True))
     monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
 
     result = scr.run_screen("v3", ["A"])
 

@@ -234,6 +234,7 @@ def test_run_screen_passes_the_configured_setting_to_the_selector(monkeypatch):
     ))
     monkeypatch.setattr(scr, "build_correlation_matrix", lambda *a, **k: pd.DataFrame())
     monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
 
     def fake_select_trades(scored, **kwargs):
         captured.update(kwargs)
@@ -287,6 +288,7 @@ def test_suppressing_shorts_leaves_the_scored_frame_intact(monkeypatch):
     ))
     monkeypatch.setattr(scr, "build_correlation_matrix", lambda *a, **k: pd.DataFrame())
     monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
 
     result = scr.run_screen_with_scores("v3", ["HELD"])
 

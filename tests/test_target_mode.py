@@ -325,6 +325,7 @@ def test_the_screener_sizes_against_the_spread_of_what_it_predicts(monkeypatch):
     )
     monkeypatch.setattr(scr, "build_correlation_matrix", lambda *a, **k: pd.DataFrame())
     monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
 
     captured = {}
 
@@ -369,6 +370,7 @@ def test_the_ensemble_is_fitted_on_target_not_on_the_raw_return(monkeypatch):
         columns=["symbol", "predicted_return", "direction_agreement", "conviction_score", "confident"]
     ))
     monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
 
     scr.run_screen("v4", ["A"])
 

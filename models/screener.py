@@ -31,9 +31,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
-from data.ingest.db import get_engine
+from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
 from execution.exit_levels import ExitLevels, exit_levels_for
+from features.build_features import fundamentals_prior_context
 from features.quant.volatility import realized_vol
 from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
@@ -539,6 +540,24 @@ def select_concentrated_trades(
     return [_make_candidate(row, weight, total_deploy_pct) for row, weight in zip(picks, weights, strict=False)]
 
 
+def _load_fundamentals_context(symbols: list[str]) -> dict[tuple[str, str], dict]:
+    """
+    Loads just enough of the raw `fundamentals` history (two filings per
+    metric, for these symbols only) for fundamentals_prior_context to give
+    _attach_reasoning's narrative something to compare "latest reported X"
+    against. Kept as its own function, separate from the pure
+    fundamentals_prior_context, purely so tests can mock the I/O here
+    without needing a real database — same pattern as load_latest_features.
+    """
+    if not symbols:
+        return {}
+    fundamentals = pd.read_sql(
+        f"SELECT symbol, ts, metric, value FROM fundamentals WHERE symbol IN ({symbol_in_clause(symbols)})",  # noqa: S608 — symbols validated via symbol_in_clause
+        get_engine(),
+    )
+    return fundamentals_prior_context(fundamentals)
+
+
 def _attach_reasoning(
     candidates: list[TradeCandidate],
     ensemble: EnsembleForecastModel,
@@ -552,6 +571,7 @@ def _attach_reasoning(
     top_n: int = 5,
     strategy: str = "concentrated",
     top_k: int | None = None,
+    fundamentals_context: dict[tuple[str, str], dict] | None = None,
 ) -> None:
     """
     Mutates each candidate in place, attaching plain-English reasoning for
@@ -574,6 +594,12 @@ def _attach_reasoning(
     not a standard-deviation count. `raw_features` (always unscaled,
     straight from the features table) supplies the value actually shown
     per top feature; only the model-facing X below uses `latest_features`.
+
+    `fundamentals_context`: {(symbol, feature_name): {"prior_value",
+    "pct_change"}} for the fund_*_latest features (see
+    _load_fundamentals_context / fundamentals_prior_context) — lets the
+    narrative say a reported number moved, instead of stating an
+    incomparable level in isolation.
     """
     if not candidates:
         return
@@ -584,6 +610,7 @@ def _attach_reasoning(
     X = rows.reindex(columns=feature_cols)
     contributions = ensemble.predict_contributions(X)
     n_confident = int(scored["confident"].sum())
+    fundamentals_context = fundamentals_context or {}
 
     for candidate in candidates:
         contrib_row = contributions.loc[candidate.symbol].drop("base_value")
@@ -593,6 +620,7 @@ def _attach_reasoning(
                 "feature_name": feat,
                 "value": None if pd.isna(raw_rows.loc[candidate.symbol, feat]) else float(raw_rows.loc[candidate.symbol, feat]),
                 "contribution": float(contrib_row[feat]),
+                "context": fundamentals_context.get((candidate.symbol, feat)),
             }
             for feat in top_feature_names
         ]
@@ -891,6 +919,7 @@ def run_screen_with_scores(
         settings.min_concentrated_leg_floor_fraction,
         strategy=settings.strategy_mode,
         top_k=settings.screener_top_k,
+        fundamentals_context=_load_fundamentals_context([c.symbol for c in candidates]),
     )
     # Exit levels come from the same price history the model trained on, so
     # a pick is proposed with levels sized to that stock rather than to the
