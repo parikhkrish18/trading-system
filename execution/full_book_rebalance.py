@@ -10,6 +10,7 @@ trade in one cycle.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Iterable
 
 from config.settings import settings
@@ -28,6 +29,12 @@ from risk.sizing import allocate_by_conviction
 logger = logging.getLogger(__name__)
 
 _MIN_REBALANCE_FRACTION = 0.05
+
+# A market close doesn't always settle at the broker instantly -- a
+# get_positions() read taken right after submit_target_position(0.0) can
+# still show the pre-fill quantity for a few minutes. 15 minutes is a
+# generous margin for a paper fill to post.
+_SETTLEMENT_WAIT_SECONDS = 15 * 60
 
 
 def _latest_prices(engine, symbols: list[str]) -> dict[str, float]:
@@ -60,11 +67,25 @@ def rebalance_after_exit(
     # submit a second close through the rebalance path for the same symbol.
     still_exiting = excluded.intersection(current_positions)
     if still_exiting:
+        # Checking again immediately would very likely see the same
+        # still-open read the close order itself just produced. Give the
+        # fill real time to post, then make the settlement call for real,
+        # rather than deferring on a read taken the instant the close was
+        # submitted.
         logger.info(
-            "Post-exit rebalance deferred: %s still present at the broker; waiting for the close to settle.",
-            ", ".join(sorted(still_exiting)),
+            "%s still shows open right after the close order — waiting %d minutes for the fill to settle before deciding.",
+            ", ".join(sorted(still_exiting)), _SETTLEMENT_WAIT_SECONDS // 60,
         )
-        return
+        time.sleep(_SETTLEMENT_WAIT_SECONDS)
+        current_positions = {s: q for s, q in broker.get_positions().items() if q != 0}
+        still_exiting = excluded.intersection(current_positions)
+        if still_exiting:
+            logger.info(
+                "Post-exit rebalance deferred: %s still present at the broker %d minutes after the close; "
+                "waiting for the close to settle.",
+                ", ".join(sorted(still_exiting)), _SETTLEMENT_WAIT_SECONDS // 60,
+            )
+            return
 
     freed_fraction = _freed_capital_fraction(broker, engine)
     if freed_fraction < _MIN_REBALANCE_FRACTION:
@@ -199,11 +220,15 @@ def rebalance_after_exit(
             logger.exception("Failed to retarget %s during the full-book rebalance.", candidate.symbol)
             continue
 
-        executed = broker.get_positions().get(candidate.symbol, 0.0)
+        # target_shares, not a live re-query: broker.get_positions() read
+        # right after submission can still show the pre-fill (unsettled)
+        # quantity -- see the settlement-wait comment above and
+        # contradiction_monitor.py's _log_closure/_log_reactivation, which
+        # have the identical issue on the same root cause.
         if log_candidate is not None:
             log_candidate(
                 candidate,
-                executed,
+                target_shares,
                 broker.mode,
                 target_shares,
                 status_by_symbol.get(candidate.symbol) or "approved",
