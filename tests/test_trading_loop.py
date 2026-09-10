@@ -5,6 +5,7 @@ import pytest
 
 from execution import trading_loop
 from execution.approval_gate import ApprovalOutcome, number_proposals
+from execution.hold_rules import HoldDecision
 from models.screener import ScreenResult, TradeCandidate
 from monitoring import reasoning
 from risk.circuit_breakers import BreakerResult
@@ -162,6 +163,83 @@ def test_log_decisions_builds_full_phase_reasoning_for_candidates_and_closures(m
     old1_phases = [p["phase"] for p in json.loads(rows["OLD1"]["reasoning"])]
     assert aapl_phases == [1, 2, 3, 4, 5, 6, 7]
     assert old1_phases == [1, 4, 5, 6, 7]  # no 2/3 -- no fresh forecast for a symbol that wasn't screened as a pick
+
+
+def test_log_decisions_gives_a_held_position_a_fresh_row_with_current_reasoning(monkeypatch):
+    """
+    A position held-but-not-reshortlisted used to get no decisions row at
+    all -- its displayed reasoning stayed frozen at whatever it was the
+    last time it WAS a fresh pick, even after a data bug behind that old
+    reasoning got fixed. It must now get its own row, phases 1-7 in order,
+    with a fresh Phase 2/3 from held_reasoning when there is one.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+    held = HoldDecision(symbol="HELD", close=False, missed_cycles=1, reasons=[])
+    fresh_phase2_3 = [
+        reasoning.phase_signals("trend", [{"feature_name": "mom_ret_5d", "value": 0.01, "contribution": 0.01}]),
+        reasoning.phase_forecast(0.02, 0.018),
+    ]
+
+    _real_log_decisions(
+        candidates=[],
+        closing_symbols=[],
+        executed={"HELD": 10.0},
+        intended_shares={"HELD": 10.0},
+        feature_set_id="v3",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        held_decisions=[held],
+        held_reasoning={"HELD": fresh_phase2_3},
+        held_predictions={"HELD": 0.02},
+    )
+
+    (row,) = captured["rows"]
+    assert row["symbol"] == "HELD"
+    assert row["forecast"] == 0.02
+    assert row["executed_position"] == 10.0
+    phases = json.loads(row["reasoning"])
+    assert [p["phase"] for p in phases] == [1, 2, 3, 4, 5, 6, 7]
+    phase4 = next(p for p in phases if p["phase"] == 4)
+    assert "HELD" in phase4["summary"]
+    assert "held" in phase4["summary"].lower()
+
+
+def test_log_decisions_held_position_without_fresh_data_still_gets_phase_four(monkeypatch):
+    """No feature row this cycle (e.g. a data gap) -- still log the hold status, just without 2/3."""
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+    held = HoldDecision(symbol="GAP", close=False, missed_cycles=3, reasons=[])
+
+    _real_log_decisions(
+        candidates=[],
+        closing_symbols=[],
+        executed={"GAP": 5.0},
+        intended_shares={"GAP": 5.0},
+        feature_set_id="v3",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        held_decisions=[held],  # no held_reasoning passed at all
+    )
+
+    (row,) = captured["rows"]
+    phases = json.loads(row["reasoning"])
+    assert [p["phase"] for p in phases] == [1, 4, 5, 6, 7]
+    assert "3 consecutive" in " ".join(next(p for p in phases if p["phase"] == 4)["lines"])
 
 
 def test_log_decisions_records_a_closed_symbol_as_zero_even_when_the_broker_has_forgotten_it(monkeypatch):
@@ -894,6 +972,37 @@ def test_position_that_merely_slips_in_rank_is_held(monkeypatch):
     proposed_closes = [p.symbol for p in seen["proposals"] if p.action == "close"]
     assert proposed_closes == []  # HELD slipped in rank but nothing fired
     assert ("HELD", 0.0) not in broker.submitted
+
+
+def test_run_cycle_refreshes_held_position_reasoning_through_explain_held(monkeypatch):
+    """
+    A position held-but-not-reshortlisted must get a fresh Phase 2/3 pulled
+    off this cycle's already-scored screen via ScreenResult.explain_held,
+    and that has to actually reach _log_decisions as held_reasoning -- this
+    is the wiring that makes "why this trade" stop freezing at whatever was
+    true the last time a held position was a fresh pick.
+    """
+    captured = {}
+    broker = _FakeBroker(positions={"HELD": 10.0})
+    monkeypatch.setattr(trading_loop.settings, "hold_max_missed_cycles", 2)
+    _wire_basic_cycle(monkeypatch, broker, [_candidate("NEW", "long", 0.1)], {"NEW": 100.0, "HELD": 50.0})
+
+    explain_calls = {}
+
+    def fake_explain_held(self, symbols, regime):
+        explain_calls["symbols"] = list(symbols)
+        explain_calls["regime"] = regime
+        return {"HELD": [reasoning.phase_signals(regime, [])]}
+
+    monkeypatch.setattr(ScreenResult, "explain_held", fake_explain_held)
+    monkeypatch.setattr(trading_loop, "_log_decisions", lambda *a, **k: captured.update(kwargs=k))
+
+    trading_loop.run_cycle("v3", ["NEW", "HELD"])
+
+    assert explain_calls["symbols"] == ["HELD"]
+    assert explain_calls["regime"] == "trend"
+    assert [d.symbol for d in captured["kwargs"]["held_decisions"]] == ["HELD"]
+    assert captured["kwargs"]["held_reasoning"] == {"HELD": [reasoning.phase_signals("trend", [])]}
 
 
 def test_position_whose_prediction_flips_sign_is_proposed_for_closing(monkeypatch):

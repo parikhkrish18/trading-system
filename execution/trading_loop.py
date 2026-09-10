@@ -400,6 +400,10 @@ def _log_decisions(
     approval_status_by_symbol: dict[str, str] | None = None,
     close_phase4_by_symbol: dict[str, dict] | None = None,
     skip_reasons: dict[str, str] | None = None,
+    held_decisions=(),
+    held_reasoning: dict[str, list[dict]] | None = None,
+    held_levels_by_symbol: dict | None = None,
+    held_predictions: dict[str, float] | None = None,
 ) -> None:
     """
     Logs one decisions row per symbol touched this cycle — new/adjusted
@@ -416,6 +420,14 @@ def _log_decisions(
     that row is still the nonzero size the human agreed to, so phase 5 has
     to say explicitly why 0 shares went out, rather than reading as an
     ordinary "opened 0 shares".
+
+    `held_decisions`/`held_reasoning`: positions kept through the screen
+    without being one of this cycle's fresh picks (see run_cycle's
+    held_decisions). Logged with their own row, same as everything else
+    touched this cycle, specifically so "why this trade" stops freezing at
+    whatever was true the last time a held position WAS a fresh pick —
+    see models.screener.explain_held_symbols for why that mattered enough
+    to build.
     """
     now = dt.datetime.now(tz=dt.UTC)
     statuses = approval_status_by_symbol or {}
@@ -499,6 +511,29 @@ def _log_decisions(
         full_reasoning = reasoning.combine_phases(phase1, phase4, phase5, phase7)
         rows.append(_row(symbol, None, 0.0, 0.0, None, full_reasoning))
 
+    held_reasoning = held_reasoning or {}
+    held_levels_by_symbol = held_levels_by_symbol or {}
+    held_predictions = held_predictions or {}
+    for d in held_decisions:
+        phase2_3 = held_reasoning.get(d.symbol)
+        # No fresh feature row this cycle (delisted, an ingest gap) -- fall
+        # back to Phase 4 alone rather than skip the row: the position's
+        # exit-condition status this cycle is still worth recording even
+        # when there's nothing new to re-explain the forecast with.
+        phase4 = reasoning.phase_hold_continued(d.symbol, held_predictions.get(d.symbol), d.missed_cycles)
+        phase5 = reasoning.phase_execution_skipped(d.symbol, "position held, not re-selected this cycle")
+        phase6 = phase6_by_symbol.get(d.symbol) or reasoning.phase_reconciliation(
+            d.symbol, intended_shares.get(d.symbol, 0.0), executed.get(d.symbol, 0.0), False
+        )
+        phase7 = reasoning.phase_ongoing_monitoring(closed=False)
+        full_reasoning = reasoning.combine_phases(phase1, *(phase2_3 or []), phase4, phase5, phase6, phase7)
+        rows.append(
+            _row(
+                d.symbol, held_predictions.get(d.symbol), None, executed.get(d.symbol), None, full_reasoning,
+                held_levels_by_symbol.get(d.symbol),
+            )
+        )
+
     if not rows:
         return
     pd.DataFrame(rows).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
@@ -578,10 +613,11 @@ def run_cycle(
     except Exception:
         logger.warning("Could not load per-position exit levels — falling back to the global thresholds.")
         prior_levels = {}
+    predicted_return_by_symbol = screen.predicted_return_by_symbol()
     hold_decisions = evaluate_holds(
         positions=current_positions,
         shortlist=candidate_symbols,
-        predictions=screen.predicted_return_by_symbol(),
+        predictions=predicted_return_by_symbol,
         pnl_pct={s: pnl for s, (pnl, _) in pnl_by_symbol.items()},
         prior_missed=prior_missed,
         max_missed_cycles=settings.hold_max_missed_cycles,
@@ -598,6 +634,14 @@ def run_cycle(
     if held_decisions:
         held_summary = ", ".join(f"{d.symbol} ({d.missed_cycles} missed cycle(s))" for d in held_decisions)
         logger.info("Holding despite missing the shortlist — no exit condition fired: %s", held_summary)
+
+    # A held position otherwise never gets a fresh decisions row -- its
+    # "why this trade" reasoning would stay frozen at whatever was true the
+    # last time it WAS a fresh pick, however many cycles ago that was, even
+    # after a data fix corrects the numbers behind it. Re-explains it off
+    # this cycle's already-fitted model/features (see
+    # ScreenResult.explain_held) rather than skip it silently.
+    held_reasoning = screen.explain_held([d.symbol for d in held_decisions], regime)
 
     # Cap total book size at settings.max_concentrated_positions: `candidates`
     # is the top-N shortlist by conviction across the WHOLE universe,
@@ -829,6 +873,10 @@ def run_cycle(
         approval_status_by_symbol=approval_status_by_symbol,
         close_phase4_by_symbol=close_phase4_by_symbol,
         skip_reasons=skip_reasons,
+        held_decisions=held_decisions,
+        held_reasoning=held_reasoning,
+        held_levels_by_symbol=prior_levels,
+        held_predictions=predicted_return_by_symbol,
     )
 
     # Hold state reflects what is ACTUALLY still open after execution: an

@@ -558,6 +558,98 @@ def _load_fundamentals_context(symbols: list[str]) -> dict[tuple[str, str], dict
     return fundamentals_prior_context(fundamentals)
 
 
+def _explain_features(
+    symbols: list[str],
+    ensemble: EnsembleForecastModel,
+    latest_features: pd.DataFrame,
+    raw_features: pd.DataFrame,
+    feature_cols: list[str],
+    fundamentals_context: dict[tuple[str, str], dict] | None,
+    top_n: int = 5,
+) -> dict[str, list[dict]]:
+    """
+    The SHAP core of a symbol's Phase 2 story: its top `top_n` feature
+    contributions by |contribution|, each carrying the raw (unscaled)
+    display value and any fundamentals trend context. Shared by
+    _attach_reasoning (for this cycle's picks) and explain_held_symbols
+    (for a position that's being held without being re-picked) so both
+    read the exact same attribution logic off the exact same ensemble —
+    no second model fit, just a second look at symbols already scored.
+    """
+    rows = latest_features.set_index("symbol").loc[symbols]
+    raw_rows = raw_features.set_index("symbol").loc[symbols]
+    X = rows.reindex(columns=feature_cols)
+    contributions = ensemble.predict_contributions(X)
+    fundamentals_context = fundamentals_context or {}
+
+    out: dict[str, list[dict]] = {}
+    for symbol in symbols:
+        contrib_row = contributions.loc[symbol].drop("base_value")
+        top_feature_names = contrib_row.abs().sort_values(ascending=False).head(top_n).index
+        out[symbol] = [
+            {
+                "feature_name": feat,
+                "value": None if pd.isna(raw_rows.loc[symbol, feat]) else float(raw_rows.loc[symbol, feat]),
+                "contribution": float(contrib_row[feat]),
+                "context": fundamentals_context.get((symbol, feat)),
+            }
+            for feat in top_feature_names
+        ]
+    return out
+
+
+def explain_held_symbols(
+    symbols: list[str],
+    ensemble: EnsembleForecastModel,
+    latest_features: pd.DataFrame,
+    raw_features: pd.DataFrame,
+    feature_cols: list[str],
+    scored: pd.DataFrame,
+    regime: str,
+) -> dict[str, list[dict]]:
+    """
+    Phases 2+3 for a position that's held through this cycle's screen
+    without being one of the fresh picks -- the same SHAP attribution
+    _attach_reasoning gives a fresh candidate, built off the exact same
+    ensemble/scored universe this cycle already computed, just for a
+    symbol that didn't make the shortlist this time.
+
+    Why this exists: _log_decisions only ever wrote a row for symbols
+    that were candidates, closes, or rejections this cycle -- a position
+    held with no exit condition fired got no new row at all, so its
+    "why this trade" reasoning stayed frozen at whatever it was the last
+    time it WAS a fresh pick, however many cycles ago that was. A data
+    fix (e.g. the unadjusted-stock-split bug behind an impossible-looking
+    "+416% in 20 days" reading) could land in `features` and still never
+    reach a held position's card, because nothing ever asked the model
+    to look at it again. This closes that gap: trading_loop.py calls it
+    for every held-and-not-reshortlisted symbol, every cycle.
+
+    Symbols with no feature row this cycle (e.g. delisted, or a gap in
+    the day's ingest) are silently omitted rather than raising -- a
+    missing fresh read isn't a reason to fail the whole cycle; the
+    position's existing decisions row (however old) still stands as the
+    record of what's currently displayed.
+    """
+    known = set(latest_features["symbol"]) if not latest_features.empty else set()
+    usable = [s for s in symbols if s in known]
+    if not usable:
+        return {}
+
+    fundamentals_context = _load_fundamentals_context(usable)
+    per_symbol_top_features = _explain_features(usable, ensemble, latest_features, raw_features, feature_cols, fundamentals_context)
+    predicted_by_symbol = dict(zip(scored["symbol"], scored["predicted_return"], strict=False))
+    conviction_by_symbol = dict(zip(scored["symbol"], scored["conviction_score"], strict=False))
+
+    return {
+        symbol: [
+            reasoning.phase_signals(regime, per_symbol_top_features[symbol]),
+            reasoning.phase_forecast(predicted_by_symbol.get(symbol, 0.0), conviction_by_symbol.get(symbol, 0.0)),
+        ]
+        for symbol in usable
+    }
+
+
 def _attach_reasoning(
     candidates: list[TradeCandidate],
     ensemble: EnsembleForecastModel,
@@ -605,25 +697,13 @@ def _attach_reasoning(
         return
 
     symbols = [c.symbol for c in candidates]
-    rows = latest_features.set_index("symbol").loc[symbols]
-    raw_rows = raw_features.set_index("symbol").loc[symbols]
-    X = rows.reindex(columns=feature_cols)
-    contributions = ensemble.predict_contributions(X)
+    per_symbol_top_features = _explain_features(
+        symbols, ensemble, latest_features, raw_features, feature_cols, fundamentals_context, top_n=top_n
+    )
     n_confident = int(scored["confident"].sum())
-    fundamentals_context = fundamentals_context or {}
 
     for candidate in candidates:
-        contrib_row = contributions.loc[candidate.symbol].drop("base_value")
-        top_feature_names = contrib_row.abs().sort_values(ascending=False).head(top_n).index
-        top_features = [
-            {
-                "feature_name": feat,
-                "value": None if pd.isna(raw_rows.loc[candidate.symbol, feat]) else float(raw_rows.loc[candidate.symbol, feat]),
-                "contribution": float(contrib_row[feat]),
-                "context": fundamentals_context.get((candidate.symbol, feat)),
-            }
-            for feat in top_feature_names
-        ]
+        top_features = per_symbol_top_features[candidate.symbol]
         if strategy == "diversified":
             phase4 = reasoning.phase_selection_diversified(
                 candidate.symbol,
@@ -704,11 +784,28 @@ class ScreenResult:
 
     candidates: list[TradeCandidate]
     scored: pd.DataFrame  # see score_universe: symbol, predicted_return, direction_agreement, …
+    # Everything explain_held needs to re-run this cycle's already-fitted
+    # ensemble against a symbol that wasn't one of the picks, without
+    # fitting anything a second time. Not meant for other callers — reach
+    # for `candidates`/`scored` instead unless you specifically need to
+    # explain a symbol outside the shortlist.
+    _ensemble: EnsembleForecastModel | None = dataclasses.field(default=None, repr=False)
+    _latest_features: pd.DataFrame | None = dataclasses.field(default=None, repr=False)
+    _raw_features: pd.DataFrame | None = dataclasses.field(default=None, repr=False)
+    _feature_cols: list[str] | None = dataclasses.field(default=None, repr=False)
 
     def predicted_return_by_symbol(self) -> dict[str, float]:
         if self.scored.empty:
             return {}
         return dict(zip(self.scored["symbol"], self.scored["predicted_return"], strict=False))
+
+    def explain_held(self, symbols: list[str], regime: str) -> dict[str, list[dict]]:
+        """See models.screener.explain_held_symbols."""
+        if not symbols or self._ensemble is None:
+            return {}
+        return explain_held_symbols(
+            symbols, self._ensemble, self._latest_features, self._raw_features, self._feature_cols, self.scored, regime,
+        )
 
 
 def run_screen(
@@ -927,7 +1024,14 @@ def run_screen_with_scores(
     # numbers apply_short_preference already ranked this candidate against)
     # rather than recomputing it a second time.
     attach_exit_levels(candidates, vol_by_symbol)
-    return ScreenResult(candidates=candidates, scored=scored)
+    return ScreenResult(
+        candidates=candidates,
+        scored=scored,
+        _ensemble=ensemble,
+        _latest_features=latest,
+        _raw_features=raw_latest,
+        _feature_cols=feature_cols,
+    )
 
 
 def apply_full_deployment(
