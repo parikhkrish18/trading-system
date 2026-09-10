@@ -4,6 +4,7 @@ import pytest
 
 from models.regime.trend_chop_classifier import TREND
 from models.screener import (
+    ScreenResult,
     TradeCandidate,
     _attach_reasoning,
     _bounded_conviction_weights,
@@ -11,6 +12,7 @@ from models.screener import (
     attach_exit_levels,
     build_correlation_matrix,
     daily_volatility,
+    explain_held_symbols,
     score_universe,
     select_concentrated_trades,
     select_trades,
@@ -743,6 +745,80 @@ def test_load_fundamentals_context_empty_symbols_skips_the_query(monkeypatch):
     monkeypatch.setattr(scr.pd, "read_sql", _boom)
 
     assert scr._load_fundamentals_context([]) == {}
+
+
+def test_explain_held_symbols_gives_phase_2_and_3_off_the_same_ensemble(monkeypatch):
+    """
+    A held-but-not-reshortlisted symbol needs exactly the SHAP-based Phase 2
+    story a fresh candidate gets, plus Phase 3's forecast -- no Phase 4
+    (that's trading_loop's call, since only it knows the hold-rule status).
+    """
+    import models.screener as scr
+
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda symbols: {})
+    scored = _scored_df([{"symbol": "HELD", "predicted_return": -0.02, "direction_agreement": 0.8, "confident": False}])
+    latest = pd.DataFrame({"symbol": ["HELD"], "f1": [1.5]})
+    contributions = pd.DataFrame({"f1": [-0.01], "base_value": [0.0]}, index=pd.Index(["HELD"], name="symbol"))
+    ensemble = _FakeEnsemble(mean_prediction=[-0.02], direction_agreement=[0.8], contributions=contributions)
+
+    result = explain_held_symbols(["HELD"], ensemble, latest, latest, feature_cols=["f1"], scored=scored, regime=TREND)
+
+    assert set(result) == {"HELD"}
+    phases = {p["phase"] for p in result["HELD"]}
+    assert phases == {2, 3}
+    phase2_lines = " ".join(result["HELD"][0]["lines"])
+    assert "f1" in phase2_lines.lower() or "f1" in str(result["HELD"][0]["top_features"])
+
+
+def test_explain_held_symbols_skips_a_symbol_with_no_fresh_feature_row(monkeypatch):
+    """A symbol missing from this cycle's feature snapshot (delisted, an ingest gap) is omitted, not a KeyError."""
+    import models.screener as scr
+
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda symbols: {})
+    scored = _scored_df([{"symbol": "HELD", "predicted_return": 0.01, "direction_agreement": 0.8, "confident": False}])
+    latest = pd.DataFrame({"symbol": ["HELD"], "f1": [1.5]})
+    contributions = pd.DataFrame({"f1": [0.01], "base_value": [0.0]}, index=pd.Index(["HELD"], name="symbol"))
+    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[0.8], contributions=contributions)
+
+    result = explain_held_symbols(
+        ["HELD", "GHOST"], ensemble, latest, latest, feature_cols=["f1"], scored=scored, regime=TREND
+    )
+
+    assert set(result) == {"HELD"}  # GHOST has no row in `latest` -- silently omitted
+
+
+def test_explain_held_symbols_empty_symbols_is_a_noop(monkeypatch):
+    import models.screener as scr
+
+    def _boom(*a, **k):
+        raise AssertionError("should not query fundamentals for an empty symbol list")
+
+    monkeypatch.setattr(scr, "_load_fundamentals_context", _boom)
+
+    assert explain_held_symbols([], None, pd.DataFrame({"symbol": []}), pd.DataFrame(), [], pd.DataFrame(), TREND) == {}
+
+
+def test_screen_result_explain_held_delegates_with_its_own_stored_context(monkeypatch):
+    """ScreenResult.explain_held must use the ensemble/features run_screen_with_scores stashed on it, not fresh ones."""
+    import models.screener as scr
+
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda symbols: {})
+    scored = _scored_df([{"symbol": "HELD", "predicted_return": 0.01, "direction_agreement": 0.8, "confident": False}])
+    latest = pd.DataFrame({"symbol": ["HELD"], "f1": [1.5]})
+    contributions = pd.DataFrame({"f1": [0.01], "base_value": [0.0]}, index=pd.Index(["HELD"], name="symbol"))
+    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[0.8], contributions=contributions)
+    result = ScreenResult(
+        candidates=[], scored=scored,
+        _ensemble=ensemble, _latest_features=latest, _raw_features=latest, _feature_cols=["f1"],
+    )
+
+    assert set(result.explain_held(["HELD"], TREND)) == {"HELD"}
+
+
+def test_screen_result_explain_held_without_a_stashed_ensemble_is_a_noop():
+    """A ScreenResult built without the private context (e.g. in an older test helper) must not crash."""
+    result = ScreenResult(candidates=[], scored=pd.DataFrame())
+    assert result.explain_held(["HELD"], TREND) == {}
 
 
 def test_attach_reasoning_empty_candidates_is_noop():

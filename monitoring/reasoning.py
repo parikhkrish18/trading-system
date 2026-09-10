@@ -439,6 +439,36 @@ def phase_forecast(predicted_return: float, conviction_score: float) -> dict:
     }
 
 
+def phase_hold_continued(symbol: str, predicted_return: float | None, missed_cycles: int) -> dict:
+    """
+    Phase 4, for a position that's held through the screen: it didn't rank
+    in this cycle's top picks, but nothing crossed a real exit condition
+    either (see execution/hold_rules.py), so it stays open rather than
+    closing on one week's dip in rank. Paired with a fresh Phase 2/3 built
+    off today's data (models.screener.explain_held_symbols) — unlike a
+    closed position, a held one keeps being explained with current
+    numbers, not whatever was true when it was last a fresh pick.
+    """
+    lines = [
+        f"{symbol} did not rank among this cycle's top picks, but nothing about it crossed a real exit "
+        "condition (a confident forecast flip, a stop/target hit, or too many consecutive missed cycles) — "
+        "see Phase 1's decision rule for the closing threshold.",
+    ]
+    if predicted_return is not None:
+        direction = "still expected to rise" if predicted_return >= 0 else "now expected to fall"
+        lines.append(
+            f"The model's current read: {direction} ({predicted_return:+.2%}) — Phase 2/3 above reflect "
+            "today's data, not whatever was true when this position was last freshly picked."
+        )
+    lines.append(f"Missed the fresh shortlist {missed_cycles} consecutive cycle(s) so far.")
+    return {
+        "phase": 4,
+        "title": "Candidate Selection & Sizing",
+        "summary": f"{symbol} held — not re-selected this cycle, but no exit condition fired.",
+        "lines": lines,
+    }
+
+
 def phase_selection_closed(symbol: str) -> dict:
     """Phase 4, for a position that fell out of this cycle's top picks and is being closed."""
     return {
