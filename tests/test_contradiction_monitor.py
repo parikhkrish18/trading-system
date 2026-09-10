@@ -201,6 +201,7 @@ def test_hourly_check_records_an_equity_snapshot_alongside_a_normal_pass(monkeyp
     monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
     calls = []
     monkeypatch.setattr(cm, "record_equity_snapshot", lambda value, mode: calls.append((value, mode)))
 
@@ -246,6 +247,7 @@ def test_snapshot_failure_does_not_abort_the_rest_of_the_check(monkeypatch):
         raise RuntimeError("db unreachable")
 
     monkeypatch.setattr(cm, "record_equity_snapshot", _boom)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
     results = cm.run_contradiction_check()
 
@@ -497,7 +499,16 @@ def test_closure_triggers_reactivation_attempt(monkeypatch):
     assert reactivation_calls == [1]
 
 
-def test_no_closure_does_not_trigger_reactivation(monkeypatch):
+def test_no_closure_still_checks_reactivation_with_nothing_excluded(monkeypatch):
+    """
+    Regression test: this used to skip _attempt_reactivation entirely when
+    nothing closed this cycle. That left a rebalance deferred by an EARLIER
+    cycle (e.g. the excluded symbol was still settling at the broker) with
+    nothing to ever retry it -- freed capital could sit in cash
+    indefinitely. Now every cycle still checks (cheaply -- see
+    rebalance_after_exit's freed_fraction gate), just with nothing excluded
+    when this cycle itself closed nothing.
+    """
     broker = _FakeBroker({"AAPL": 10})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
@@ -507,11 +518,11 @@ def test_no_closure_does_not_trigger_reactivation(monkeypatch):
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)
 
     reactivation_calls = []
-    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: reactivation_calls.append(1))
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: reactivation_calls.append(k.get("excluded_symbols")))
 
     cm.run_contradiction_check()
 
-    assert reactivation_calls == []
+    assert reactivation_calls == [set()]
 
 
 def test_agreeing_signals_leave_the_position_open(monkeypatch):
@@ -522,6 +533,7 @@ def test_agreeing_signals_leave_the_position_open(monkeypatch):
     monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
     results = cm.run_contradiction_check()
 
@@ -647,6 +659,7 @@ def test_sparse_news_does_not_trigger_even_with_strong_sentiment(monkeypatch):
     monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.9, 1))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
     cm.run_contradiction_check()
 
@@ -1021,8 +1034,8 @@ def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
     alerts = []
     monkeypatch.setattr(cm, "send_slack_alert", lambda msg, severity="warning": alerts.append(msg))
 
-    reactivations = []
-    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: reactivations.append(1))
+    reactivation_calls = []
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: reactivation_calls.append(k.get("excluded_symbols")))
 
     results = cm.run_contradiction_check(request_fn=_reject_all)
 
@@ -1032,7 +1045,10 @@ def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
     assert any("kept open" in m and "AAPL" in m for m in alerts)
     assert len(alerts) == 1, f"one summary expected, got {len(alerts)}: {alerts}"
     assert not results[0].closed  # the record reflects what actually happened
-    assert reactivations == []  # nothing closed -> no capital freed -> no re-screen
+    # Still called every cycle (so a still-idle freed-capital balance from an
+    # EARLIER cycle keeps getting a chance) -- just with nothing excluded,
+    # since this cycle itself closed nothing.
+    assert reactivation_calls == [set()]
 
 
 def test_reactivation_opens_are_gated_with_their_own_proposal(monkeypatch):
@@ -1159,6 +1175,7 @@ def test_news_refresh_failure_does_not_abort_the_check(monkeypatch):
     monkeypatch.setattr(cm, "ingest_news", _boom)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
     results = cm.run_contradiction_check()
 
@@ -1308,6 +1325,7 @@ def test_an_uncontended_lock_lets_the_pass_run_normally(monkeypatch):
     monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
     results = cm.run_contradiction_check()
 
@@ -1355,6 +1373,7 @@ def test_a_clean_breaker_pass_leaves_the_hourly_check_unaffected(monkeypatch):
     monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
     results = cm.run_contradiction_check()
 
