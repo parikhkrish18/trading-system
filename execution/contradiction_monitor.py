@@ -63,6 +63,7 @@ from execution.trading_loop import (
     _run_breaker_check,
     current_pnl_by_symbol,
 )
+from features.qualitative.macro_sentiment import SECTOR_ETF_BY_GICS_SECTOR
 from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
 from models.screener import run_screen
@@ -92,6 +93,23 @@ _SENTIMENT_CONTRADICTION_THRESHOLD = 0.4  # mean sentiment must be this strongly
 # ~6e-8 (effectively zero) -- the 24h lookback above still bounds which rows
 # are read at all, this only changes how they're combined once read.
 _SENTIMENT_RECENCY_HALF_LIFE_HOURS = 1.0
+
+# The hourly counterpart to features/qualitative/macro_sentiment.py's
+# macro_sector_x_own_sentiment (macro_sector_sentiment * sentiment_mean_3d,
+# fed to the model for the weekly screen): a stock's own bad news,
+# corroborated by a bearish move across its whole sector, is a real signal
+# the two solo checks above miss -- neither the stock's own sentiment nor
+# a sector-wide mood swing needs to be extreme on its own if the other
+# backs it up. Reuses _recent_sentiment's own 1h-half-life/24h-lookback
+# read, just pointed at the stock's sector ETF instead of the stock.
+#
+# Threshold picked off realistic inputs, not tuned: a moderate own-reading
+# that alone wouldn't clear _SENTIMENT_CONTRADICTION_THRESHOLD (e.g. -0.3)
+# combined with a genuinely bad sector tape (e.g. -0.5) gives a product of
+# 0.15 -- comfortably below what two merely-noisy readings near zero could
+# produce by chance, but well within reach of an actual sector-wide selloff
+# landing on a stock with real negative coverage of its own.
+_MACRO_ALIGNMENT_THRESHOLD = 0.15
 
 _MOMENTUM_WINDOW_DAYS = 5
 # The trigger size is config, not a constant — see
@@ -160,12 +178,31 @@ def _recent_momentum(engine, symbol: str) -> float | None:
     return None if pd.isna(ret) else float(ret)
 
 
+def _sector_by_symbol(engine, symbols: list[str]) -> dict[str, str]:
+    """
+    {symbol: GICS sector} for the given symbols, from the universe table --
+    what _check_position needs to find a held stock's sector ETF (see
+    SECTOR_ETF_BY_GICS_SECTOR). A symbol missing from the universe (a
+    delisting, a naming gap the sector scrape hasn't caught up to) is
+    simply absent from the returned dict, same as any other feature with
+    incomplete inputs -- not a reason to fail the whole check.
+    """
+    if not symbols:
+        return {}
+    df = pd.read_sql(
+        f"SELECT symbol, gics_sector FROM universe WHERE symbol IN ({symbol_in_clause(symbols)})",  # noqa: S608 — symbols validated via symbol_in_clause
+        engine,
+    )
+    return dict(zip(df["symbol"], df["gics_sector"], strict=False))
+
+
 def _check_position(
     engine,
     symbol: str,
     qty: float,
     pnl_pct: float | None = None,
     levels: ExitLevels | None = None,
+    sector: str | None = None,
 ) -> ContradictionResult:
     side = "long" if qty > 0 else "short"
     sign = 1.0 if qty > 0 else -1.0
@@ -183,6 +220,33 @@ def _check_position(
                     "detail": f"mean sentiment {sentiment:.2f} over last {_SENTIMENT_LOOKBACK_HOURS}h contradicts {side} position",
                 }
             )
+
+    # Macro/sector alignment (see _MACRO_ALIGNMENT_THRESHOLD above): only
+    # worth checking at all once the stock's own sentiment already leans
+    # against the position -- a sector-wide mood swing on a stock with
+    # neutral or favorable news of its own isn't this signal's job (that's
+    # exactly why the model gets the raw macro_sector_sentiment feature
+    # separately, for the weekly screen to weigh on its own). Deliberately
+    # NOT gated on _MIN_NEWS_COUNT the way the solo check above is -- a
+    # single fresh own-headline, reinforced by real sector-wide coverage,
+    # is exactly the case a 2-article minimum on the stock alone would
+    # otherwise sit on for another cycle or more.
+    etf = SECTOR_ETF_BY_GICS_SECTOR.get(sector) if sector else None
+    if etf is not None and sentiment is not None and sign * sentiment < 0:
+        sector_sentiment, sector_news_count = _recent_sentiment(engine, etf)
+        if sector_sentiment is not None and sector_news_count >= _MIN_NEWS_COUNT:
+            interaction = sentiment * sector_sentiment
+            if interaction >= _MACRO_ALIGNMENT_THRESHOLD:
+                reasons.append(
+                    {
+                        "signal": "macro_sector_alignment",
+                        "value": interaction,
+                        "detail": (
+                            f"{symbol}'s own sentiment ({sentiment:.2f}) and its sector's ({etf}: "
+                            f"{sector_sentiment:.2f}) are aligned against the {side} position"
+                        ),
+                    }
+                )
 
     momentum = _recent_momentum(engine, symbol)
     if momentum is not None and sign * momentum <= -settings.contradiction_momentum_pct:
@@ -629,6 +693,16 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         logger.exception("Could not load per-position exit levels — falling back to the global stop/target settings.")
         levels_by_symbol = {}
 
+    try:
+        sector_by_symbol = _sector_by_symbol(engine, symbols)
+    except Exception:
+        # Same degrade-gracefully posture as the exit-levels load above --
+        # the macro/sector-alignment check simply won't fire for anything
+        # this cycle (etf resolves to None), the two original signals are
+        # unaffected.
+        logger.exception("Could not load sectors for the held symbols — macro/sector alignment won't be checked this pass.")
+        sector_by_symbol = {}
+
     # Detect first, act later: every position is checked, and everything
     # that tripped goes to the human as ONE batch instead of a message per
     # position.
@@ -636,7 +710,9 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     flagged: list[ContradictionResult] = []
     for symbol, qty in positions.items():
         pnl_pct = pnl_by_symbol.get(symbol, (None, None))[0]
-        result = _check_position(engine, symbol, qty, pnl_pct=pnl_pct, levels=levels_by_symbol.get(symbol))
+        result = _check_position(
+            engine, symbol, qty, pnl_pct=pnl_pct, levels=levels_by_symbol.get(symbol), sector=sector_by_symbol.get(symbol)
+        )
         results.append(result)
         if result.closed:
             flagged.append(result)

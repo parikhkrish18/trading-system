@@ -270,6 +270,146 @@ def test_negative_sentiment_closes_a_long_position(monkeypatch):
     assert results[0].reasons[0]["signal"] == "news_sentiment"
 
 
+def _sentiment_by_symbol(readings: dict[str, tuple[float | None, int]]):
+    """A _recent_sentiment fake that returns a different (sentiment, count) per symbol -- for tests that need
+    the stock's own reading and its sector ETF's reading to differ."""
+    def fn(engine, symbol):
+        return readings.get(symbol, (None, 0))
+    return fn
+
+
+def test_macro_sector_alignment_closes_a_long_neither_reading_alone_would_have(monkeypatch):
+    """
+    SNDK's own sentiment (-0.3) alone is below _SENTIMENT_CONTRADICTION_THRESHOLD
+    (0.4) -- the solo news_sentiment check would not fire. Reinforced by a
+    genuinely bad sector tape (XLK -0.55), the product (0.165) clears
+    _MACRO_ALIGNMENT_THRESHOLD (0.15) and should still close the long.
+    """
+    monkeypatch.setattr(
+        cm, "_recent_sentiment", _sentiment_by_symbol({"SNDK": (-0.3, 3), "XLK": (-0.55, 4)})
+    )
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    result = cm._check_position(engine=object(), symbol="SNDK", qty=10, sector="Information Technology")
+
+    assert result.closed
+    signals = {r["signal"] for r in result.reasons}
+    assert "macro_sector_alignment" in signals
+    assert "news_sentiment" not in signals  # confirms the solo check alone would NOT have fired
+    macro_reason = next(r for r in result.reasons if r["signal"] == "macro_sector_alignment")
+    assert macro_reason["value"] == pytest.approx(-0.3 * -0.55)
+    assert "SNDK" in macro_reason["detail"]
+    assert "XLK" in macro_reason["detail"]
+
+
+def test_macro_sector_alignment_does_not_fire_without_a_known_sector(monkeypatch):
+    """A symbol missing from the universe table (sector=None) can't be mapped to an ETF -- must not crash."""
+    monkeypatch.setattr(
+        cm, "_recent_sentiment", _sentiment_by_symbol({"SNDK": (-0.3, 3), "XLK": (-0.55, 4)})
+    )
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    result = cm._check_position(engine=object(), symbol="SNDK", qty=10, sector=None)
+
+    assert not result.closed
+
+
+def test_macro_sector_alignment_does_not_fire_when_own_sentiment_agrees_with_the_position(monkeypatch):
+    """A bearish sector tape on a stock whose OWN news is positive is not this signal's job."""
+    monkeypatch.setattr(
+        cm, "_recent_sentiment", _sentiment_by_symbol({"SNDK": (0.3, 3), "XLK": (-0.8, 4)})
+    )
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    result = cm._check_position(engine=object(), symbol="SNDK", qty=10, sector="Information Technology")
+
+    assert not result.closed
+
+
+def test_macro_sector_alignment_does_not_fire_below_the_threshold(monkeypatch):
+    """Both readings lean the right way but too mildly -- product stays under _MACRO_ALIGNMENT_THRESHOLD."""
+    monkeypatch.setattr(
+        cm, "_recent_sentiment", _sentiment_by_symbol({"SNDK": (-0.1, 3), "XLK": (-0.2, 4)})
+    )
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    result = cm._check_position(engine=object(), symbol="SNDK", qty=10, sector="Information Technology")
+
+    assert not result.closed
+
+
+def test_macro_sector_alignment_does_not_fire_on_thin_sector_coverage(monkeypatch):
+    """Fewer than _MIN_NEWS_COUNT sector-ETF articles -- one stray sector headline can't trigger this alone."""
+    monkeypatch.setattr(
+        cm, "_recent_sentiment", _sentiment_by_symbol({"SNDK": (-0.3, 3), "XLK": (-0.9, 1)})
+    )
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    result = cm._check_position(engine=object(), symbol="SNDK", qty=10, sector="Information Technology")
+
+    assert not result.closed
+
+
+def test_macro_sector_alignment_closes_a_short_when_both_readings_are_bullish(monkeypatch):
+    """The mirror case: a held short, contradicted by aligned bullish own + sector sentiment."""
+    monkeypatch.setattr(
+        cm, "_recent_sentiment", _sentiment_by_symbol({"SNDK": (0.3, 3), "XLK": (0.55, 4)})
+    )
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    result = cm._check_position(engine=object(), symbol="SNDK", qty=-10, sector="Information Technology")
+
+    assert result.closed
+    assert result.reasons[0]["signal"] == "macro_sector_alignment"
+    assert "short position" in result.reasons[0]["detail"]
+
+
+def test_sector_by_symbol_maps_held_symbols_to_their_gics_sector(monkeypatch):
+    df = pd.DataFrame({"symbol": ["SNDK", "AAPL"], "gics_sector": ["Information Technology", "Information Technology"]})
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: df)
+
+    result = cm._sector_by_symbol(engine=object(), symbols=["SNDK", "AAPL"])
+
+    assert result == {"SNDK": "Information Technology", "AAPL": "Information Technology"}
+
+
+def test_sector_by_symbol_empty_symbols_is_a_noop(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("should not query for an empty symbol list")
+
+    monkeypatch.setattr(cm.pd, "read_sql", _boom)
+
+    assert cm._sector_by_symbol(engine=object(), symbols=[]) == {}
+
+
+def test_run_contradiction_check_closes_on_macro_alignment_alone(monkeypatch):
+    """
+    End-to-end: a position whose own sentiment would NOT have cleared the
+    solo threshold still closes once the sector-alignment signal fires,
+    with the sector correctly resolved from _sector_by_symbol.
+    """
+    broker = _FakeBroker({"SNDK": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", _sentiment_by_symbol({"SNDK": (-0.3, 3), "XLK": (-0.55, 4)}))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    monkeypatch.setattr(cm, "_sector_by_symbol", lambda engine, symbols: {"SNDK": "Information Technology"})
+    monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    results = cm.run_contradiction_check()
+
+    assert broker.closed == ["SNDK"]
+    assert results[0].reasons[0]["signal"] == "macro_sector_alignment"
+    (message,) = followups
+    assert "SNDK" in message and "XLK" in message
+
+
 def test_close_followup_message_includes_the_reason_not_just_the_symbol(monkeypatch):
     """
     APPROVAL_MODE=auto (the default) never sends the pre-trade proposal
