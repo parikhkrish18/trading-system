@@ -571,8 +571,15 @@ def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None
             logger.exception("Failed to open reactivation position %s.", c.symbol)
             continue
 
-        executed = broker.get_positions().get(c.symbol, 0.0)
-        _log_reactivation(c, executed, broker.mode, target_shares, approval_status=status_by_symbol.get(c.symbol) or "approved")
+        # target_shares, not a live re-query -- the same settlement race as
+        # the closure logging above (see the comment there), but on the
+        # open side: a get_positions() read this soon after submission can
+        # still show 0 shares for a fill that hasn't posted yet. Logging
+        # that as executed_position would make the round-trip
+        # reconstruction skip this row as a candidate entry entirely
+        # (it only starts an episode on a nonzero executed_position), so a
+        # reactivation buy could vanish from Closed Trades on both ends.
+        _log_reactivation(c, target_shares, broker.mode, target_shares, approval_status=status_by_symbol.get(c.symbol) or "approved")
         reopened.append(f"{c.symbol} {target_shares:+,.2f} sh")
         reopened_target_pct[c.symbol] = c.target_position_pct or 0.0
 
@@ -771,8 +778,18 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
             continue
 
         closed_any = True
-        executed = broker.get_positions().get(result.symbol, 0.0)
-        _log_closure(result, broker.mode, executed, approval_status=status or "approved")
+        # 0.0, not a re-query: submit_target_position(0.0) always means a
+        # full flatten, but broker.get_positions() read back this soon can
+        # still show the pre-fill quantity (paper fills settle with a
+        # delay -- the SAME race full_book_rebalance's "still present at
+        # the broker" deferral log exists to guard against). Logging that
+        # stale nonzero here as executed_position previously made
+        # /api/trades/closed's round-trip reconstruction -- which only
+        # treats executed_position == 0 as a close -- never see the exit,
+        # so the trade silently never appeared in the Closed Trades table.
+        # trading_loop.py's _log_decisions hardcodes 0.0 for the same
+        # reason; mirror that here.
+        _log_closure(result, broker.mode, 0.0, approval_status=status or "approved")
         closed.append(result.symbol)
 
         # Every client holding this symbol exits it too, on their own

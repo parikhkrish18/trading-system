@@ -965,6 +965,46 @@ def test_contradiction_closes_are_batched_into_one_gate_call(monkeypatch):
     assert set(broker.closed) == {"AAPL", "TSLA"}
 
 
+def test_closed_position_logs_as_flat_even_when_the_broker_read_back_is_still_stale(monkeypatch):
+    """
+    Regression test: a paper fill doesn't settle instantly, so
+    broker.get_positions() read right after submit_target_position(0.0) can
+    still show the pre-fill quantity (this is exactly what
+    full_book_rebalance's "still present at the broker" deferral guards
+    against on the reinvestment side). _log_closure must be told 0.0 --
+    what we submitted -- not whatever that stale read happens to return,
+    or /api/trades/closed's reconstruction (which only treats
+    executed_position == 0 as a close) never sees the exit and the trade
+    silently never appears as closed.
+    """
+
+    class _StaleReadBroker(_FakeBroker):
+        def submit_target_position(self, symbol, target_shares):
+            # Records the close but deliberately does NOT update
+            # get_positions()'s view yet -- simulating an unsettled fill.
+            self.closed.append(symbol)
+            return {"symbol": symbol, "qty": target_shares}
+
+    broker = _StaleReadBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_news", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+
+    logged = []
+    monkeypatch.setattr(
+        cm, "_log_closure",
+        lambda result, mode, executed_position, approval_status=None: logged.append((result.symbol, executed_position)),
+    )
+
+    cm.run_contradiction_check(request_fn=_approve_all)
+
+    assert logged == [("AAPL", 0.0)]
+
+
 def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
     broker = _FakeBroker({"AAPL": 10})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
@@ -1020,6 +1060,49 @@ def test_reactivation_opens_are_gated_with_their_own_proposal(monkeypatch):
     assert gate_calls[0]["reasons"] == ["reactivation"]
     assert "reactivation" in gate_calls[0]["context"]
     assert broker.closed == ["AAPL"]  # the open went through
+
+
+def test_reactivation_open_logs_target_shares_even_when_the_broker_read_back_is_still_stale(monkeypatch):
+    """
+    Regression test, open-side counterpart to the closure one above: a
+    get_positions() read right after submit_target_position(target_shares)
+    can still show the pre-fill (0) quantity for a brand-new position.
+    _log_reactivation must be told target_shares -- what we submitted --
+    or the round-trip reconstruction (which only starts an episode on a
+    nonzero executed_position) never registers this position as opened at
+    all, and it can vanish from Closed Trades on both ends.
+    """
+    from models.screener import TradeCandidate
+
+    class _StaleReadBroker(_FakeBroker):
+        def submit_target_position(self, symbol, target_shares):
+            self.closed.append(symbol)
+            return {"symbol": symbol, "qty": target_shares}
+
+    broker = _StaleReadBroker({}, portfolio_value=100_000.0)
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["AAPL"], "close": [50.0]}))
+
+    candidate = TradeCandidate(
+        symbol="AAPL", side="long", predicted_return=0.03, direction_agreement=0.9,
+        conviction_score=0.027, target_position_pct=0.6,
+    )
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: [candidate])
+
+    logged = []
+    monkeypatch.setattr(
+        cm, "_log_reactivation",
+        lambda candidate, executed_position, mode, target_shares, approval_status=None: logged.append(
+            (candidate.symbol, executed_position, target_shares)
+        ),
+    )
+
+    cm._attempt_reactivation(broker, engine=object(), request_fn=_approve_all)
+
+    assert len(logged) == 1
+    symbol, executed_position, target_shares = logged[0]
+    assert symbol == "AAPL"
+    assert executed_position == target_shares  # not the stale 0 the broker read back
 
 
 def test_rejected_reactivation_stays_in_cash_and_is_logged(monkeypatch):
