@@ -530,7 +530,12 @@ def get_live_accuracy(limit: int = 500) -> dict:
     def _scored(subset: pd.DataFrame) -> dict:
         if subset.empty:
             return dict(empty_bucket)
-        result = compute_forecast_accuracy(subset, prices)
+        # The model forecasts settings.target_horizon_days ahead (a swing-
+        # trade horizon, 20 trading days by default) -- grading it against
+        # the DEFAULT horizon_bars=1 (next single day) checks a question the
+        # model was never asked, and reads as near-noise regardless of how
+        # the real trades actually did. Must match what it was scored on.
+        result = compute_forecast_accuracy(subset, prices, horizon_bars=settings.target_horizon_days)
         if result.empty:
             return dict(empty_bucket)
         return {
@@ -571,7 +576,11 @@ def get_model_drift(consecutive_weeks: int = drift.DEFAULT_DRIFT_WEEKS) -> dict:
 
     symbol_list = symbol_in_clause(decisions["symbol"].unique())
     prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
-    scored = compute_forecast_accuracy(decisions[["symbol", "ts", "forecast"]], prices)
+    # Same horizon-matching reasoning as /api/analysis/live_accuracy just
+    # above: grading at the model's actual target_horizon_days, not the
+    # default 1-day lookup, or every signal downstream (weekly_hit_rate,
+    # the baseline comparison, feature_drag) is checking the wrong thing.
+    scored = compute_forecast_accuracy(decisions[["symbol", "ts", "forecast"]], prices, horizon_bars=settings.target_horizon_days)
     if scored.empty:
         return {**empty, "message": "No live decisions have matured yet (need a later price bar to grade against)."}
 

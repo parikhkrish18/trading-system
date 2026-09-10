@@ -231,6 +231,10 @@ def test_live_accuracy_no_decisions_returns_null_hit_rate(monkeypatch, client):
 
 
 def test_live_accuracy_computes_hit_rate_from_matured_decisions(monkeypatch, client):
+    # 1-day horizon so the 1-day-apart price series below is enough to
+    # mature -- production grades at settings.target_horizon_days, covered
+    # separately by test_live_accuracy_grades_at_the_configured_horizon.
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)
     decisions = pd.DataFrame(
         {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "mode": ["paper"]}
     )
@@ -254,6 +258,7 @@ def test_live_accuracy_excludes_backfilled_history_from_the_live_number(monkeypa
     paper decision (a miss). Blended, that would read as a 75% hit rate; the
     live number must be the honest 0% and the replay reported separately.
     """
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)  # matches the 1-day-apart price series below
     decisions = pd.DataFrame(
         {
             "symbol": ["AAPL", "AAPL", "AAPL", "AAPL"],
@@ -287,6 +292,7 @@ def test_live_accuracy_excludes_backfilled_history_from_the_live_number(monkeypa
 
 
 def test_live_accuracy_with_only_backfill_rows_reports_no_live_number(monkeypatch, client):
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)  # matches the 1-day-apart price series below
     decisions = pd.DataFrame(
         {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "mode": ["backfill"]}
     )
@@ -301,6 +307,36 @@ def test_live_accuracy_with_only_backfill_rows_reports_no_live_number(monkeypatc
     assert body["hit_rate"] is None  # nothing real has matured — say so, don't borrow history
     assert body["n_matured"] == 0
     assert body["backfill"]["n_matured"] == 1
+
+
+def test_live_accuracy_grades_at_the_configured_horizon_not_the_next_day(monkeypatch, client):
+    """
+    Regression test: the model forecasts settings.target_horizon_days
+    ahead, not the next single trading day -- grading it against tomorrow's
+    price checks a question it was never asked and reads as near-noise
+    (this is exactly how a genuinely profitable live book still showed a
+    live "hit rate" worse than a coin flip). Day+1 here is a miss and
+    day+2 is a hit; with target_horizon_days=2 the reported hit rate must
+    reflect day+2.
+    """
+    monkeypatch.setattr(server.settings, "target_horizon_days", 2)
+    decisions = pd.DataFrame(
+        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "mode": ["paper"]}
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL", "AAPL"],
+            "ts": pd.to_datetime(["2026-07-27T00:00:00Z", "2026-07-28T00:00:00Z", "2026-07-29T00:00:00Z"]),
+            "close": [100.0, 90.0, 110.0],  # day+1: down (would-be miss) -- day+2: up (the real, correctly-graded hit)
+        }
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    body = client.get("/api/analysis/live_accuracy").json()
+    assert body["n_matured"] == 1
+    assert body["hit_rate"] == pytest.approx(1.0)
 
 
 def test_drift_no_decisions_returns_unavailable(monkeypatch, client):
@@ -329,6 +365,7 @@ def test_drift_no_matured_decisions_says_so(monkeypatch, client):
 
 def test_drift_flags_when_recent_weeks_undercut_the_walkforward_baseline(monkeypatch, client):
     """3 straight weeks of real misses against a strong baseline should flag."""
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)  # matches the 1-day-apart price series below
     phase2 = json.dumps([{"phase": 2, "title": "x", "summary": "x", "lines": [], "top_features": [{"feature_name": "mom_ret_5d", "value": 0.1, "contribution": 0.01}]}])
     weeks = [pd.Timestamp("2026-08-03"), pd.Timestamp("2026-08-10"), pd.Timestamp("2026-08-17")]
     rows, price_rows = [], []
@@ -361,6 +398,7 @@ def test_drift_flags_when_recent_weeks_undercut_the_walkforward_baseline(monkeyp
 
 
 def test_drift_baseline_unavailable_when_mlflow_is_down(monkeypatch, client):
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)  # matches the 1-day-apart price series below
     decisions = pd.DataFrame(
         {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "reasoning": [None]}
     )
@@ -380,6 +418,37 @@ def test_drift_baseline_unavailable_when_mlflow_is_down(monkeypatch, client):
     assert body["available"] is True  # live data is still shown even without a baseline to compare against
     assert body["baseline_accuracy"] is None
     assert body["accuracy_flag"]["flagged"] is False
+
+
+def test_drift_grades_at_the_configured_horizon_not_the_next_day(monkeypatch, client):
+    """
+    Same regression as live_accuracy's: weekly_hit_rate and feature_drag
+    both run on compute_forecast_accuracy's output, so a wrong horizon
+    here corrupts every drift signal downstream, not just one number.
+    """
+    monkeypatch.setattr(server.settings, "target_horizon_days", 2)
+    decisions = pd.DataFrame(
+        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "reasoning": [None]}
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL", "AAPL"],
+            "ts": pd.to_datetime(["2026-07-27T00:00:00Z", "2026-07-28T00:00:00Z", "2026-07-29T00:00:00Z"]),
+            "close": [100.0, 90.0, 110.0],  # day+1: down (would-be miss) -- day+2: up (the real, correctly-graded hit)
+        }
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    def _boom(tracking_uri):
+        raise RuntimeError("no mlflow in this test — not what's under test here")
+
+    monkeypatch.setattr(server.report_card, "fetch_fold_runs", _boom)
+
+    body = client.get("/api/analysis/drift").json()
+    assert body["available"] is True
+    assert body["weekly"][0]["hit_rate"] == pytest.approx(1.0)
 
 
 def test_closed_trades_reconstructs_a_round_trip(monkeypatch, client):
