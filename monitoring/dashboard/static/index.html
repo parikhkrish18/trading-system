@@ -163,6 +163,151 @@
     <div id="tab-ticker" class="tab-panel" hidden>
       <section id="ticker-lookup-section">
         <h2>Ticker Lookup <span class="muted">(everything collected for one symbol this cycle)</span></h2>
+        <div class="glossary-toggle" id="glossary-toggle">▸ What do these terms mean? (feature glossary)</div>
+        <div class="glossary-body" id="glossary-body">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Term</th><th>How it is calculated</th><th>What the value means for the stock</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><code>mom_ret_5d</code> — 5-day momentum return</td>
+                  <td>(Price today / Price 5 trading days ago) − 1</td>
+                  <td><strong>Positive:</strong> stock has risen over the last week. <strong>Negative:</strong> stock has fallen. Larger absolute values mean stronger recent price movement.</td>
+                </tr>
+                <tr>
+                  <td><code>mom_ret_20d</code> — 20-day momentum return</td>
+                  <td>(Price today / Price 20 trading days ago) − 1</td>
+                  <td>Same idea over roughly one month. Comparing it with <code>mom_ret_5d</code> shows whether short-term momentum agrees with or is reversing the broader recent trend.</td>
+                </tr>
+                <tr>
+                  <td><code>adx_14</code> — 14-day Average Directional Index</td>
+                  <td>Calculated from 14-day smoothed positive and negative directional movement (+DI and −DI), then ADX = smoothed average of 100 × abs(+DI − −DI) / (+DI + −DI)</td>
+                  <td>Measures <strong>trend strength, not direction</strong>. Roughly: <strong>&lt;20 = weak/choppy</strong>, <strong>20–25 = developing trend</strong>, <strong>&gt;25 = meaningful trend</strong>, <strong>&gt;40 = strong trend</strong>. It does not say whether the trend is bullish or bearish.</td>
+                </tr>
+                <tr>
+                  <td><code>vol_realized_20d</code> — 20-day realized volatility</td>
+                  <td>Standard deviation of the last 20 daily returns, annualized: std(daily returns) × √252</td>
+                  <td>How violently the stock has actually been moving. <strong>Higher = larger/more unpredictable daily swings. Lower = calmer price behavior.</strong> Does not indicate direction.</td>
+                </tr>
+                <tr>
+                  <td><code>vol_atr_14</code> — 14-day Average True Range</td>
+                  <td>Daily True Range = max(High−Low, abs(High−PrevClose), abs(Low−PrevClose)), then its 14-day Wilder average</td>
+                  <td>Typical daily movement in <strong>dollars</strong>. ATR of $5 means a normal day's total movement is around $5. Useful for stops and position sizing, not bullish/bearish direction.</td>
+                </tr>
+                <tr>
+                  <td><code>vol_of_vol</code> — volatility regime ratio</td>
+                  <td>Recent 10-day realized volatility / 60-day realized volatility</td>
+                  <td><strong>&gt;1:</strong> stock has recently become more volatile than normal. <strong>&lt;1:</strong> it has become calmer. <strong>≈1:</strong> recent volatility is similar to its longer-term norm.</td>
+                </tr>
+                <tr>
+                  <td><code>meanrev_zscore_20d</code> — 20-day price z-score</td>
+                  <td>(Current price − 20-day mean price) / 20-day standard deviation of price</td>
+                  <td>Measures how unusually far price is from its recent average. <strong>+2:</strong> roughly 2 standard deviations above normal. <strong>−2:</strong> roughly 2 below. Large magnitudes indicate a stretched price, though they can also signal a genuine breakout.</td>
+                </tr>
+                <tr>
+                  <td><code>meanrev_bollinger_pctb</code> — Bollinger %B</td>
+                  <td>Upper band = 20-day MA + 2σ; lower = 20-day MA − 2σ; %B = (Price − Lower) / (Upper − Lower)</td>
+                  <td><strong>1 = upper Bollinger Band</strong>, <strong>0.5 = 20-day average</strong>, <strong>0 = lower band</strong>. <strong>&gt;1</strong> means price broke above the normal band; <strong>&lt;0</strong> means it broke below it.</td>
+                </tr>
+                <tr>
+                  <td><code>meanrev_rsi_14</code> — 14-day RSI</td>
+                  <td>14-period average gains and losses; RS = Avg Gain / Avg Loss; RSI = 100 − 100/(1+RS)</td>
+                  <td>Measures recent buying vs. selling momentum on a <strong>0–100 scale</strong>. Roughly <strong>&gt;70 = overbought/strong upward momentum</strong>, <strong>&lt;30 = oversold/strong downward momentum</strong>, <strong>~50 = balanced</strong>.</td>
+                </tr>
+                <tr>
+                  <td><code>Regime</code> — market trend/chop regime</td>
+                  <td>Calculate ADX-14 for SPY. If ADX ≥ 25, label market Trending; otherwise label Choppy.</td>
+                  <td>Gives every stock market context. <strong>Trending:</strong> momentum-type signals may be more reliable. <strong>Choppy:</strong> breakouts may fail more often and mean-reversion behavior may matter more.</td>
+                </tr>
+                <tr>
+                  <td><code>sentiment_mean_3d</code> — 3-day company-news sentiment</td>
+                  <td>Score each relevant company headline/article from −1 to +1, then average scores from the last 3 days</td>
+                  <td><strong>Positive:</strong> recent news backdrop is favorable. <strong>Negative:</strong> recent news is unfavorable. Near zero means neutral/mixed news.</td>
+                </tr>
+                <tr>
+                  <td><code>sentiment_mean_10d</code> — 10-day company-news sentiment</td>
+                  <td>Average the stock's news sentiment scores from the last 10 days</td>
+                  <td>Gives a slower-moving news baseline. Useful for distinguishing a one-day news shock from a sustained positive or negative narrative.</td>
+                </tr>
+                <tr>
+                  <td><code>sentiment_momentum_3v10</code> — sentiment momentum</td>
+                  <td>sentiment_mean_3d − sentiment_mean_10d</td>
+                  <td><strong>Positive:</strong> news has recently become more bullish than its prior baseline. <strong>Negative:</strong> news is deteriorating. Near zero means sentiment hasn't materially changed.</td>
+                </tr>
+                <tr>
+                  <td><code>news_volume_3d</code> — 3-day news volume</td>
+                  <td>Count of relevant company-news events/articles during the previous 3 days</td>
+                  <td>Measures how much information is arriving. <strong>High volume:</strong> something significant may be happening and the sentiment estimate has more observations. <strong>Low volume:</strong> sentiment may depend on only one or two stories.</td>
+                </tr>
+                <tr>
+                  <td><code>macro_mkt_sentiment</code> — broad-market news sentiment</td>
+                  <td>Recency-weighted aggregation of sentiment from broad-market news tied to instruments such as SPY, QQQ, Dow and Russell 2000</td>
+                  <td><strong>Positive:</strong> broad news environment is supportive/risk-on. <strong>Negative:</strong> market backdrop is bearish/risk-off. Provides context for company-specific news.</td>
+                </tr>
+                <tr>
+                  <td><code>macro_sector_sentiment</code> — sector news sentiment</td>
+                  <td>Recency-weighted aggregation of sentiment for the stock's sector, e.g. XLK/technology for a technology company</td>
+                  <td>Shows whether the company's sector has a favorable or unfavorable news backdrop. Helps separate company-specific strength from sector-wide strength.</td>
+                </tr>
+                <tr>
+                  <td><code>macro_mkt_x_own_sentiment</code> — market × stock sentiment interaction</td>
+                  <td>macro_mkt_sentiment × stock's own sentiment</td>
+                  <td><strong>Large positive:</strong> stock news and market backdrop reinforce one another. <strong>Negative:</strong> stock-specific news and market sentiment disagree. Near zero means one or both signals are neutral.</td>
+                </tr>
+                <tr>
+                  <td><code>macro_sector_x_own_sentiment</code> — sector × stock sentiment interaction</td>
+                  <td>macro_sector_sentiment × stock's own sentiment</td>
+                  <td><strong>Large positive:</strong> company and sector news point the same way. <strong>Negative:</strong> company is bucking its sector's sentiment. Useful for detecting confirmation vs. divergence.</td>
+                </tr>
+                <tr>
+                  <td><code>days_to_next_fomc</code> — days until FOMC</td>
+                  <td>Calendar difference between today and the next scheduled Federal Reserve interest-rate decision</td>
+                  <td><strong>Small number:</strong> major macro event risk is close, so volatility and uncertainty may rise. <strong>Large number:</strong> less immediate FOMC-related event risk.</td>
+                </tr>
+                <tr>
+                  <td><code>days_to_next_cpi</code> — days until CPI</td>
+                  <td>Calendar days until the next scheduled U.S. CPI inflation release</td>
+                  <td><strong>Small number:</strong> inflation-driven market risk is imminent. Especially relevant to rate-sensitive/growth stocks.</td>
+                </tr>
+                <tr>
+                  <td><code>days_to_next_jobs</code> — days until jobs report</td>
+                  <td>Calendar days until the next major U.S. employment report, typically Nonfarm Payrolls</td>
+                  <td><strong>Small number:</strong> employment/rate-expectation volatility is near. <strong>Large number:</strong> jobs-event risk is farther away.</td>
+                </tr>
+                <tr>
+                  <td><code>fund_eps_actual_latest</code> — latest diluted EPS</td>
+                  <td>Most recently publicly reported diluted EPS available as of the observation date</td>
+                  <td>Profit attributable to each diluted share. Higher/positive EPS generally means stronger profitability, but the <strong>change and surprise versus expectations</strong> often matter more than the raw value.</td>
+                </tr>
+                <tr>
+                  <td><code>fund_revenue_actual_latest</code> — latest quarterly revenue</td>
+                  <td>Most recent publicly filed quarterly total revenue</td>
+                  <td>How much the company sold during its latest reported quarter. Higher revenue isn't automatically bullish; <strong>revenue growth and performance versus expectations</strong> matter more.</td>
+                </tr>
+                <tr>
+                  <td><code>fund_net_income_latest</code> — latest quarterly net income</td>
+                  <td>Most recent publicly reported quarterly revenue minus all expenses, interest, taxes, etc.</td>
+                  <td>The company's bottom-line profit. <strong>Positive/rising:</strong> generally healthier profitability. <strong>Negative/falling:</strong> losses or deteriorating profitability, though context matters.</td>
+                </tr>
+                <tr>
+                  <td><code>fund_gross_profit_latest</code> — latest gross profit</td>
+                  <td>Revenue − Cost of Goods Sold (COGS), using the latest reported quarter</td>
+                  <td>Money remaining after the direct cost of producing what the company sells. Rising gross profit can indicate growth, pricing power, or better economics; falling gross profit can signal pressure.</td>
+                </tr>
+                <tr>
+                  <td><code>fund_total_assets_latest</code> — latest total assets</td>
+                  <td>Most recent reported balance-sheet total of cash, investments, receivables, inventory, property, intangibles, etc.</td>
+                  <td>Shows the size of the company's economic resource base. More assets are <strong>not automatically bullish</strong>; their quality and the returns generated from them matter.</td>
+                </tr>
+                <tr>
+                  <td><code>fund_total_liabilities_latest</code> — latest total liabilities</td>
+                  <td>Most recent reported balance-sheet total of debts and other obligations</td>
+                  <td>Shows how much the company owes. High/rising liabilities can mean greater financial risk, but should be compared with assets, cash flow, earnings and the nature of those liabilities.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
         <div class="filter-row">
           <input id="ticker-lookup-symbol" placeholder="Symbol (e.g. AAPL)" />
           <button id="ticker-lookup-btn" class="btn btn-secondary">Look up</button>

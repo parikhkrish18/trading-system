@@ -1103,6 +1103,15 @@ document.getElementById("ticker-lookup-symbol").addEventListener("keydown", (e) 
   if (e.key === "Enter") document.getElementById("ticker-lookup-btn").click();
 });
 
+// Static reference content (not fetched -- it doesn't change per lookup),
+// collapsed by default so it stays out of the way until someone wants it.
+document.getElementById("glossary-toggle").addEventListener("click", () => {
+  const body = document.getElementById("glossary-body");
+  const el = document.getElementById("glossary-toggle");
+  body.classList.toggle("open");
+  el.textContent = (body.classList.contains("open") ? "▾ " : "▸ ") + "What do these terms mean? (feature glossary)";
+});
+
 // ---------- Clients ----------
 async function loadClientTradingBadge() {
   try {
