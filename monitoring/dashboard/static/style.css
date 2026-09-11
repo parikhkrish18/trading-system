@@ -177,6 +177,7 @@ h3 { font-size: 13px; color: var(--text-muted); margin: 0 0 8px; font-weight: 60
 .position-grid-stats .label { color: var(--text-muted); font-size: 11px; }
 .pl-pos { color: var(--green); font-weight: 600; }
 .pl-neg { color: var(--red); font-weight: 600; }
+.pl-neutral { color: var(--accent); font-weight: 600; }
 
 .reasoning-toggle {
   font-size: 12px;
@@ -216,6 +217,27 @@ h3 { font-size: 13px; color: var(--text-muted); margin: 0 0 8px; font-weight: 60
 .feature-group { margin-bottom: 16px; }
 .feature-group h4 { font-size: 12px; font-weight: 600; color: var(--text-muted); margin: 0 0 6px; }
 .feature-group .position-grid-stats { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); margin-bottom: 0; }
+
+/* Ticker Lookup's feature glossary: collapsed by default, minimal footprint
+   until opened -- same interaction as .reasoning-toggle/.reasoning-body,
+   just not tied to per-decision data so it gets its own pair of classes. */
+.glossary-toggle {
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 12px;
+  display: inline-block;
+}
+.glossary-body { display: none; margin-bottom: 16px; }
+.glossary-body.open { display: block; }
+.glossary-body table th,
+.glossary-body table td { white-space: normal; vertical-align: top; line-height: 1.5; }
+.glossary-body table th:first-child,
+.glossary-body table td:first-child { width: 20%; }
+.glossary-body table th:nth-child(2),
+.glossary-body table td:nth-child(2) { width: 32%; }
+.glossary-body table code { font-size: 12px; }
 
 .chart-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
 .chart-box {
