@@ -905,6 +905,204 @@ function currentNewsFilter() {
   return document.getElementById("news-symbol-filter").value.trim();
 }
 
+// ---------- Ticker Lookup tab ----------
+// Turns the raw feature_name column names from the `features` table (see
+// features/build_features.py's QUANT_FEATURES registry and the qualitative/
+// macro/event-risk builders it also feeds) into the same plain-English
+// labels/grouping a reader would want, rather than showing DB column names
+// verbatim. fund_*_latest entries are deliberately left out here -- they're
+// the same numbers the Fundamentals table below already shows, just
+// re-expressed as of a price date for model training.
+const FEATURE_INFO = {
+  mom_ret_5d: { label: "5-day return", group: "Price & Trend", fmt: (v) => fmt.pct(v, 2) },
+  mom_ret_20d: { label: "20-day return", group: "Price & Trend", fmt: (v) => fmt.pct(v, 2) },
+  adx_14: { label: "Trend strength (ADX-14)", group: "Price & Trend", fmt: (v) => fmt.num(v, 1) },
+  vol_realized_20d: { label: "Realized volatility (20d, annualized)", group: "Volatility", fmt: (v) => fmt.pct(v, 1) },
+  vol_atr_14: { label: "Average daily range (ATR-14)", group: "Volatility", fmt: (v) => fmt.money(v) },
+  vol_of_vol: { label: "Vol-of-vol (10d ÷ 60d)", group: "Volatility", fmt: (v) => fmt.num(v, 2) },
+  meanrev_zscore_20d: { label: "Price z-score (20d)", group: "Mean Reversion", fmt: (v) => fmt.num(v, 2) },
+  meanrev_bollinger_pctb: { label: "Bollinger %b", group: "Mean Reversion", fmt: (v) => fmt.num(v, 2) },
+  meanrev_rsi_14: { label: "RSI (14d)", group: "Mean Reversion", fmt: (v) => fmt.num(v, 1) },
+  sentiment_mean_3d: { label: "News sentiment (3d avg)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2) },
+  sentiment_mean_10d: { label: "News sentiment (10d avg)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2) },
+  sentiment_momentum_3v10: { label: "Sentiment momentum (3d vs 10d)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2) },
+  news_volume_3d: { label: "News volume (3d count)", group: "News Sentiment", fmt: (v) => fmt.num(v, 0) },
+  macro_mkt_sentiment: { label: "Market-wide sentiment", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2) },
+  macro_sector_sentiment: { label: "Sector sentiment", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2) },
+  macro_mkt_x_own_sentiment: { label: "Market × own sentiment (alignment)", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2) },
+  macro_sector_x_own_sentiment: { label: "Sector × own sentiment (alignment)", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2) },
+  days_to_next_fomc: { label: "Days to next Fed decision", group: "Event Risk", fmt: (v) => fmt.num(v, 0) },
+  days_to_next_cpi: { label: "Days to next inflation report", group: "Event Risk", fmt: (v) => fmt.num(v, 0) },
+  days_to_next_jobs: { label: "Days to next jobs report", group: "Event Risk", fmt: (v) => fmt.num(v, 0) },
+};
+const FEATURE_GROUP_ORDER = ["Price & Trend", "Volatility", "Mean Reversion", "News Sentiment", "Macro & Sector", "Event Risk", "Other"];
+
+function featureGroupsHTML(features) {
+  const byGroup = {};
+  for (const f of features || []) {
+    if (f.feature_name.startsWith("fund_")) continue; // shown in the Fundamentals table instead
+    const info = FEATURE_INFO[f.feature_name] || { label: f.feature_name, group: "Other", fmt: (v) => fmt.num(v, 4) };
+    (byGroup[info.group] ??= []).push({ label: info.label, value: info.fmt(f.value) });
+  }
+  const groups = FEATURE_GROUP_ORDER.filter((g) => byGroup[g] && byGroup[g].length);
+  if (groups.length === 0) {
+    return '<div class="empty-state">No market/model features collected for this symbol yet.</div>';
+  }
+  return groups
+    .map(
+      (g) => `
+      <div class="feature-group">
+        <h4>${escapeHTML(g)}</h4>
+        <div class="position-grid-stats">
+          ${byGroup[g].map((f) => `<div><div class="label">${escapeHTML(f.label)}</div>${f.value}</div>`).join("")}
+        </div>
+      </div>`
+    )
+    .join("");
+}
+
+function fundamentalsTableHTML(fundamentals) {
+  if (!fundamentals || fundamentals.length === 0) {
+    return '<div class="empty-state">No fundamentals collected for this symbol yet.</div>';
+  }
+  const rows = fundamentals
+    .map((f) => `<tr><td>${escapeHTML(f.metric)}</td><td>${fmt.num(f.value, 2)}</td><td>${fmt.time(f.ts)}</td></tr>`)
+    .join("");
+  return `
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Metric</th><th>Latest value</th><th>Filed</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+function tickerPriceSummaryHTML(latestPrice) {
+  if (!latestPrice) {
+    return '<div class="empty-state">No price data collected for this symbol yet.</div>';
+  }
+  return `
+    <div class="summary-row">
+      <div><div class="label">Close</div>${fmt.money(latestPrice.close)}</div>
+      <div><div class="label">Open</div>${fmt.money(latestPrice.open)}</div>
+      <div><div class="label">High</div>${fmt.money(latestPrice.high)}</div>
+      <div><div class="label">Low</div>${fmt.money(latestPrice.low)}</div>
+      <div><div class="label">Volume</div>${fmt.num(latestPrice.volume, 0)}</div>
+      <div><div class="label">As of</div>${fmt.time(latestPrice.ts)}</div>
+    </div>`;
+}
+
+// Reuses reasoningPhasesHTML (see the Positions section above) so a
+// decision's reasoning reads identically here as it does on a held
+// position's card -- same phase cards, same legacy-format fallback.
+function tickerDecisionsHTML(decisions, tickerKey) {
+  if (!decisions || decisions.length === 0) {
+    return '<div class="empty-state">No model decisions logged for this symbol yet.</div>';
+  }
+  return decisions
+    .map((d, idx) => {
+      const target = Number(d.target_position);
+      const direction = !target ? "Flat" : target > 0 ? "Long" : "Short";
+      const statusBits = [d.mode, d.approval_status, d.executed_position ? "order placed" : "not placed"]
+        .filter(Boolean)
+        .join(" · ");
+      const toggleId = `${tickerKey}-${idx}`;
+      return `
+        <div class="phase-card">
+          <div class="position-grid-stats">
+            <div><div class="label">Decided</div>${fmt.time(d.ts)}</div>
+            <div><div class="label">Direction</div>${direction}</div>
+            <div><div class="label">Forecast</div>${fmt.pct(d.forecast, 2)}</div>
+            <div><div class="label">Ensemble agreement</div>${fmt.pct(d.direction_agreement, 0)}</div>
+            <div><div class="label">Target size</div>${fmt.pct(Math.abs(target || 0), 1)}</div>
+            <div><div class="label">Regime</div>${d.regime || "—"}</div>
+          </div>
+          <div class="muted" style="font-size:11px;margin:4px 0;">
+            ${escapeHTML(statusBits)} · feature set ${escapeHTML(d.feature_set_id || "—")} · model ${escapeHTML(d.model_version || "—")}
+          </div>
+          <div class="reasoning-toggle" data-ticker-idx="${toggleId}">▸ Why — model reasoning</div>
+          <div class="reasoning-body" id="ticker-reasoning-${toggleId}">${reasoningPhasesHTML(d.reasoning)}</div>
+        </div>`;
+    })
+    .join("");
+}
+
+function wireTickerToggles(container) {
+  container.querySelectorAll(".reasoning-toggle[data-ticker-idx]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const body = document.getElementById(`ticker-reasoning-${el.dataset.tickerIdx}`);
+      body.classList.toggle("open");
+      el.textContent = (body.classList.contains("open") ? "▾ " : "▸ ") + "Why — model reasoning";
+    });
+  });
+}
+
+function tickerLookupResultHTML(data) {
+  const nothing =
+    !data.latest_price &&
+    (!data.features || data.features.length === 0) &&
+    (!data.fundamentals || data.fundamentals.length === 0) &&
+    (!data.news || data.news.length === 0) &&
+    (!data.decisions || data.decisions.length === 0);
+  if (nothing) {
+    return `<div class="empty-state">No data collected for ${escapeHTML(data.symbol)} yet — check the symbol, or it may not be in the tracked universe.</div>`;
+  }
+  return `
+    <section>
+      <h3>${escapeHTML(data.symbol)} — latest price</h3>
+      ${tickerPriceSummaryHTML(data.latest_price)}
+    </section>
+    <section>
+      <h3>Market &amp; model features
+        <span class="muted">${data.feature_set_id ? `(feature set ${escapeHTML(data.feature_set_id)})` : ""}</span>
+      </h3>
+      ${featureGroupsHTML(data.features)}
+    </section>
+    <section>
+      <h3>Fundamentals</h3>
+      ${fundamentalsTableHTML(data.fundamentals)}
+    </section>
+    <section>
+      <h3>Recent news <span class="muted">(${(data.news || []).length})</span></h3>
+      <div class="news-feed-list">${newsFeedHTML(data.news)}</div>
+    </section>
+    <section>
+      <h3>Model decisions &amp; reasoning <span class="muted">(most recent ${(data.decisions || []).length})</span></h3>
+      ${tickerDecisionsHTML(data.decisions, data.symbol)}
+    </section>`;
+}
+
+async function loadTickerLookup(symbolRaw) {
+  const symbol = (symbolRaw || "").trim().toUpperCase();
+  const box = document.getElementById("ticker-lookup-result");
+  if (!symbol) {
+    box.innerHTML =
+      '<div class="empty-state">Enter a symbol above to see its latest price, market/quant features, fundamentals, news and model decisions.</div>';
+    return;
+  }
+  box.innerHTML = '<div class="empty-state">Loading…</div>';
+  const res = await fetch(`/api/ticker/${encodeURIComponent(symbol)}`);
+  if (res.status === 401) {
+    window.location.href = "/login";
+    return;
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    box.innerHTML = `<div class="empty-state">Could not look up ${escapeHTML(symbol)} — ${escapeHTML(body.detail || String(res.status))}</div>`;
+    return;
+  }
+  const data = await res.json();
+  box.innerHTML = tickerLookupResultHTML(data);
+  wireTickerToggles(box);
+}
+
+document.getElementById("ticker-lookup-btn").addEventListener("click", () => {
+  loadTickerLookup(document.getElementById("ticker-lookup-symbol").value);
+});
+document.getElementById("ticker-lookup-symbol").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("ticker-lookup-btn").click();
+});
+
 // ---------- Clients ----------
 async function loadClientTradingBadge() {
   try {

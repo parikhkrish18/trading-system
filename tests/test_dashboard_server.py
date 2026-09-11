@@ -622,6 +622,124 @@ def test_positions_news_hides_headlines_a_vendor_mistagged(monkeypatch, client):
     assert body["AAPL"][0]["headline"] == "AAPL beats earnings"
 
 
+def test_ticker_lookup_assembles_every_section(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    latest_price = pd.DataFrame(
+        [{"ts": pd.Timestamp("2026-09-10T00:00:00Z"), "open": 99.0, "high": 101.0, "low": 98.5, "close": 100.0, "volume": 5_000_000, "source": "yfinance"}]
+    )
+    feature_set_row = pd.DataFrame([{"feature_set_id": "v4", "ts": pd.Timestamp("2026-09-10T00:00:00Z")}])
+    raw_features = pd.DataFrame(
+        [
+            {"feature_name": "mom_ret_5d", "value": 0.03},
+            {"feature_name": "meanrev_rsi_14", "value": 62.0},
+            {"feature_name": "fund_eps_actual_latest", "value": 1.5},  # excluded from featureGroupsHTML, kept here
+        ]
+    )
+    fundamentals = pd.DataFrame(
+        [
+            {"ts": pd.Timestamp("2026-08-01T00:00:00Z"), "metric": "eps_actual", "value": 1.2},
+            {"ts": pd.Timestamp("2026-05-01T00:00:00Z"), "metric": "eps_actual", "value": 1.1},  # older -- dropped
+        ]
+    )
+    news = pd.DataFrame(
+        [{"ts": pd.Timestamp("2026-09-09T00:00:00Z"), "headline": "AAPL beats earnings", "summary": "", "source": "finnhub", "sentiment": 0.6, "sentiment_reason": "beat estimates", "sentiment_relevant": True}]
+    )
+    decisions = pd.DataFrame(
+        [
+            {
+                "ts": pd.Timestamp("2026-09-08T00:00:00Z"), "feature_set_id": "v4", "model_version": "lgbm-1",
+                "forecast": 0.04, "regime": "trend", "target_position": 0.3, "executed_position": 0.3,
+                "mode": "paper", "reasoning": json.dumps([{"phase": 2, "title": "x", "summary": "y", "lines": []}]),
+                "approval_status": "auto", "direction_agreement": 0.8,
+            }
+        ]
+    )
+    calls = iter([latest_price, feature_set_row, raw_features, fundamentals, news, decisions])
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/ticker/AAPL")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["symbol"] == "AAPL"
+    assert body["latest_price"]["close"] == 100.0
+    assert body["feature_set_id"] == "v4"
+    assert {f["feature_name"] for f in body["features"]} == {"mom_ret_5d", "meanrev_rsi_14", "fund_eps_actual_latest"}
+    # Only the latest-filed value per metric survives.
+    assert len(body["fundamentals"]) == 1
+    assert body["fundamentals"][0]["value"] == 1.2
+    assert body["news"][0]["headline"] == "AAPL beats earnings"
+    assert body["decisions"][0]["forecast"] == 0.04
+    assert body["decisions"][0]["reasoning"][0]["title"] == "x"  # decoded from the JSONB string
+
+
+def test_ticker_lookup_lowercases_symbol_is_normalized_to_upper(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    empty = pd.DataFrame()
+    calls = iter([empty, empty, empty, empty, empty])
+    captured_symbols = []
+
+    def fake_read_sql(query, engine, params=None):
+        captured_symbols.append(str(query))
+        return next(calls)
+
+    monkeypatch.setattr(server.pd, "read_sql", fake_read_sql)
+
+    resp = client.get("/api/ticker/aapl")
+    assert resp.status_code == 200
+    assert resp.json()["symbol"] == "AAPL"
+    assert any("'AAPL'" in q for q in captured_symbols)
+
+
+def test_ticker_lookup_rejects_a_symbol_that_does_not_look_like_a_ticker(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+
+    resp = client.get("/api/ticker/123-not-a-ticker")
+
+    assert resp.status_code == 400
+
+
+def test_ticker_lookup_with_nothing_in_the_db_returns_empty_shape_not_an_error(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    empty = pd.DataFrame()
+    # No feature_set_row -> raw_features is never queried, so only 5 calls.
+    calls = iter([empty, empty, empty, empty, empty])
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/ticker/ZZZZ")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "symbol": "ZZZZ",
+        "latest_price": None,
+        "feature_set_id": None,
+        "features": [],
+        "fundamentals": [],
+        "news": [],
+        "decisions": [],
+    }
+
+
+def test_ticker_lookup_hides_news_a_vendor_mistagged(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    empty = pd.DataFrame()
+    news = pd.DataFrame(
+        [
+            {"ts": pd.Timestamp("2026-09-09T00:00:00Z"), "headline": "real AAPL story", "summary": "", "source": "finnhub", "sentiment": 0.5, "sentiment_reason": "r", "sentiment_relevant": True},
+            {"ts": pd.Timestamp("2026-09-08T00:00:00Z"), "headline": "mistagged story", "summary": "", "source": "finnhub", "sentiment": -0.5, "sentiment_reason": "r2", "sentiment_relevant": False},
+        ]
+    )
+    # Call order: latest_price, feature_set_row (empty -> raw_features skipped),
+    # fundamentals_raw, news, decisions.
+    calls = iter([empty, empty, empty, news, empty])
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/ticker/AAPL")
+    body = resp.json()
+    assert len(body["news"]) == 1
+    assert body["news"][0]["headline"] == "real AAPL story"
+
+
 def test_regime_history_returns_empty_with_insufficient_data(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(columns=["ts", "high", "low", "close"]))
