@@ -5,13 +5,14 @@ the macro calendar, rebuild features, then run one screen-and-trade cycle.
 
 Each step is isolated via run_job (same pattern as
 scripts/run_daily_ingest.py) so one failing data source doesn't take down
-the week's trading cycle — e.g. if Polygon is down for news, prices and
+the week's trading cycle — e.g. if Finnhub is down for news, prices and
 fundamentals still refresh and the cycle still runs on what it has.
 
-Honest cost note: fundamentals + news ingestion for the full ~500-symbol
-universe is paced against Polygon's free-tier rate limit (see
-data/ingest/http.py) — that's roughly two hours for those two steps alone
-on this tier, not a bug, just what the vendor limit costs.
+Honest cost note: fundamentals ingestion for the full ~500-symbol universe
+is paced against Polygon's free-tier rate limit (see data/ingest/http.py)
+— that alone is roughly an hour on this tier, not a bug, just what the
+vendor limit costs. News (data/ingest/finnhub.py) is paced against
+Finnhub's much lighter limit and finishes far faster.
 
 Usage:
     python -m scripts.run_weekly_cycle --feature-set-id v4
@@ -27,9 +28,9 @@ import pandas as pd
 
 from config.settings import settings
 from data.ingest.db import get_engine
+from data.ingest.finnhub import ingest_finnhub
 from data.ingest.fundamentals import ingest_fundamentals
 from data.ingest.macro_calendar import refresh_macro_calendar
-from data.ingest.news import ingest_news
 from data.ingest.prices import ingest_prices
 from data.ingest.universe import load_active_universe, refresh_universe
 from data.validators.checks import check_staleness
@@ -177,7 +178,7 @@ def main() -> None:
     # tradeable universe, but features/qualitative/macro_sentiment.py needs
     # their news deliberately pulled, not just incidentally co-tagged onto
     # some other symbol's story.
-    run_job("news_ingest", ingest_news, [*symbols, *MACRO_PROXY_SYMBOLS], args.since_hours)
+    run_job("news_ingest", ingest_finnhub, [*symbols, *MACRO_PROXY_SYMBOLS], args.since_hours)
     run_job("sentiment_backfill", backfill_unscored_news, 5000)
     run_job("macro_calendar_refresh", refresh_macro_calendar)
     run_job("build_features", build_and_store, symbols, args.feature_set_id)
