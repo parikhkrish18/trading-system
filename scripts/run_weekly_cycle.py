@@ -13,6 +13,14 @@ Fundamentals (data/ingest/fundamentals.py) and news/filings
 against Finnhub's rate limit rather than the ~hour-long Polygon free-tier
 pacing fundamentals used to cost.
 
+Deploy this behind monitoring/dashboard/Dockerfile (its own build, or a
+custom start command on a service that shares its build), never a plain
+Railpack Python build: this module imports execution.trading_loop, which
+imports LightGBM, whose compiled wheel dlopen()s libgomp.so.1 at import
+time -- present in the Dockerfile (see its own comment) but absent from a
+bare Railpack Python image. On Railpack this crashes at import, before a
+single log line is written, which reads as an empty, silent "success".
+
 Usage:
     python -m scripts.run_weekly_cycle --feature-set-id v4
     python -m scripts.run_weekly_cycle --feature-set-id v4 --dry-run

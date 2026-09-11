@@ -32,6 +32,10 @@ CLIENT_TRADING_ENABLED is True -- a separate switch from TRADING_MODE, and
 real money regardless of whether the master account above is trading paper
 or live. See execution/client_risk_controls.py and execution/client_fanout.py.
 
+Deploy this behind monitoring/dashboard/Dockerfile, never a plain Railpack
+Python build -- see scripts/run_weekly_cycle.py's docstring for why
+(LightGBM's libgomp.so.1 dependency, only present in that Dockerfile).
+
 Usage:
     python -m execution.contradiction_monitor
 """
