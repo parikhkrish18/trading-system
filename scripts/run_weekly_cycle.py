@@ -8,11 +8,10 @@ scripts/run_daily_ingest.py) so one failing data source doesn't take down
 the week's trading cycle — e.g. if Finnhub is down for news, prices and
 fundamentals still refresh and the cycle still runs on what it has.
 
-Honest cost note: fundamentals ingestion for the full ~500-symbol universe
-is paced against Polygon's free-tier rate limit (see data/ingest/http.py)
-— that alone is roughly an hour on this tier, not a bug, just what the
-vendor limit costs. News (data/ingest/finnhub.py) is paced against
-Finnhub's much lighter limit and finishes far faster.
+Fundamentals (data/ingest/fundamentals.py) and news/filings
+(data/ingest/finnhub.py) both come from Finnhub now, so both are paced
+against Finnhub's rate limit rather than the ~hour-long Polygon free-tier
+pacing fundamentals used to cost.
 
 Usage:
     python -m scripts.run_weekly_cycle --feature-set-id v4

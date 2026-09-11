@@ -1,14 +1,24 @@
 """
-Phase 1 fundamentals puller — Polygon.io.
+Fundamentals puller — Finnhub's financials-as-reported feed.
 
-Pulls quarterly financials via Polygon's vX financials endpoint and reshapes
-into the long-format schema downstream code expects:
+Pulls quarterly/annual financial statements via Finnhub's
+/stock/financials-reported endpoint and reshapes into the long-format
+schema downstream code expects:
 
     symbol | ts | metric | value | source
 
-e.g. one row per (symbol, report_date, "eps_actual"), another for
-(symbol, report_date, "revenue_actual"), etc. This keeps the schema stable
-regardless of which metrics the vendor exposes.
+e.g. one row per (symbol, filed_date, "eps_actual"), another for
+(symbol, filed_date, "revenue_actual"), etc. Same shape this module used
+when it pulled from Polygon, so nothing downstream (features/build_features.py,
+the dashboard's Ticker Lookup) needs to change.
+
+Replaces Polygon's vX/reference/financials as the fundamentals source:
+Polygon's `filing_date` field was missing on most historical reports,
+forcing that data to be dropped wholesale (see the look-ahead-bias comment
+below for why a missing date can't just fall back to the period-end date).
+Finnhub's `filedDate`, coming straight from SEC filing metadata — the same
+feed data/ingest/finnhub.py's SEC-filings ingest already relies on — is
+reliably present.
 
 Usage:
     python -m data.ingest.fundamentals --symbols SPY,QQQ
@@ -22,43 +32,69 @@ import time
 import pandas as pd
 import requests
 
-from config.settings import settings
 from data.ingest.db import upsert_dataframe
-from data.ingest.http import DEFAULT_SLEEP_SECONDS, polygon_configured, polygon_get
+from data.ingest.finnhub import DEFAULT_SLEEP_SECONDS, finnhub_configured, finnhub_get
 from data.ingest.universe import resolve_symbols
 
 logger = logging.getLogger(__name__)
 
-POLYGON_FINANCIALS_URL = "https://api.polygon.io/vX/reference/financials"
+FINNHUB_FINANCIALS_URL = "https://finnhub.io/api/v1/stock/financials-reported"
 
-# Metric -> path within a Polygon financials result's `financials` block.
-_METRIC_PATHS = {
-    "eps_actual": ("income_statement", "diluted_earnings_per_share", "value"),
-    "revenue_actual": ("income_statement", "revenues", "value"),
-    "net_income": ("income_statement", "net_income_loss", "value"),
-    "gross_profit": ("income_statement", "gross_profit", "value"),
-    "total_assets": ("balance_sheet", "assets", "value"),
-    "total_liabilities": ("balance_sheet", "liabilities", "value"),
+# Metric -> XBRL "concept" tags (case-insensitive) that carry it, across the
+# handful of us-gaap taxonomy variants companies actually file under (e.g.
+# revenue-recognition tags changed industry-wide around ASC 606). Matched
+# against every line item Finnhub returns across all statement sections
+# present (income statement, balance sheet, cash flow) rather than one fixed
+# section, since which section a concept lands in isn't perfectly consistent
+# across filers either.
+_METRIC_CONCEPTS: dict[str, set[str]] = {
+    "eps_actual": {"earningspersharediluted"},
+    "revenue_actual": {
+        "revenues",
+        "revenuefromcontractwithcustomerexcludingassessedtax",
+        "revenuefromcontractwithcustomerincludingassessedtax",
+        "salesrevenuenet",
+        "salesrevenuegoodsnet",
+    },
+    "net_income": {"netincomeloss", "profitloss"},
+    "gross_profit": {"grossprofit"},
+    "total_assets": {"assets"},
+    "total_liabilities": {"liabilities"},
 }
+
+
+def _extract_metrics(report: dict) -> dict[str, float]:
+    """
+    Flatten every line item across whichever of report['report']['bs'/'ic'/'cf']
+    are present into {metric: value} for the metrics in _METRIC_CONCEPTS,
+    keeping the first matching line item per metric.
+    """
+    found: dict[str, float] = {}
+    statements = report.get("report") or {}
+    line_items = [item for section in statements.values() if isinstance(section, list) for item in section]
+    for metric, concepts in _METRIC_CONCEPTS.items():
+        for item in line_items:
+            concept = str(item.get("concept") or "").strip().lower()
+            if concept in concepts and item.get("value") is not None:
+                found[metric] = item["value"]
+                break
+    return found
 
 
 def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_SECONDS) -> pd.DataFrame:
     """
-    Pull quarterly financials per symbol from Polygon and reshape into
-    long format. Returns columns: symbol, ts (tz-aware), metric, value, source.
+    Pull as-reported quarterly/annual financials per symbol from Finnhub and
+    reshape into long format. Returns columns: symbol, ts (tz-aware), metric,
+    value, source.
 
-    `sleep_seconds` paces requests between symbols — matters once --universe
-    is scanning hundreds of names against a rate-limited free-tier key; a
-    single-digit --symbols list can pass sleep_seconds=0.
+    `sleep_seconds` paces requests between symbols, same reasoning as
+    data/ingest/finnhub.py's own pacing — matters once --universe is
+    scanning hundreds of names; a single-digit --symbols list can pass
+    sleep_seconds=0.
     """
-    if not polygon_configured():
-        # One line instead of 503 slow ones: without a key every request
-        # 401s, but the pacing sleep between symbols runs anyway, so a
-        # universe pull spends ~109 minutes failing. The model handles
-        # missing fundamentals natively (the columns are simply absent),
-        # so returning empty is the same outcome, reached immediately.
+    if not finnhub_configured():
         logger.warning(
-            "POLYGON_API_KEY is not set — skipping fundamentals for %s symbol(s). "
+            "FINNHUB_API_KEY is not set — skipping fundamentals for %s symbol(s). "
             "Features that depend on fundamentals will be absent, which the model tolerates.",
             len(symbols),
         )
@@ -68,68 +104,45 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
     for i, symbol in enumerate(symbols):
         if i > 0 and sleep_seconds > 0:
             time.sleep(sleep_seconds)
-        params = {
-            "ticker": symbol,
-            "timeframe": "quarterly",
-            "limit": 20,
-            "apiKey": settings.polygon_api_key,
-        }
-        # Same fix as news.py: don't let one symbol's transient network error
-        # (read timeout, DNS blip) discard the whole batch of already-fetched
-        # symbols — skip just this one and keep going.
         try:
-            resp = polygon_get(POLYGON_FINANCIALS_URL, params)
+            resp = finnhub_get(FINNHUB_FINANCIALS_URL, {"symbol": symbol})
         except requests.RequestException:
             logger.warning("Failed to fetch fundamentals for %s — skipping this symbol.", symbol, exc_info=True)
             continue
-        results = resp.json().get("results", [])
+        reports = resp.json().get("data", [])
 
-        for report in results:
-            # Use filing_date (when the report actually became public), not
-            # end_date (the fiscal period's end) — using end_date would let a
-            # model "see" a quarter's numbers as of the quarter's last day,
-            # weeks before they were actually filed. That's look-ahead bias:
-            # it would inflate backtested accuracy in a way that can't repeat
-            # in live trading, since real-time data has no such head start.
+        for report in reports:
+            # filedDate (when the filing actually became public), not
+            # endDate (the fiscal period's end) -- same look-ahead-bias
+            # reasoning this module has always used: using the period end
+            # would let a model "see" a quarter's numbers weeks before they
+            # were filed, which can't repeat in live trading.
             #
-            # No `or report.get("end_date")` fallback: that would leak the
+            # No `or report.get("endDate")` fallback: that would leak the
             # exact look-ahead bias this comment warns about, every time
-            # filing_date happens to be missing/falsy (common for
-            # older/partial Polygon records). A report with no filing_date
-            # is skipped and logged, not silently mis-dated.
-            report_date = report.get("filing_date")
-            if not report_date:
+            # filedDate happens to be missing/falsy.
+            filed_date = report.get("filedDate")
+            if not filed_date:
                 logger.warning(
-                    "Skipping a %s fundamentals report with no filing_date (would otherwise "
-                    "need end_date, which leaks look-ahead bias) — end_date was %r.",
-                    symbol, report.get("end_date"),
+                    "Skipping a %s fundamentals report with no filedDate (would otherwise "
+                    "need endDate, which leaks look-ahead bias) — endDate was %r.",
+                    symbol, report.get("endDate"),
                 )
                 continue
-            financials = report.get("financials", {})
-            for metric, (statement, field, subfield) in _METRIC_PATHS.items():
-                value = financials.get(statement, {}).get(field, {}).get(subfield)
-                if value is None:
-                    continue
+            for metric, value in _extract_metrics(report).items():
                 rows.append(
-                    {
-                        "symbol": symbol,
-                        "ts": report_date,
-                        "metric": metric,
-                        "value": value,
-                        "source": "polygon",
-                    }
+                    {"symbol": symbol, "ts": filed_date, "metric": metric, "value": value, "source": "finnhub"}
                 )
 
     df = pd.DataFrame(rows, columns=["symbol", "ts", "metric", "value", "source"])
     if not df.empty:
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
-        # Polygon can return more than one report with the same filing_date
-        # for the same symbol (e.g. a restated/amended filing) — two rows
-        # with an identical (symbol, ts, metric) key in one batch makes
-        # upsert_dataframe's ON CONFLICT DO UPDATE fail outright (a single
-        # statement can't "affect the same row twice"), the same class of
-        # bug fixed for news.py's shared-story case. Keep the last one
-        # (Polygon returns revisions after the original in practice).
+        # Finnhub can return more than one report resolving to the same
+        # (symbol, filedDate, metric) key (e.g. a restated/amended filing
+        # filed the same day as the original) -- two rows with an identical
+        # key in one batch makes upsert_dataframe's ON CONFLICT DO UPDATE
+        # fail outright. Keep the last one, same convention this module has
+        # always used for same-day revisions.
         df = df.drop_duplicates(subset=["symbol", "ts", "metric"], keep="last")
     return df
 
@@ -145,7 +158,7 @@ def main() -> None:
     parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
     parser.add_argument(
         "--sleep-seconds", type=float, default=DEFAULT_SLEEP_SECONDS,
-        help="Pause between symbols to stay under Polygon's rate limit (set 0 for a short --symbols list).",
+        help="Pause between symbols to stay under Finnhub's rate limit (set 0 for a short --symbols list).",
     )
     args = parser.parse_args()
     symbols = resolve_symbols(args.symbols, args.universe)

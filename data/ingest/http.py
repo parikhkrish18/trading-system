@@ -1,10 +1,9 @@
 """
-Shared HTTP helper for Polygon API calls. fundamentals.py is the only
-Polygon-backed ingestion script left (news ingestion moved to Finnhub, see
-data/ingest/finnhub.py) -- it hits Polygon's free-tier rate limit
-(~5 requests/minute, observed empirically — a plain per-symbol loop over a
-few hundred universe symbols will hit this), so the 429 backoff logic lives
-here.
+Shared HTTP helper for Polygon API calls. Unused now that both fundamentals
+(data/ingest/fundamentals.py) and news/filings (data/ingest/finnhub.py) come
+from Finnhub -- kept in case a future data source needs Polygon again, since
+it still hits Polygon's free-tier rate limit (~5 requests/minute, observed
+empirically) with the same 429 backoff logic.
 """
 from __future__ import annotations
 
