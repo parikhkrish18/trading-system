@@ -125,6 +125,35 @@ def test_fetch_fundamentals_matches_metrics_regardless_of_statement_section(monk
     assert set(df["metric"]) == {"total_assets", "total_liabilities", "net_income"}
 
 
+def test_fetch_fundamentals_coerces_string_values_and_skips_unparseable_ones(monkeypatch):
+    """
+    Regression test, hit live: Finnhub doesn't guarantee `value` is numeric --
+    a string value in even one row poisons the whole DataFrame column's dtype
+    to text, which then fails the entire batch's upsert against the
+    `double precision` fundamentals.value column, not just that one row.
+    """
+    report = {
+        "endDate": "2026-06-30",
+        "filedDate": "2026-06-30",
+        "report": {
+            "ic": [
+                {"concept": "Revenues", "label": "Revenues", "value": "1000000.5"},
+                {"concept": "NetIncomeLoss", "label": "Net income", "value": "N/A"},
+                {"concept": "GrossProfit", "label": "Gross profit", "value": 42.0},
+            ],
+        },
+    }
+    monkeypatch.setattr(fundamentals, "finnhub_get", lambda *a, **k: _FakeResponse({"data": [report]}))
+    monkeypatch.setattr(fundamentals, "finnhub_configured", lambda: True)
+
+    df = fundamentals.fetch_fundamentals(["SPY"])
+
+    assert set(df["metric"]) == {"revenue_actual", "gross_profit"}  # net_income skipped, not crashed
+    revenue_row = df.loc[df["metric"] == "revenue_actual"].iloc[0]
+    assert revenue_row["value"] == 1000000.5
+    assert isinstance(revenue_row["value"], float)
+
+
 def test_fetch_fundamentals_skips_a_symbol_that_errors_instead_of_losing_the_whole_batch(monkeypatch):
     """
     Regression test: a single transient network error on one symbol must not

@@ -75,9 +75,21 @@ def _extract_metrics(report: dict) -> dict[str, float]:
     for metric, concepts in _METRIC_CONCEPTS.items():
         for item in line_items:
             concept = str(item.get("concept") or "").strip().lower()
-            if concept in concepts and item.get("value") is not None:
-                found[metric] = item["value"]
-                break
+            if concept not in concepts:
+                continue
+            # Finnhub doesn't guarantee `value` is numeric (seen live: a
+            # string). fundamentals.value is a `double precision` column, and
+            # pandas infers a whole column's dtype as text the moment one row
+            # holds a string -- that failed the entire batch's upsert, not
+            # just this one row. Coerce defensively and skip what won't
+            # convert, the same "drop what we can't trust" pattern as a
+            # missing filedDate below.
+            try:
+                value = float(item.get("value"))
+            except (TypeError, ValueError):
+                continue
+            found[metric] = value
+            break
     return found
 
 
