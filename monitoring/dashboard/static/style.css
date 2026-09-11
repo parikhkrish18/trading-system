@@ -177,6 +177,7 @@ h3 { font-size: 13px; color: var(--text-muted); margin: 0 0 8px; font-weight: 60
 .position-grid-stats .label { color: var(--text-muted); font-size: 11px; }
 .pl-pos { color: var(--green); font-weight: 600; }
 .pl-neg { color: var(--red); font-weight: 600; }
+.pl-neutral { color: var(--accent); font-weight: 600; }
 
 .reasoning-toggle {
   font-size: 12px;

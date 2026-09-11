@@ -913,36 +913,79 @@ function currentNewsFilter() {
 // verbatim. fund_*_latest entries are deliberately left out here -- they're
 // the same numbers the Fundamentals table below already shows, just
 // re-expressed as of a price date for model training.
+
+// Each entry's `signal(v)` returns "good" | "bad" | "neutral", matching the
+// ranges spelled out in the glossary's own "what the value means" column --
+// this must stay in sync with that table (index.html's #glossary-body) if
+// either one changes. Three rules, applied consistently everywhere a range
+// has a stated bullish/bearish read:
+//   - A feature the glossary itself says is direction-agnostic (ADX,
+//     realized vol, ATR, vol-of-vol, news volume, revenue/gross profit/
+//     assets/liabilities -- "not automatically bullish") is always neutral,
+//     regardless of its value. Magnitude isn't a green/red signal there.
+//   - The three mean-reversion features (z-score, Bollinger %b, RSI) are
+//     colored from a mean-reversion read: stretched high = caution (bad),
+//     stretched low = opportunity (good), the normal middle = neutral --
+//     matching the glossary's own overbought/oversold framing for RSI, and
+//     extended consistently to the other two "how stretched is price"
+//     features in the same group.
+//   - A days-to-next-event countdown is only ever a risk flag, never a
+//     positive: close = bad (event risk imminent), otherwise neutral.
+const _SENTIMENT_DEADZONE = 0.1; // matches sentimentLabel()'s "Neutral" band on the Live News tab
+const _INTERACTION_DEADZONE = 0.02; // product of two <=1 sentiment scores, so naturally smaller-magnitude
+const _EVENT_SOON_DAYS = 3;
+
+function signBySign(deadzone = 0) {
+  return (v) => (v === null || v === undefined || Number.isNaN(v) ? "neutral" : v > deadzone ? "good" : v < -deadzone ? "bad" : "neutral");
+}
+function alwaysNeutral() {
+  return "neutral";
+}
+function daysToEventSignal(v) {
+  return v !== null && v !== undefined && !Number.isNaN(v) && v <= _EVENT_SOON_DAYS ? "bad" : "neutral";
+}
+function stretchSignal(lowGood, highBad) {
+  // Below lowGood = oversold/undervalued (good), above highBad = overbought/overextended (bad).
+  return (v) => (v === null || v === undefined || Number.isNaN(v) ? "neutral" : v < lowGood ? "good" : v > highBad ? "bad" : "neutral");
+}
+
 const FEATURE_INFO = {
-  mom_ret_5d: { label: "5-day return", group: "Price & Trend", fmt: (v) => fmt.pct(v, 2) },
-  mom_ret_20d: { label: "20-day return", group: "Price & Trend", fmt: (v) => fmt.pct(v, 2) },
-  adx_14: { label: "Trend strength (ADX-14)", group: "Price & Trend", fmt: (v) => fmt.num(v, 1) },
-  vol_realized_20d: { label: "Realized volatility (20d, annualized)", group: "Volatility", fmt: (v) => fmt.pct(v, 1) },
-  vol_atr_14: { label: "Average daily range (ATR-14)", group: "Volatility", fmt: (v) => fmt.money(v) },
-  vol_of_vol: { label: "Vol-of-vol (10d ÷ 60d)", group: "Volatility", fmt: (v) => fmt.num(v, 2) },
-  meanrev_zscore_20d: { label: "Price z-score (20d)", group: "Mean Reversion", fmt: (v) => fmt.num(v, 2) },
-  meanrev_bollinger_pctb: { label: "Bollinger %b", group: "Mean Reversion", fmt: (v) => fmt.num(v, 2) },
-  meanrev_rsi_14: { label: "RSI (14d)", group: "Mean Reversion", fmt: (v) => fmt.num(v, 1) },
-  sentiment_mean_3d: { label: "News sentiment (3d avg)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2) },
-  sentiment_mean_10d: { label: "News sentiment (10d avg)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2) },
-  sentiment_momentum_3v10: { label: "Sentiment momentum (3d vs 10d)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2) },
-  news_volume_3d: { label: "News volume (3d count)", group: "News Sentiment", fmt: (v) => fmt.num(v, 0) },
-  macro_mkt_sentiment: { label: "Market-wide sentiment", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2) },
-  macro_sector_sentiment: { label: "Sector sentiment", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2) },
-  macro_mkt_x_own_sentiment: { label: "Market × own sentiment (alignment)", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2) },
-  macro_sector_x_own_sentiment: { label: "Sector × own sentiment (alignment)", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2) },
-  days_to_next_fomc: { label: "Days to next Fed decision", group: "Event Risk", fmt: (v) => fmt.num(v, 0) },
-  days_to_next_cpi: { label: "Days to next inflation report", group: "Event Risk", fmt: (v) => fmt.num(v, 0) },
-  days_to_next_jobs: { label: "Days to next jobs report", group: "Event Risk", fmt: (v) => fmt.num(v, 0) },
+  mom_ret_5d: { label: "5-day return", group: "Price & Trend", fmt: (v) => fmt.pct(v, 2), signal: signBySign() },
+  mom_ret_20d: { label: "20-day return", group: "Price & Trend", fmt: (v) => fmt.pct(v, 2), signal: signBySign() },
+  adx_14: { label: "Trend strength (ADX-14)", group: "Price & Trend", fmt: (v) => fmt.num(v, 1), signal: alwaysNeutral },
+  vol_realized_20d: { label: "Realized volatility (20d, annualized)", group: "Volatility", fmt: (v) => fmt.pct(v, 1), signal: alwaysNeutral },
+  vol_atr_14: { label: "Average daily range (ATR-14)", group: "Volatility", fmt: (v) => fmt.money(v), signal: alwaysNeutral },
+  vol_of_vol: { label: "Vol-of-vol (10d ÷ 60d)", group: "Volatility", fmt: (v) => fmt.num(v, 2), signal: alwaysNeutral },
+  meanrev_zscore_20d: { label: "Price z-score (20d)", group: "Mean Reversion", fmt: (v) => fmt.num(v, 2), signal: stretchSignal(-2, 2) },
+  meanrev_bollinger_pctb: { label: "Bollinger %b", group: "Mean Reversion", fmt: (v) => fmt.num(v, 2), signal: stretchSignal(0, 1) },
+  meanrev_rsi_14: { label: "RSI (14d)", group: "Mean Reversion", fmt: (v) => fmt.num(v, 1), signal: stretchSignal(30, 70) },
+  sentiment_mean_3d: { label: "News sentiment (3d avg)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2), signal: signBySign(_SENTIMENT_DEADZONE) },
+  sentiment_mean_10d: { label: "News sentiment (10d avg)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2), signal: signBySign(_SENTIMENT_DEADZONE) },
+  sentiment_momentum_3v10: { label: "Sentiment momentum (3d vs 10d)", group: "News Sentiment", fmt: (v) => fmt.num(v, 2), signal: signBySign(_SENTIMENT_DEADZONE) },
+  news_volume_3d: { label: "News volume (3d count)", group: "News Sentiment", fmt: (v) => fmt.num(v, 0), signal: alwaysNeutral },
+  macro_mkt_sentiment: { label: "Market-wide sentiment", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2), signal: signBySign(_SENTIMENT_DEADZONE) },
+  macro_sector_sentiment: { label: "Sector sentiment", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2), signal: signBySign(_SENTIMENT_DEADZONE) },
+  macro_mkt_x_own_sentiment: { label: "Market × own sentiment (alignment)", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2), signal: signBySign(_INTERACTION_DEADZONE) },
+  macro_sector_x_own_sentiment: { label: "Sector × own sentiment (alignment)", group: "Macro & Sector", fmt: (v) => fmt.num(v, 2), signal: signBySign(_INTERACTION_DEADZONE) },
+  days_to_next_fomc: { label: "Days to next Fed decision", group: "Event Risk", fmt: (v) => fmt.num(v, 0), signal: daysToEventSignal },
+  days_to_next_cpi: { label: "Days to next inflation report", group: "Event Risk", fmt: (v) => fmt.num(v, 0), signal: daysToEventSignal },
+  days_to_next_jobs: { label: "Days to next jobs report", group: "Event Risk", fmt: (v) => fmt.num(v, 0), signal: daysToEventSignal },
 };
 const FEATURE_GROUP_ORDER = ["Price & Trend", "Volatility", "Mean Reversion", "News Sentiment", "Macro & Sector", "Event Risk", "Other"];
+
+// good -> green (var(--green)), bad -> red (var(--red)), neutral -> blue
+// (var(--accent)) -- see the .pl-pos/.pl-neg/.pl-neutral rules in style.css.
+function signalClass(signal) {
+  return signal === "good" ? "pl-pos" : signal === "bad" ? "pl-neg" : "pl-neutral";
+}
 
 function featureGroupsHTML(features) {
   const byGroup = {};
   for (const f of features || []) {
     if (f.feature_name.startsWith("fund_")) continue; // shown in the Fundamentals table instead
-    const info = FEATURE_INFO[f.feature_name] || { label: f.feature_name, group: "Other", fmt: (v) => fmt.num(v, 4) };
-    (byGroup[info.group] ??= []).push({ label: info.label, value: info.fmt(f.value) });
+    const info = FEATURE_INFO[f.feature_name] || { label: f.feature_name, group: "Other", fmt: (v) => fmt.num(v, 4), signal: alwaysNeutral };
+    const cls = signalClass(info.signal(f.value));
+    (byGroup[info.group] ??= []).push({ label: info.label, valueHTML: `<span class="${cls}">${info.fmt(f.value)}</span>` });
   }
   const groups = FEATURE_GROUP_ORDER.filter((g) => byGroup[g] && byGroup[g].length);
   if (groups.length === 0) {
@@ -954,19 +997,35 @@ function featureGroupsHTML(features) {
       <div class="feature-group">
         <h4>${escapeHTML(g)}</h4>
         <div class="position-grid-stats">
-          ${byGroup[g].map((f) => `<div><div class="label">${escapeHTML(f.label)}</div>${f.value}</div>`).join("")}
+          ${byGroup[g].map((f) => `<div><div class="label">${escapeHTML(f.label)}</div>${f.valueHTML}</div>`).join("")}
         </div>
       </div>`
     )
     .join("");
 }
 
+// Only EPS and net income get a real green/red read here -- the glossary
+// explicitly frames both as "positive/rising = healthier, negative/falling
+// = losses". Revenue, gross profit, total assets and total liabilities are
+// each explicitly disclaimed in the glossary as "not automatically
+// bullish"/needing more context than the raw level alone provides, so they
+// stay neutral regardless of value -- coloring them would assert a read the
+// glossary itself says the number can't support on its own.
+const _FUNDAMENTALS_SIGNAL = {
+  eps_actual: signBySign(),
+  net_income: signBySign(),
+};
+
 function fundamentalsTableHTML(fundamentals) {
   if (!fundamentals || fundamentals.length === 0) {
     return '<div class="empty-state">No fundamentals collected for this symbol yet.</div>';
   }
   const rows = fundamentals
-    .map((f) => `<tr><td>${escapeHTML(f.metric)}</td><td>${fmt.num(f.value, 2)}</td><td>${fmt.time(f.ts)}</td></tr>`)
+    .map((f) => {
+      const signal = (_FUNDAMENTALS_SIGNAL[f.metric] || alwaysNeutral)(f.value);
+      const cls = signalClass(signal);
+      return `<tr><td>${escapeHTML(f.metric)}</td><td><span class="${cls}">${fmt.num(f.value, 2)}</span></td><td>${fmt.time(f.ts)}</td></tr>`;
+    })
     .join("");
   return `
     <div class="table-wrap">
