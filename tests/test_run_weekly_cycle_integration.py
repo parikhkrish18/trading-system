@@ -47,7 +47,7 @@ def _wire_happy_path(monkeypatch, calls, symbols=("AAPL", "MSFT")):
     monkeypatch.setattr(rwc, "load_active_universe", lambda: list(symbols))
     monkeypatch.setattr(rwc, "ingest_prices", _recorder(calls, "price_ingest"))
     monkeypatch.setattr(rwc, "ingest_fundamentals", _recorder(calls, "fundamentals_ingest"))
-    monkeypatch.setattr(rwc, "ingest_news", _recorder(calls, "news_ingest"))
+    monkeypatch.setattr(rwc, "ingest_finnhub", _recorder(calls, "news_ingest"))
     monkeypatch.setattr(rwc, "backfill_unscored_news", _recorder(calls, "sentiment_backfill"))
     monkeypatch.setattr(rwc, "refresh_macro_calendar", _recorder(calls, "macro_calendar_refresh"))
     monkeypatch.setattr(rwc, "build_and_store", _recorder(calls, "build_features"))
@@ -97,7 +97,7 @@ def test_every_successful_job_sends_a_telegram_progress_update(monkeypatch, _cal
     matching _JOB_RESULT_LABELS in scripts/run_weekly_cycle.py."""
     _wire_happy_path(monkeypatch, _calls)
     monkeypatch.setattr(rwc, "backfill_unscored_news", _recorder(_calls, "sentiment_backfill", return_value=312))
-    monkeypatch.setattr(rwc, "ingest_news", _recorder(_calls, "news_ingest", return_value=57))
+    monkeypatch.setattr(rwc, "ingest_finnhub", _recorder(_calls, "news_ingest", return_value=57))
 
     _run_main(monkeypatch)
 
@@ -182,7 +182,7 @@ def test_build_features_gets_the_requested_feature_set_id(monkeypatch, _calls):
 def test_a_failed_ingest_job_does_not_stop_later_jobs_or_the_trading_cycle(monkeypatch, _calls):
     _wire_happy_path(monkeypatch, _calls)
     monkeypatch.setattr(
-        rwc, "ingest_news", _recorder(_calls, "news_ingest", raises=ConnectionError("polygon is down"))
+        rwc, "ingest_finnhub", _recorder(_calls, "news_ingest", raises=ConnectionError("finnhub is down"))
     )
 
     _run_main(monkeypatch)
@@ -227,7 +227,7 @@ def test_empty_universe_aborts_before_any_other_job_runs(monkeypatch, _calls):
     monkeypatch.setattr(rwc, "alert_pipeline_failure", _recorder(_calls, "alert"))
     # None of these should ever be called -- fail loudly if they are.
     for name in (
-        "ingest_prices", "ingest_fundamentals", "ingest_news", "backfill_unscored_news",
+        "ingest_prices", "ingest_fundamentals", "ingest_finnhub", "backfill_unscored_news",
         "refresh_macro_calendar", "build_and_store", "run_guarded_trading_cycle",
     ):
         monkeypatch.setattr(rwc, name, _recorder(_calls, name))

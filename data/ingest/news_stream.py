@@ -1,7 +1,7 @@
 """
 Continuous, real-time news ingestion via Alpaca's news websocket
-(Benzinga-sourced — the same underlying content data/ingest/news.py's
-Polygon REST endpoint pulls, pushed instead of polled). Fills the SAME
+(Benzinga-sourced — pushed rather than polled; data/ingest/finnhub.py is
+the polled counterpart, company news + SEC filings). Fills the SAME
 news_events table, in the same shape (sentiment/surprise left NULL for
 features/qualitative/sentiment.py to score in its own pass) — everything
 downstream (the weekly screener's sentiment features, the hourly
@@ -191,10 +191,10 @@ class NewsStreamBuffer:
         n = self._writer(
             df,
             table="news_events",
-            # See data/ingest/news.py::ingest_news for why this is id alone
-            # and why sentiment/surprise are preserved on conflict -- same
-            # table, same idempotent-id scheme, same "never wipe a score
-            # that's already been computed" requirement.
+            # See data/ingest/finnhub.py::ingest_finnhub for why this is id
+            # alone and why sentiment/surprise are preserved on conflict --
+            # same table, same idempotent-id scheme, same "never wipe a
+            # score that's already been computed" requirement.
             conflict_cols=["id"],
             preserve_cols=["sentiment", "surprise"],
         )

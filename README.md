@@ -41,9 +41,12 @@ Fully working now:
 - S&P 500 universe, scraped from Wikipedia (`data/ingest/universe.py`) —
   drives every ingestion/training/screening script's `--universe` flag
 - Price ingestion (yfinance batch, or Alpaca) with upsert + validators (Phase 1)
-- Fundamentals + news ingestion via Polygon (needs `POLYGON_API_KEY`), with
+- Fundamentals ingestion via Polygon (needs `POLYGON_API_KEY`), with
   429-aware backoff and pacing for scanning hundreds of symbols on a
   rate-limited tier (Phase 1)
+- News ingestion: Finnhub company news + SEC filings, polled (needs
+  `FINNHUB_API_KEY`, `data/ingest/finnhub.py`), plus Alpaca's Benzinga-sourced
+  websocket for continuous between-poll coverage (`data/ingest/news_stream.py`)
 - Headline sentiment scoring via Claude (needs `ANTHROPIC_API_KEY`) (Phase 2)
 - Macro calendar: FOMC dates scraped from federalreserve.gov, CPI/Jobs dates
   from FRED's API (needs `FRED_API_KEY` — bls.gov itself blocks scraping),
@@ -112,7 +115,7 @@ python -m data.schema.migrate            # applies data/schema/*.sql
 python -m data.ingest.universe --scrape  # populates the S&P 500 universe table
 python -m data.ingest.prices --universe --backfill-years 5
 python -m data.ingest.fundamentals --universe   # slow on a rate-limited Polygon key, see --sleep-seconds
-python -m data.ingest.news --universe
+python -m data.ingest.finnhub --universe        # company news + SEC filings
 python -m features.build_features --universe --feature-set-id v3
 python -m models.train --universe --feature-set-id v3 --n-folds 6
 python -m models.screener --universe --feature-set-id v3   # book size comes from SCREENER_TOP_K in .env, default 10

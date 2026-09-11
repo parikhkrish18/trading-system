@@ -1,9 +1,10 @@
 """
-Shared HTTP helper for Polygon API calls. Every Polygon-backed ingestion
-script (fundamentals.py, news.py) hits the same free-tier rate limit
+Shared HTTP helper for Polygon API calls. fundamentals.py is the only
+Polygon-backed ingestion script left (news ingestion moved to Finnhub, see
+data/ingest/finnhub.py) -- it hits Polygon's free-tier rate limit
 (~5 requests/minute, observed empirically — a plain per-symbol loop over a
 few hundred universe symbols will hit this), so the 429 backoff logic lives
-here once instead of being duplicated per script.
+here.
 """
 from __future__ import annotations
 

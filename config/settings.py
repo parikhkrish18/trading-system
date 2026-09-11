@@ -46,7 +46,12 @@ class Settings(BaseSettings):
     ibkr_live_port: int = Field(default=7496, alias="IBKR_LIVE_PORT")  # TWS live
 
     # --- Data vendors ---
+    # Fundamentals only (data/ingest/fundamentals.py) -- news ingestion moved
+    # to Finnhub, see finnhub_api_key below.
     polygon_api_key: str = Field(default="", alias="POLYGON_API_KEY")
+    # data/ingest/finnhub.py: company news + SEC filings, the polled
+    # counterpart to data/ingest/news_stream.py's Alpaca/Benzinga websocket.
+    finnhub_api_key: str = Field(default="", alias="FINNHUB_API_KEY")
     fundamentals_news_api_key: str = Field(default="", alias="FUNDAMENTALS_NEWS_API_KEY")
     # Free key: https://fred.stlouisfed.org/docs/api/api_key.html — used for
     # CPI/jobs release dates in data/ingest/macro_calendar.py (BLS's own site

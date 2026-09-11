@@ -47,7 +47,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
-from data.ingest.news import ingest_news
+from data.ingest.finnhub import ingest_finnhub
 from data.ingest.universe import load_active_universe
 from execution import hold_rules
 from execution.approval_gate import ProposedTrade, advisory_lock, request_approval, send_followup
@@ -683,7 +683,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 
     symbols = list(positions.keys())
     try:
-        ingest_news(symbols, since_hours=_SENTIMENT_LOOKBACK_HOURS)
+        ingest_finnhub(symbols, since_hours=_SENTIMENT_LOOKBACK_HOURS)
         backfill_unscored_news()
     except Exception:
         logger.exception("News refresh failed — checking against whatever sentiment is already in the DB.")
