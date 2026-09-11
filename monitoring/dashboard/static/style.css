@@ -210,6 +210,13 @@ h3 { font-size: 13px; color: var(--text-muted); margin: 0 0 8px; font-weight: 60
 .phase-lines { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; }
 .phase-lines li { margin-bottom: 2px; }
 
+/* Ticker Lookup tab: one .feature-group per category (Price & Trend,
+   Volatility, ...), each just a small h4 heading over the same
+   .position-grid-stats layout the Positions cards already use. */
+.feature-group { margin-bottom: 16px; }
+.feature-group h4 { font-size: 12px; font-weight: 600; color: var(--text-muted); margin: 0 0 6px; }
+.feature-group .position-grid-stats { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); margin-bottom: 0; }
+
 .chart-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
 .chart-box {
   background: var(--bg-card);

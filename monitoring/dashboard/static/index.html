@@ -32,6 +32,7 @@
     <button class="tab-btn active" data-tab="overview">Overview</button>
     <button class="tab-btn" data-tab="model">Model</button>
     <button class="tab-btn" data-tab="news">Live News</button>
+    <button class="tab-btn" data-tab="ticker">Ticker Lookup</button>
     <button class="tab-btn" data-tab="clients">Clients</button>
   </nav>
 
@@ -156,6 +157,19 @@
           <button id="news-refresh-btn" class="btn btn-secondary">Refresh</button>
         </div>
         <div id="live-news-list" class="news-feed-list"></div>
+      </section>
+    </div>
+
+    <div id="tab-ticker" class="tab-panel" hidden>
+      <section id="ticker-lookup-section">
+        <h2>Ticker Lookup <span class="muted">(everything collected for one symbol this cycle)</span></h2>
+        <div class="filter-row">
+          <input id="ticker-lookup-symbol" placeholder="Symbol (e.g. AAPL)" />
+          <button id="ticker-lookup-btn" class="btn btn-secondary">Look up</button>
+        </div>
+        <div id="ticker-lookup-result">
+          <div class="empty-state">Enter a symbol above to see its latest price, market/quant features, fundamentals, news and model decisions.</div>
+        </div>
       </section>
     </div>
 

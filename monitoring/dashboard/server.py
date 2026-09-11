@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import mlflow
 import pandas as pd
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -733,6 +733,106 @@ def get_positions_news(limit_per_symbol: int = 8) -> dict[str, list[dict]]:
     for symbol, group in df.groupby("symbol"):
         result[symbol] = _clean_records(group.head(limit_per_symbol))
     return result
+
+
+@app.get("/api/ticker/{symbol}")
+def get_ticker_lookup(symbol: str) -> dict:
+    """
+    Everything collected for one ticker, for the Ticker Lookup tab: the
+    latest price bar, the full latest feature vector this cycle actually
+    computed (quant/sentiment/macro/event-risk/fundamentals -- whatever
+    features/build_features.py wrote, grouped client-side by name prefix),
+    the latest known fundamentals, recent news, and the model's own recent
+    decisions/reasoning for it (including genuine per-prediction LightGBM
+    feature contributions where present -- see models/screener.py).
+
+    Works for ANY symbol with data in the DB, not just currently held
+    positions -- this is a lookup tool, not a positions view.
+    """
+    symbol = symbol.strip().upper()
+    try:
+        symbol_list = symbol_in_clause([symbol])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    engine = get_engine()
+
+    latest_price = pd.read_sql(
+        "SELECT ts, open, high, low, close, volume, source FROM prices "  # noqa: S608 — symbol validated via symbol_in_clause
+        f"WHERE symbol IN ({symbol_list}) ORDER BY ts DESC LIMIT 1",
+        engine,
+    )
+
+    # The most recent feature_set_id this symbol actually has rows under --
+    # not settings.feature_set_id, so this still works if the DB is a
+    # version behind whatever's configured live.
+    feature_set_row = pd.read_sql(
+        "SELECT feature_set_id, MAX(ts) AS ts FROM features "  # noqa: S608 — symbol validated via symbol_in_clause
+        f"WHERE symbol IN ({symbol_list}) GROUP BY feature_set_id ORDER BY ts DESC LIMIT 1",
+        engine,
+    )
+    features: list[dict] = []
+    feature_set_id = None
+    if not feature_set_row.empty:
+        feature_set_id = feature_set_row.iloc[0]["feature_set_id"]
+        feature_ts = feature_set_row.iloc[0]["ts"]
+        raw_features = pd.read_sql(
+            text(
+                "SELECT feature_name, value FROM features "  # noqa: S608 — symbol validated via symbol_in_clause
+                f"WHERE symbol IN ({symbol_list}) AND feature_set_id = :fsid AND ts = :ts"
+            ),
+            engine,
+            params={"fsid": feature_set_id, "ts": feature_ts},
+        )
+        features = _clean_records(raw_features)
+
+    fundamentals_raw = pd.read_sql(
+        "SELECT ts, metric, value FROM fundamentals "  # noqa: S608 — symbol validated via symbol_in_clause
+        f"WHERE symbol IN ({symbol_list}) ORDER BY ts DESC",
+        engine,
+    )
+    if not fundamentals_raw.empty:
+        # Latest filed value per metric -- same "most recent as of now" read
+        # build_fundamentals_features uses, just without the as-of price-date join.
+        fundamentals_raw = fundamentals_raw.sort_values("ts", ascending=False).drop_duplicates("metric")
+    fundamentals = _clean_records(fundamentals_raw)
+
+    news = pd.read_sql(
+        "SELECT ts, headline, summary, source, sentiment, sentiment_reason, sentiment_relevant FROM news_events "  # noqa: S608 — symbol validated via symbol_in_clause
+        f"WHERE symbol IN ({symbol_list}) ORDER BY ts DESC LIMIT 30",
+        engine,
+    )
+    # Same convention as /api/positions/news: a story a vendor mistagged
+    # onto this symbol (sentiment_relevant == False) doesn't belong here at
+    # all; NULL (unscored, or scored before this column existed) stays
+    # visible.
+    if "sentiment_relevant" in news.columns:
+        news = news[news["sentiment_relevant"] != False]  # noqa: E712 — NaN-safe: only an explicit False is dropped
+    news_records = _clean_records(news)
+
+    decisions = pd.read_sql(
+        text(
+            "SELECT ts, feature_set_id, model_version, forecast, regime, target_position, "
+            "executed_position, mode, reasoning, approval_status, direction_agreement FROM decisions "
+            "WHERE symbol = :symbol ORDER BY ts DESC LIMIT 20"
+        ),
+        engine,
+        params={"symbol": symbol},
+    )
+    decision_records = _clean_records(decisions)
+    for r in decision_records:
+        if isinstance(r.get("reasoning"), str):
+            r["reasoning"] = json.loads(r["reasoning"])
+
+    return {
+        "symbol": symbol,
+        "latest_price": _clean_records(latest_price)[0] if not latest_price.empty else None,
+        "feature_set_id": feature_set_id,
+        "features": features,
+        "fundamentals": fundamentals,
+        "news": news_records,
+        "decisions": decision_records,
+    }
 
 
 @app.get("/api/news/ingestion_status")
