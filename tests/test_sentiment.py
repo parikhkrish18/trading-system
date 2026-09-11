@@ -295,6 +295,65 @@ def test_score_sentiment_survives_a_batch_whose_response_is_not_valid_json(monke
     assert pd.isna(by_id[2]["sentiment"])  # the bad batch stays unscored, not crashed on
 
 
+def test_score_sentiment_retries_a_batch_that_fails_to_parse_and_succeeds(monkeypatch):
+    """
+    A parse failure is usually just sampling variance -- re-asking the same
+    batch often works. The batch must not be left unscored if a later
+    attempt succeeds.
+    """
+    attempts = {"count": 0}
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return "not valid json at all"
+        return json.dumps(
+            [{"id": item["id"], "sentiment": 0.8, "reason": "fine", "relevant": True} for item in items]
+        )
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+    headlines = pd.DataFrame(
+        {
+            "id": [1],
+            "ts": pd.to_datetime(["2026-07-27"], utc=True),
+            "symbol": ["SPY"],
+            "headline": ["headline"],
+        }
+    )
+
+    scored = sentiment.score_sentiment(headlines)
+
+    assert attempts["count"] == 3  # failed twice, succeeded on the third attempt
+    assert list(scored["sentiment"]) == [0.8]
+
+
+def test_score_sentiment_gives_up_on_a_batch_after_max_attempts(monkeypatch):
+    """A batch that never parses, across every retry, must still leave its rows
+    unscored rather than crash -- same outcome as before retries existed, just
+    reached after _MAX_SCORE_ATTEMPTS tries instead of one."""
+    attempts = {"count": 0}
+
+    def respond(messages):
+        attempts["count"] += 1
+        return "not valid json at all"
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+    headlines = pd.DataFrame(
+        {
+            "id": [1],
+            "ts": pd.to_datetime(["2026-07-27"], utc=True),
+            "symbol": ["SPY"],
+            "headline": ["headline"],
+        }
+    )
+
+    scored = sentiment.score_sentiment(headlines)
+
+    assert attempts["count"] == sentiment._MAX_SCORE_ATTEMPTS
+    assert pd.isna(scored.iloc[0]["sentiment"])
+
+
 def test_backfill_unscored_news_writes_the_good_batches_when_one_batch_fails_to_parse(monkeypatch):
     """
     Same regression as above, exercised through backfill_unscored_news's

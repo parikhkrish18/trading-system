@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 
 _MODEL = "claude-haiku-4-5"
 _BATCH_SIZE = 20
+# A parse failure is usually just sampling variance in Claude's output (a
+# stray unescaped quote, a truncated tail), not a persistent problem with
+# this batch's content -- re-asking the identical question often just works.
+# Retried immediately, no backoff: this is a malformed-response retry, not a
+# rate-limit/network one (the anthropic client already retries those itself).
+_MAX_SCORE_ATTEMPTS = 3
 
 _SYSTEM_PROMPT = (
     "You are scoring financial news stories for sentiment, one story paired "
@@ -146,31 +152,46 @@ def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
 
     for start in range(0, len(headlines), _BATCH_SIZE):
         batch = headlines.iloc[start : start + _BATCH_SIZE]
-        try:
-            id_to_result = _score_batch(client, batch)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            # Claude occasionally hands back text that doesn't parse into
-            # the expected shape at all -- not just one row's optional
-            # field missing (the per-id .get() calls in _score_batch
-            # already handle that gracefully), but the whole response
-            # failing json.loads (a stray unescaped quote in a "reason"
-            # string is the usual culprit), or a required field like "id"/
-            # "sentiment" missing entirely. Left uncaught, this used to
-            # raise straight out of score_sentiment and take every OTHER
-            # batch in this same call down with it -- backfill_unscored_news
-            # never reaches its DB-write loop, so up to 24 already-
-            # successful, already-paid-for batches got thrown away because
-            # one later batch in the same run failed to parse. Skip just
-            # this one batch instead: its rows keep the pd.NA this
-            # function initializes every row to, so backfill_unscored_news's
-            # existing pd.isna(...) check leaves them sentiment IS NULL --
-            # naturally retried next run, same as a single missing id
-            # already was, while every sibling batch's real results still
-            # make it back to the caller and get written.
+        id_to_result = None
+        last_exc = None
+        for attempt in range(1, _MAX_SCORE_ATTEMPTS + 1):
+            try:
+                id_to_result = _score_batch(client, batch)
+                break
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                # Claude occasionally hands back text that doesn't parse into
+                # the expected shape at all -- not just one row's optional
+                # field missing (the per-id .get() calls in _score_batch
+                # already handle that gracefully), but the whole response
+                # failing json.loads (a stray unescaped quote in a "reason"
+                # string is the usual culprit), or a required field like "id"/
+                # "sentiment" missing entirely. Re-asking the same batch
+                # usually just works (it's sampling variance, not a bad
+                # input), so retry up to _MAX_SCORE_ATTEMPTS times before
+                # giving up on this batch for this run.
+                last_exc = exc
+                logger.warning(
+                    "Could not parse Claude's response for a batch of %d headlines (ids %s), "
+                    "attempt %d/%d.",
+                    len(batch), list(batch["id"]), attempt, _MAX_SCORE_ATTEMPTS, exc_info=True,
+                )
+        if id_to_result is None:
+            # Every attempt failed. Left uncaught, this used to raise
+            # straight out of score_sentiment and take every OTHER batch in
+            # this same call down with it -- backfill_unscored_news never
+            # reaches its DB-write loop, so up to 24 already-successful,
+            # already-paid-for batches got thrown away because one later
+            # batch in the same run failed to parse. Skip just this one
+            # batch instead: its rows keep the pd.NA this function
+            # initializes every row to, so backfill_unscored_news's existing
+            # pd.isna(...) check leaves them sentiment IS NULL -- naturally
+            # retried next run, same as a single missing id already was,
+            # while every sibling batch's real results still make it back
+            # to the caller and get written.
             logger.warning(
-                "Could not parse Claude's response for a batch of %d headlines (ids %s) -- "
-                "leaving them unscored for the next backfill run.",
-                len(batch), list(batch["id"]), exc_info=True,
+                "Still could not parse Claude's response for a batch of %d headlines (ids %s) "
+                "after %d attempts -- leaving them unscored for the next backfill run.",
+                len(batch), list(batch["id"]), _MAX_SCORE_ATTEMPTS, exc_info=last_exc,
             )
             continue
         for row_id, (score, reason, relevant) in id_to_result.items():
