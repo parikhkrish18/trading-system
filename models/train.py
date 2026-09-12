@@ -41,10 +41,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 
-import mlflow
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sqlalchemy import text
 
 from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
@@ -212,6 +212,38 @@ def load_training_frame(
     return cross_sectional_zscore(merged, feature_columns(merged), "ts")
 
 
+def _write_fold_result(model_name: str, feature_set_id: str, fold, row: dict) -> None:
+    """
+    Persists one fold's results for the dashboard's Model Analysis / Model
+    Report Card panels (monitoring/dashboard/report_card.py, server.py) --
+    replaces the previous per-fold mlflow.log_metrics call. Written straight
+    to Postgres (the database this whole app already depends on) rather than
+    a separate always-on MLflow service: one row per fold is all either
+    panel has ever shown, so there was never a need for a full tracking
+    server, and it's one less service that can go to sleep and time out a
+    training run (see the walk-forward-job crash this replaces).
+    """
+    pd.DataFrame(
+        [
+            {
+                "model_name": model_name,
+                "feature_set_id": feature_set_id,
+                "fold_id": fold.fold_id,
+                "train_start": fold.train_start,
+                "train_end": fold.train_end,
+                "test_start": fold.test_start,
+                "test_end": fold.test_end,
+                "mae": row["mae"],
+                "rmse": row["rmse"],
+                "directional_accuracy": row["directional_accuracy"],
+                "directional_accuracy_when_confident": row["directional_accuracy_when_confident"],
+                "pct_rows_confident": row["pct_rows_confident"],
+                "mean_ensemble_std": row.get("mean_ensemble_std"),
+            }
+        ]
+    ).to_sql("walk_forward_folds", get_engine(), if_exists="append", index=False)
+
+
 def run_walk_forward(
     feature_set_id: str,
     symbols: list[str],
@@ -292,8 +324,13 @@ def run_walk_forward(
     # in would feed realised volatility and beta to the model as features.
     risk_profile = trailing_risk_profile(df[["symbol", "ts", "close"]])
 
-    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-    mlflow.set_experiment(model_name)
+    # A fresh run replaces this model's previous fold results outright,
+    # rather than accumulating run after run — the dashboard has never shown
+    # more than the latest run per model, so there's nothing to gain from
+    # keeping old ones around and it avoids stale folds mixing with new ones
+    # if n_folds or the data changes between runs.
+    with get_engine().begin() as conn:
+        conn.execute(text("DELETE FROM walk_forward_folds WHERE model_name = :model_name"), {"model_name": model_name})
 
     results = []
     for fold in folds:
@@ -303,149 +340,111 @@ def run_walk_forward(
         if train_df.empty or test_df.empty:
             continue
 
-        with mlflow.start_run(run_name=f"fold_{fold.fold_id}"):
-            mlflow.log_params(
-                {
-                    "fold_id": fold.fold_id,
-                    "train_start": str(fold.train_start),
-                    "train_end": str(fold.train_end),
-                    "test_start": str(fold.test_start),
-                    "test_end": str(fold.test_end),
-                    "feature_set_id": feature_set_id,
-                    "target_horizon_days": target_horizon_days,
-                    "target_mode": target_mode,
-                    "n_features": len(feature_cols),
-                    "n_ensemble_models": n_ensemble_models,
-                    "confident_agreement_threshold": confident_agreement_threshold,
-                    "purge_days": purge_days,
-                    "purged_train_end": str(cutoff),
-                    "round_trip_cost_fraction": round_trip_cost,
-                }
+        model = EnsembleForecastModel(n_models=n_ensemble_models)
+        model.fit(train_df[feature_cols], train_df["target"])
+        ensemble_out = model.predict(test_df[feature_cols])
+        preds = ensemble_out["mean_prediction"].to_numpy()
+        # `actual` is whatever the model was trained to predict, so MAE,
+        # RMSE and directional accuracy stay measured against the model's
+        # own objective. `market` is the absolute forward return, always
+        # — money is measured in money regardless of the target mode.
+        actual = test_df["target"].to_numpy()
+        market = test_df["fwd_return"].to_numpy()
+
+        mae = mean_absolute_error(actual, preds)
+        rmse = np.sqrt(mean_squared_error(actual, preds))
+        # Directional accuracy matters at least as much as magnitude error
+        # for a system that ultimately just takes long/short/flat decisions.
+        # Two versions, because in relative mode they answer different
+        # questions: did the stock beat the market (the model's own
+        # objective), and did it go up at all (what a long actually needs).
+        # In absolute mode the two are identical by construction.
+        directional_acc = float(np.mean(np.sign(preds) == np.sign(actual)))
+        directional_acc_absolute = float(np.mean(np.sign(preds) == np.sign(market)))
+
+        # Does ensemble agreement actually correlate with being right?
+        # This is what calibrates the screener's confidence threshold —
+        # if accuracy on the "confident" subset isn't meaningfully better
+        # than the overall accuracy above, agreement isn't a useful filter.
+        confident_mask = (ensemble_out["direction_agreement"] >= confident_agreement_threshold).to_numpy()
+        pct_confident = float(confident_mask.mean())
+        directional_acc_confident = (
+            float(np.mean(np.sign(preds[confident_mask]) == np.sign(actual[confident_mask])))
+            if confident_mask.any()
+            else float("nan")
+        )
+
+        # What trading the confident calls would have paid, AND what
+        # doing nothing would have paid over the identical window.
+        # `market` is every candidate row in the test window — the
+        # equal-weight buy-and-hold baseline. Reporting the model's
+        # return without it is how this project spent months mistaking
+        # market drift for skill (see models/evaluation.py).
+        # Which rows the live system would have traded. The agreement
+        # mask above stays as a diagnostic — it answers "does agreement
+        # predict accuracy" — but it is NOT what the screener selects
+        # on, so it must not be what the money metrics are computed
+        # from. See models/evaluation.production_book_mask.
+        if respect_production_config:
+            traded_mask = production_book_mask(
+                preds,
+                test_df["ts"].to_numpy(),
+                cost=round_trip_cost,
+                allow_shorts=settings.allow_shorts,
+                top_k=book_top_k,
             )
+        else:
+            traded_mask = confident_mask
 
-            model = EnsembleForecastModel(n_models=n_ensemble_models)
-            model.fit(train_df[feature_cols], train_df["target"])
-            ensemble_out = model.predict(test_df[feature_cols])
-            preds = ensemble_out["mean_prediction"].to_numpy()
-            # `actual` is whatever the model was trained to predict, so MAE,
-            # RMSE and directional accuracy stay measured against the model's
-            # own objective. `market` is the absolute forward return, always
-            # — money is measured in money regardless of the target mode.
-            actual = test_df["target"].to_numpy()
-            market = test_df["fwd_return"].to_numpy()
+        metrics = trade_metrics(
+            preds[traded_mask],
+            market[traded_mask],
+            market,
+            round_trip_cost,
+        )
 
-            mae = mean_absolute_error(actual, preds)
-            rmse = np.sqrt(mean_squared_error(actual, preds))
-            # Directional accuracy matters at least as much as magnitude error
-            # for a system that ultimately just takes long/short/flat decisions.
-            # Two versions, because in relative mode they answer different
-            # questions: did the stock beat the market (the model's own
-            # objective), and did it go up at all (what a long actually needs).
-            # In absolute mode the two are identical by construction.
-            directional_acc = float(np.mean(np.sign(preds) == np.sign(actual)))
-            directional_acc_absolute = float(np.mean(np.sign(preds) == np.sign(market)))
+        # Ranking by size of predicted move selects, mechanically, for
+        # stocks that move a lot — so an equal-weight benchmark may be
+        # flattering a book that is simply more volatile than the
+        # universe. Measure the tilt, and price it.
+        fold_risk = test_df[["symbol", "ts"]].merge(risk_profile, on=["symbol", "ts"], how="left")
+        row_vol = fold_risk["realized_vol"].to_numpy()
+        row_beta = fold_risk["beta"].to_numpy()
+        picks_vol = float(np.nanmean(row_vol[traded_mask])) if traded_mask.any() else float("nan")
+        picks_beta = float(np.nanmean(row_beta[traded_mask])) if traded_mask.any() else float("nan")
+        risk_metrics = {
+            "picks_realized_vol": picks_vol,
+            "universe_realized_vol": float(np.nanmean(row_vol)),
+            "picks_beta": picks_beta,
+            "universe_beta": float(np.nanmean(row_beta)),
+            "vol_matched_benchmark": volatility_matched_benchmark(market, row_vol, traded_mask),
+            "beta_adjusted_excess": beta_adjusted_excess(
+                metrics["model_return_net"], metrics["benchmark_return"], picks_beta
+            ),
+        }
+        risk_metrics["vol_matched_excess"] = float(
+            metrics["model_return_net"] - risk_metrics["vol_matched_benchmark"]
+        )
+        metrics = {**metrics, **risk_metrics}
 
-            # Does ensemble agreement actually correlate with being right?
-            # This is what calibrates the screener's confidence threshold —
-            # if accuracy on the "confident" subset isn't meaningfully better
-            # than the overall accuracy above, agreement isn't a useful filter.
-            confident_mask = (ensemble_out["direction_agreement"] >= confident_agreement_threshold).to_numpy()
-            pct_confident = float(confident_mask.mean())
-            directional_acc_confident = (
-                float(np.mean(np.sign(preds[confident_mask]) == np.sign(actual[confident_mask])))
-                if confident_mask.any()
-                else float("nan")
-            )
-
-            # What trading the confident calls would have paid, AND what
-            # doing nothing would have paid over the identical window.
-            # `market` is every candidate row in the test window — the
-            # equal-weight buy-and-hold baseline. Reporting the model's
-            # return without it is how this project spent months mistaking
-            # market drift for skill (see models/evaluation.py).
-            # Which rows the live system would have traded. The agreement
-            # mask above stays as a diagnostic — it answers "does agreement
-            # predict accuracy" — but it is NOT what the screener selects
-            # on, so it must not be what the money metrics are computed
-            # from. See models/evaluation.production_book_mask.
-            if respect_production_config:
-                traded_mask = production_book_mask(
-                    preds,
-                    test_df["ts"].to_numpy(),
-                    cost=round_trip_cost,
-                    allow_shorts=settings.allow_shorts,
-                    top_k=book_top_k,
-                )
-            else:
-                traded_mask = confident_mask
-
-            metrics = trade_metrics(
-                preds[traded_mask],
-                market[traded_mask],
-                market,
-                round_trip_cost,
-            )
-
-            # Ranking by size of predicted move selects, mechanically, for
-            # stocks that move a lot — so an equal-weight benchmark may be
-            # flattering a book that is simply more volatile than the
-            # universe. Measure the tilt, and price it.
-            fold_risk = test_df[["symbol", "ts"]].merge(risk_profile, on=["symbol", "ts"], how="left")
-            row_vol = fold_risk["realized_vol"].to_numpy()
-            row_beta = fold_risk["beta"].to_numpy()
-            picks_vol = float(np.nanmean(row_vol[traded_mask])) if traded_mask.any() else float("nan")
-            picks_beta = float(np.nanmean(row_beta[traded_mask])) if traded_mask.any() else float("nan")
-            risk_metrics = {
-                "picks_realized_vol": picks_vol,
-                "universe_realized_vol": float(np.nanmean(row_vol)),
-                "picks_beta": picks_beta,
-                "universe_beta": float(np.nanmean(row_beta)),
-                "vol_matched_benchmark": volatility_matched_benchmark(market, row_vol, traded_mask),
-                "beta_adjusted_excess": beta_adjusted_excess(
-                    metrics["model_return_net"], metrics["benchmark_return"], picks_beta
-                ),
-            }
-            risk_metrics["vol_matched_excess"] = float(
-                metrics["model_return_net"] - risk_metrics["vol_matched_benchmark"]
-            )
-            metrics = {**metrics, **risk_metrics}
-            mlflow.log_metrics(
-                {
-                    "mae": mae,
-                    "rmse": rmse,
-                    "directional_accuracy": directional_acc,
-                    "directional_accuracy_absolute": directional_acc_absolute,
-                    "directional_accuracy_when_confident": directional_acc_confident,
-                    "pct_rows_confident": pct_confident,
-                    "mean_ensemble_std": float(ensemble_out["std_prediction"].mean()),
-                    # Historical names, still logged so runs from before the
-                    # benchmark existed remain comparable in the MLflow UI.
-                    # Nothing in this repo PRINTS them any more — a bare
-                    # return figure with no benchmark beside it is the exact
-                    # mistake this change exists to stop.
-                    "mean_return_confident_gross": metrics["model_return_gross"],
-                    "mean_return_confident_net": metrics["model_return_net"],
-                    **{k: v for k, v in metrics.items() if pd.notna(v)},
-                }
-            )
-
-            results.append(
-                {
-                    "fold_id": fold.fold_id,
-                    "test_start": fold.test_start,
-                    "test_end": fold.test_end,
-                    "n_train": len(train_df),
-                    "n_test": len(test_df),
-                    "mae": mae,
-                    "rmse": rmse,
-                    "directional_accuracy": directional_acc,
-                    "directional_accuracy_absolute": directional_acc_absolute,
-                    "directional_accuracy_when_confident": directional_acc_confident,
-                    "pct_rows_confident": pct_confident,
-                    "pct_rows_traded": float(traded_mask.mean()),
-                    **metrics,
-                }
-            )
+        fold_row = {
+            "fold_id": fold.fold_id,
+            "test_start": fold.test_start,
+            "test_end": fold.test_end,
+            "n_train": len(train_df),
+            "n_test": len(test_df),
+            "mae": mae,
+            "rmse": rmse,
+            "directional_accuracy": directional_acc,
+            "directional_accuracy_absolute": directional_acc_absolute,
+            "directional_accuracy_when_confident": directional_acc_confident,
+            "pct_rows_confident": pct_confident,
+            "pct_rows_traded": float(traded_mask.mean()),
+            "mean_ensemble_std": float(ensemble_out["std_prediction"].mean()),
+            **metrics,
+        }
+        results.append(fold_row)
+        _write_fold_result(model_name, feature_set_id, fold, fold_row)
 
     frame = pd.DataFrame(results)
     # Provenance travels with the numbers: two runs of this harness can

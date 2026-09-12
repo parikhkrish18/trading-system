@@ -675,7 +675,7 @@ async function loadAnalysis() {
   const rows = await fetchJSON("/api/analysis/runs");
   const tbody = document.querySelector("#analysis-table tbody");
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No walk-forward runs found in MLflow.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No walk-forward runs recorded yet — run `python -m models.train`.</td></tr>';
     renderLineChart(document.getElementById("analysis-chart"), []);
     return;
   }

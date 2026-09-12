@@ -188,7 +188,8 @@ def test_circuit_breakers_endpoint(monkeypatch, client):
 
 
 def test_analysis_runs_endpoint_empty(monkeypatch, client):
-    monkeypatch.setattr(server.mlflow, "search_runs", lambda experiment_names: pd.DataFrame())
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
     resp = client.get("/api/analysis/runs")
     assert resp.json() == []
 
@@ -196,25 +197,27 @@ def test_analysis_runs_endpoint_empty(monkeypatch, client):
 def test_analysis_runs_endpoint_returns_records(monkeypatch, client):
     df = pd.DataFrame(
         {
+            "fold_id": [0],
+            "feature_set_id": ["v3"],
+            "train_start": pd.to_datetime(["2024-01-01"], utc=True),
+            "train_end": pd.to_datetime(["2025-01-01"], utc=True),
+            "test_start": pd.to_datetime(["2025-01-01"], utc=True),
+            "test_end": pd.to_datetime(["2025-07-01"], utc=True),
+            "mae": [0.03],
+            "rmse": [0.05],
+            "directional_accuracy": [0.52],
+            "directional_accuracy_when_confident": [0.53],
+            "pct_rows_confident": [0.9],
+            "mean_ensemble_std": [0.01],
             "start_time": pd.to_datetime(["2026-07-28"], utc=True),
-            "params.fold_id": ["0"],
-            "params.feature_set_id": ["v3"],
-            "params.train_start": ["2024-01-01"],
-            "params.train_end": ["2025-01-01"],
-            "params.test_start": ["2025-01-01"],
-            "params.test_end": ["2025-07-01"],
-            "metrics.mae": [0.03],
-            "metrics.rmse": [0.05],
-            "metrics.directional_accuracy": [0.52],
-            "metrics.directional_accuracy_when_confident": [0.53],
-            "metrics.pct_rows_confident": [0.9],
         }
     )
-    monkeypatch.setattr(server.mlflow, "search_runs", lambda experiment_names: df)
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
 
     resp = client.get("/api/analysis/runs")
     body = resp.json()
-    assert body[0]["fold_id"] == "0"
+    assert body[0]["fold_id"] == 0
     assert body[0]["directional_accuracy"] == pytest.approx(0.52)
 
 
@@ -383,7 +386,7 @@ def test_drift_flags_when_recent_weeks_undercut_the_walkforward_baseline(monkeyp
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
     monkeypatch.setattr(
         server.report_card, "fetch_fold_runs",
-        lambda tracking_uri: [{"run_name": "f0", "fold_id": "0", "metrics": {"directional_accuracy": 0.55}}],
+        lambda: [{"run_name": "f0", "fold_id": "0", "metrics": {"directional_accuracy": 0.55}}],
     )
 
     body = client.get("/api/analysis/drift").json()
@@ -397,7 +400,7 @@ def test_drift_flags_when_recent_weeks_undercut_the_walkforward_baseline(monkeyp
     assert drag["mom_ret_5d"]["n"] == 15
 
 
-def test_drift_baseline_unavailable_when_mlflow_is_down(monkeypatch, client):
+def test_drift_baseline_unavailable_when_the_fold_query_fails(monkeypatch, client):
     monkeypatch.setattr(server.settings, "target_horizon_days", 1)  # matches the 1-day-apart price series below
     decisions = pd.DataFrame(
         {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "reasoning": [None]}
@@ -409,8 +412,8 @@ def test_drift_baseline_unavailable_when_mlflow_is_down(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
-    def _boom(tracking_uri):
-        raise RuntimeError("mlflow unreachable")
+    def _boom():
+        raise RuntimeError("walk_forward_folds unreachable")
 
     monkeypatch.setattr(server.report_card, "fetch_fold_runs", _boom)
 
@@ -441,8 +444,8 @@ def test_drift_grades_at_the_configured_horizon_not_the_next_day(monkeypatch, cl
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
-    def _boom(tracking_uri):
-        raise RuntimeError("no mlflow in this test — not what's under test here")
+    def _boom():
+        raise RuntimeError("no fold data in this test — not what's under test here")
 
     monkeypatch.setattr(server.report_card, "fetch_fold_runs", _boom)
 
@@ -813,7 +816,7 @@ def _fold_run(fold_id, accuracy, confident_accuracy, pct_confident):
 
 def test_report_card_endpoint_folds_metrics_into_headline_chart_and_callouts(monkeypatch, client):
     runs = [_fold_run(2, 0.60, 0.70, 0.5), _fold_run(1, 0.50, 0.60, 0.5)]
-    monkeypatch.setattr(server.report_card, "fetch_fold_runs", lambda uri, experiment_name="forecast_lgbm": runs)
+    monkeypatch.setattr(server.report_card, "fetch_fold_runs", lambda: runs)
 
     resp = client.get("/api/analysis/report_card")
 
@@ -828,9 +831,9 @@ def test_report_card_endpoint_folds_metrics_into_headline_chart_and_callouts(mon
     assert any("models agreed" in c for c in body["callouts"])
 
 
-def test_report_card_endpoint_is_empty_not_500_when_mlflow_is_down(monkeypatch, client):
-    def _down(uri, experiment_name="forecast_lgbm"):
-        raise ConnectionError("mlflow unreachable")
+def test_report_card_endpoint_is_empty_not_500_when_the_fold_query_fails(monkeypatch, client):
+    def _down():
+        raise ConnectionError("walk_forward_folds unreachable")
 
     monkeypatch.setattr(server.report_card, "fetch_fold_runs", _down)
 
@@ -841,7 +844,7 @@ def test_report_card_endpoint_is_empty_not_500_when_mlflow_is_down(monkeypatch, 
 
 
 def test_report_card_endpoint_unavailable_when_no_runs(monkeypatch, client):
-    monkeypatch.setattr(server.report_card, "fetch_fold_runs", lambda uri, experiment_name="forecast_lgbm": [])
+    monkeypatch.setattr(server.report_card, "fetch_fold_runs", lambda: [])
 
     resp = client.get("/api/analysis/report_card")
 

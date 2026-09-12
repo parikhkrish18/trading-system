@@ -87,8 +87,9 @@ Fully working now:
 - Custom monitoring dashboard (`monitoring/dashboard/server.py` — FastAPI +
   vanilla JS, no Streamlit): every open position with live P&L and the
   model's actual reasoning for entering it, decision history, walk-forward
-  analysis from MLflow, live directional hit-rate, equity/drawdown,
-  circuit-breaker status, and the test suite runnable on demand. `make dashboard`
+  analysis (`walk_forward_folds` table, see `data/schema/017_walk_forward_folds.sql`),
+  live directional hit-rate, equity/drawdown, circuit-breaker status, and the
+  test suite runnable on demand. `make dashboard`
 - Alerting: Slack webhook (`SLACK_WEBHOOK_URL`) with automatic fallback to
   the Telegram bot when Slack is unconfigured/down; entry points also log
   to a rotating `logs/trading-system.log`

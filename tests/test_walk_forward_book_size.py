@@ -6,8 +6,6 @@ has to measure the same book size the live screener actually trades.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -34,22 +32,6 @@ class _FakeEnsemble:
         )
 
 
-class _FakeMlflow:
-    """No-op stand-in — the real one needs a tracking server/local store this test shouldn't touch."""
-
-    def set_tracking_uri(self, uri): ...
-
-    def set_experiment(self, name): ...
-
-    def log_params(self, params): ...
-
-    def log_metrics(self, metrics): ...
-
-    @contextmanager
-    def start_run(self, run_name=None):
-        yield None
-
-
 def _synthetic_train_df():
     dates = pd.bdate_range("2026-01-01", periods=20)
     return pd.DataFrame(
@@ -64,10 +46,27 @@ def _synthetic_train_df():
     )
 
 
+class _FakeConnection:
+    """No-op stand-in for run_walk_forward's DELETE of a model's old fold rows —
+    this test never reaches an actual fold result to write."""
+
+    def execute(self, *a, **k): ...
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc): ...
+
+
+class _FakeEngine:
+    def begin(self):
+        return _FakeConnection()
+
+
 def _run_and_capture_book_top_k(monkeypatch, **run_kwargs):
     monkeypatch.setattr(train, "load_training_frame", lambda *a, **k: _synthetic_train_df())
     monkeypatch.setattr(train, "EnsembleForecastModel", _FakeEnsemble)
-    monkeypatch.setattr(train, "mlflow", _FakeMlflow())
+    monkeypatch.setattr(train, "get_engine", lambda: _FakeEngine())
 
     captured = {}
 
