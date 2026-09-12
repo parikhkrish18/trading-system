@@ -1,3 +1,5 @@
+import datetime as dt
+
 import pandas as pd
 import pytest
 from sqlalchemy import text
@@ -33,6 +35,8 @@ def test_stable_id_differs_by_symbol_for_the_same_key():
 
 
 def test_fetch_company_news_shapes_finnhub_response(monkeypatch):
+    recent_ts = int((dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=1)).timestamp())
+
     def fake_get(url, params=None, timeout=None):
         assert url == finnhub.FINNHUB_COMPANY_NEWS_URL
         assert params["symbol"] in ("SPY", "QQQ")
@@ -40,7 +44,7 @@ def test_fetch_company_news_shapes_finnhub_response(monkeypatch):
             [
                 {
                     "id": 25286,
-                    "datetime": 1758000000,
+                    "datetime": recent_ts,
                     "headline": f"{params['symbol']} headline",
                     "summary": "Some summary.",
                     "category": "company news",
@@ -52,7 +56,7 @@ def test_fetch_company_news_shapes_finnhub_response(monkeypatch):
     monkeypatch.setattr(finnhub, "finnhub_get", fake_get)
     monkeypatch.setattr(finnhub.settings, "finnhub_api_key", "test-key")
 
-    df = finnhub.fetch_company_news(["SPY", "QQQ"], since_hours=24 * 365)
+    df = finnhub.fetch_company_news(["SPY", "QQQ"], since_hours=24)
 
     assert list(df.columns) == ["id", "symbol", "ts", "headline", "summary", "source"]
     assert len(df) == 2
@@ -90,12 +94,14 @@ def test_fetch_company_news_filters_out_anything_older_than_since_hours(monkeypa
 
 
 def test_fetch_company_news_decodes_html_entities(monkeypatch):
+    recent_ts = int((dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=1)).timestamp())
+
     def fake_get(url, params=None, timeout=None):
         return _FakeResponse(
             [
                 {
                     "id": 1,
-                    "datetime": 1758000000,
+                    "datetime": recent_ts,
                     "headline": "Designates ChatGPT As &#39;Very Large Online Search Engine&#39;",
                     "summary": "The CEO said it &#39;exceeded expectations&#39;.",
                 }
@@ -105,7 +111,7 @@ def test_fetch_company_news_decodes_html_entities(monkeypatch):
     monkeypatch.setattr(finnhub, "finnhub_get", fake_get)
     monkeypatch.setattr(finnhub.settings, "finnhub_api_key", "test-key")
 
-    df = finnhub.fetch_company_news(["AAPL"], since_hours=24 * 365)
+    df = finnhub.fetch_company_news(["AAPL"], since_hours=24)
 
     assert df.iloc[0]["headline"] == "Designates ChatGPT As 'Very Large Online Search Engine'"
     assert df.iloc[0]["summary"] == "The CEO said it 'exceeded expectations'."
@@ -114,17 +120,51 @@ def test_fetch_company_news_decodes_html_entities(monkeypatch):
 def test_fetch_company_news_skips_a_symbol_that_errors_instead_of_losing_the_whole_batch(monkeypatch):
     import requests
 
+    recent_ts = int((dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=1)).timestamp())
+
     def fake_get(url, params=None, timeout=None):
         if params["symbol"] == "BAD":
             raise requests.exceptions.ConnectionError("read timed out")
-        return _FakeResponse([{"id": 1, "datetime": 1758000000, "headline": "ok", "summary": ""}])
+        return _FakeResponse([{"id": 1, "datetime": recent_ts, "headline": "ok", "summary": ""}])
 
     monkeypatch.setattr(finnhub, "finnhub_get", fake_get)
     monkeypatch.setattr(finnhub.settings, "finnhub_api_key", "test-key")
 
-    df = finnhub.fetch_company_news(["SPY", "BAD", "QQQ"], since_hours=24 * 365, sleep_seconds=0)
+    df = finnhub.fetch_company_news(["SPY", "BAD", "QQQ"], since_hours=24, sleep_seconds=0)
 
     assert set(df["symbol"]) == {"SPY", "QQQ"}
+
+
+def test_fetch_company_news_clamps_since_hours_to_the_max_news_age(monkeypatch):
+    """
+    A caller passing a since_hours far beyond _MAX_NEWS_AGE_HOURS (e.g. a
+    historical backfill script) must still only get back news from the last
+    7 days -- older news isn't worth scoring or keeping for this swing-
+    trading system, and the cap is enforced at ingestion regardless of what
+    the caller asks for.
+    """
+    too_old_ts = int((dt.datetime.now(tz=dt.UTC) - dt.timedelta(days=30)).timestamp())
+    recent_ts = int((dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=1)).timestamp())
+
+    def fake_get(url, params=None, timeout=None):
+        # The date range requested from Finnhub itself must also be
+        # clamped, not just the post-fetch filter -- confirm "from" isn't
+        # anywhere near 365 days back.
+        requested_from = dt.date.fromisoformat(params["from"])
+        assert (dt.datetime.now(tz=dt.UTC).date() - requested_from).days <= finnhub._MAX_NEWS_AGE_HOURS // 24 + 1
+        return _FakeResponse(
+            [
+                {"id": 1, "datetime": too_old_ts, "headline": "too old", "summary": ""},
+                {"id": 2, "datetime": recent_ts, "headline": "recent enough", "summary": ""},
+            ]
+        )
+
+    monkeypatch.setattr(finnhub, "finnhub_get", fake_get)
+    monkeypatch.setattr(finnhub.settings, "finnhub_api_key", "test-key")
+
+    df = finnhub.fetch_company_news(["AAPL"], since_hours=24 * 365)
+
+    assert list(df["headline"]) == ["recent enough"]
 
 
 def test_fetch_company_news_without_a_key_returns_empty_and_does_not_call_out(monkeypatch):
@@ -139,6 +179,8 @@ def test_fetch_company_news_without_a_key_returns_empty_and_does_not_call_out(mo
 
 
 def test_fetch_sec_filings_shapes_finnhub_response(monkeypatch):
+    recent_date = (dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+
     def fake_get(url, params=None, timeout=None):
         assert url == finnhub.FINNHUB_FILINGS_URL
         return _FakeResponse(
@@ -148,7 +190,7 @@ def test_fetch_sec_filings_shapes_finnhub_response(monkeypatch):
                     "symbol": params["symbol"],
                     "cik": "320193",
                     "form": "8-K",
-                    "filedDate": "2026-09-08 06:14:21",
+                    "filedDate": recent_date,
                     "reportUrl": "https://www.sec.gov/ix?doc=/Archives/edgar/data/320193/report.htm",
                     "filingUrl": "https://www.sec.gov/Archives/edgar/data/320193/index.html",
                 }
@@ -158,7 +200,7 @@ def test_fetch_sec_filings_shapes_finnhub_response(monkeypatch):
     monkeypatch.setattr(finnhub, "finnhub_get", fake_get)
     monkeypatch.setattr(finnhub.settings, "finnhub_api_key", "test-key")
 
-    df = finnhub.fetch_sec_filings(["AAPL"], since_hours=24 * 365)
+    df = finnhub.fetch_sec_filings(["AAPL"], since_hours=24)
 
     assert len(df) == 1
     row = df.iloc[0]
@@ -169,13 +211,15 @@ def test_fetch_sec_filings_shapes_finnhub_response(monkeypatch):
 
 
 def test_fetch_sec_filings_falls_back_to_filing_url_when_no_report_url(monkeypatch):
+    recent_date = (dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+
     def fake_get(url, params=None, timeout=None):
         return _FakeResponse(
             [
                 {
                     "accessNumber": "0001193125-20-050885",
                     "form": "NT 10-K",
-                    "filedDate": "2026-09-08 06:14:21",
+                    "filedDate": recent_date,
                     "filingUrl": "https://www.sec.gov/Archives/edgar/data/320193/other-index.html",
                 }
             ]
@@ -184,7 +228,7 @@ def test_fetch_sec_filings_falls_back_to_filing_url_when_no_report_url(monkeypat
     monkeypatch.setattr(finnhub, "finnhub_get", fake_get)
     monkeypatch.setattr(finnhub.settings, "finnhub_api_key", "test-key")
 
-    df = finnhub.fetch_sec_filings(["AAPL"], since_hours=24 * 365)
+    df = finnhub.fetch_sec_filings(["AAPL"], since_hours=24)
 
     assert df.iloc[0]["summary"] == "https://www.sec.gov/Archives/edgar/data/320193/other-index.html"
 

@@ -203,12 +203,21 @@ def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
 
 
 def backfill_unscored_news(batch_size: int = 500) -> int:
-    """Pull rows from news_events where sentiment IS NULL, score them, write back."""
+    """
+    Pull rows from news_events where sentiment IS NULL, score them, write back.
+
+    Newest first: the dashboard, contradiction monitor, and screener only
+    ever look at recent news, so a large backlog of older unscored rows
+    (e.g. right after a full historical re-ingest) must never sit ahead of
+    today's headlines in the queue -- that would leave exactly the news
+    everything downstream actually cares about stuck showing "unscored"
+    indefinitely while Claude calls burn through old backlog first.
+    """
     engine = get_engine()
     query = """
         SELECT id, ts, symbol, headline, summary FROM news_events
         WHERE sentiment IS NULL
-        ORDER BY ts
+        ORDER BY ts DESC
         LIMIT %(limit)s
     """
     df = pd.read_sql(query, engine, params={"limit": int(batch_size)})

@@ -55,6 +55,15 @@ DEFAULT_SLEEP_SECONDS = 1.1
 
 _NEWS_COLUMNS = ["id", "symbol", "ts", "headline", "summary", "source"]
 
+# Nothing older than this is worth scoring or keeping: this is a swing-
+# trading system whose holds typically resolve in days, not weeks (see
+# execution/contradiction_monitor.py's docstring), and sentiment_backfill
+# scores newest-first anyway, so week-plus-old news would just burn Claude
+# calls on stories nothing downstream still cares about. Enforced here, at
+# ingestion, regardless of what since_hours a caller passes -- cheaper to
+# never write the row than to filter it out later.
+_MAX_NEWS_AGE_HOURS = 24 * 7
+
 
 def finnhub_configured() -> bool:
     """
@@ -110,6 +119,7 @@ def fetch_company_news(symbols: list[str], since_hours: int, sleep_seconds: floa
         )
         return pd.DataFrame(columns=_NEWS_COLUMNS)
 
+    since_hours = min(since_hours, _MAX_NEWS_AGE_HOURS)
     since = dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=since_hours)
     today = dt.datetime.now(tz=dt.UTC).date()
     rows: list[dict] = []
@@ -163,6 +173,7 @@ def fetch_sec_filings(symbols: list[str], since_hours: int, sleep_seconds: float
         logger.warning("FINNHUB_API_KEY is not set — skipping SEC filings for %s symbol(s).", len(symbols))
         return pd.DataFrame(columns=_NEWS_COLUMNS)
 
+    since_hours = min(since_hours, _MAX_NEWS_AGE_HOURS)
     since = dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=since_hours)
     today = dt.datetime.now(tz=dt.UTC).date()
     rows: list[dict] = []
