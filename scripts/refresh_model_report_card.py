@@ -56,6 +56,11 @@ def refresh_model_report_card(as_of_date: dt.date | None = None) -> dict:
     snapshot = compute_report_card(decisions, prices, horizon_bars=settings.target_horizon_days, as_of_date=as_of_date)
 
     row = pd.DataFrame([{**snapshot, "as_of_date": as_of_date}])
+    # hit_rate/avg_realized_return are None until the system's first real
+    # trade matures -- pandas would otherwise infer an all-None column as
+    # object/TEXT rather than DOUBLE PRECISION when staging the upsert.
+    row["hit_rate"] = row["hit_rate"].astype("float64")
+    row["avg_realized_return"] = row["avg_realized_return"].astype("float64")
     upsert_dataframe(row, table="model_report_card_history", conflict_cols=["as_of_date"])
     return snapshot
 
