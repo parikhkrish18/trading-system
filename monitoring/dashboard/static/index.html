@@ -81,6 +81,28 @@
       </div>
     </section>
 
+    <section id="trade-log-section">
+      <h2>Trade Log <span class="muted">(raw data — every executed decision, for study)</span></h2>
+      <div class="summary-row">
+        <button id="trade-log-prev" class="btn btn-secondary">&larr; Prev</button>
+        <span id="trade-log-page-info" class="muted"></span>
+        <button id="trade-log-next" class="btn btn-secondary">Next &rarr;</button>
+        <a id="trade-log-export" class="btn btn-secondary" href="/api/trades/log/export">Download full CSV</a>
+      </div>
+      <div class="table-wrap">
+        <table id="trade-log-table">
+          <thead>
+            <tr>
+              <th></th><th>Date</th><th>Symbol</th><th>Direction</th><th>Forecast</th>
+              <th>Regime</th><th>Confidence</th><th>Outcome</th><th>Realized return</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="trade-log-detail"></div>
+    </section>
+
     <section id="breakers-section">
       <h2>Circuit Breakers</h2>
       <div id="breakers-list" class="breakers-grid"></div>
@@ -103,17 +125,16 @@
     </section>
 
     <section id="analysis-section">
-      <h2>Model Analysis <span class="muted">(walk-forward folds)</span></h2>
+      <h2>Model Analysis <span class="muted">(forward test — real trades only, by month)</span></h2>
       <div class="chart-box">
-        <h3>Directional accuracy over time</h3>
+        <h3>Success rate over time</h3>
         <div id="analysis-chart"></div>
       </div>
       <div class="table-wrap">
         <table id="analysis-table">
           <thead>
             <tr>
-              <th>Fold</th><th>Feature set</th><th>Test window</th>
-              <th>MAE</th><th>RMSE</th><th>Dir. acc.</th><th>Dir. acc. (confident)</th><th>% confident</th>
+              <th>Month</th><th>Graded</th><th>Success rate</th><th>Avg. realized return</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -122,13 +143,8 @@
     </section>
 
     <section id="report-card-section">
-      <h2>Model Report Card <span class="muted">(walk-forward folds, plain English)</span></h2>
+      <h2>Model Report Card <span class="muted">(forward test, plain English)</span></h2>
       <div class="summary-row" id="report-card-summary"></div>
-      <div class="chart-box">
-        <h3>Directional accuracy per fold — all predictions vs. only when the models agreed</h3>
-        <div id="report-card-chart"></div>
-      </div>
-      <div id="report-card-callouts"></div>
     </section>
 
     <section id="drift-section">

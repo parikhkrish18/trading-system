@@ -168,56 +168,6 @@ function renderLineChart(
   wrap.addEventListener("touchend", hide);
 }
 
-// Grouped bar chart for the report card — same hand-rolled SVG approach as
-// renderLineChart. `rows`: [{fold_label, series, accuracy}], long form.
-function renderGroupedBarChart(container, rows, { height = 180, colors = { [0]: "#5b8cff", [1]: "#26a65b" } } = {}) {
-  container.innerHTML = "";
-  if (!rows || rows.length === 0) {
-    container.innerHTML = '<div class="empty-state">No fold metrics recorded yet.</div>';
-    return;
-  }
-  const width = 600;
-  const pad = 8;
-  const labelBand = 16;
-  const folds = [...new Set(rows.map((r) => r.fold_label))];
-  const seriesNames = [...new Set(rows.map((r) => r.series))];
-  const groupWidth = (width - pad * 2) / folds.length;
-  const barWidth = Math.min(24, (groupWidth - 6) / seriesNames.length);
-  const plotHeight = height - pad * 2 - labelBand;
-
-  const bars = rows
-    .map((r) => {
-      const gi = folds.indexOf(r.fold_label);
-      const si = seriesNames.indexOf(r.series);
-      const h = Math.max(1, plotHeight * Math.min(Math.max(r.accuracy, 0), 1));
-      const x = pad + gi * groupWidth + (groupWidth - barWidth * seriesNames.length) / 2 + si * barWidth;
-      const y = pad + plotHeight - h;
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(barWidth - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="${colors[si] || "#5b8cff"}"><title>${r.fold_label} — ${r.series}: ${(r.accuracy * 100).toFixed(1)}%</title></rect>`;
-    })
-    .join("");
-
-  const fiftyY = pad + plotHeight * 0.5;
-  const labels = folds
-    .map((f, gi) => {
-      const x = pad + gi * groupWidth + groupWidth / 2;
-      return `<text x="${x.toFixed(1)}" y="${height - 4}" text-anchor="middle" font-size="10" fill="#8b92a6">${f}</text>`;
-    })
-    .join("");
-
-  const legend = seriesNames
-    .map((name, si) => `<span class="legend-item"><span class="legend-swatch" style="background:${colors[si] || "#5b8cff"}"></span>${name}</span>`)
-    .join(" ");
-
-  container.innerHTML = `
-    <svg viewBox="0 0 ${width} ${height}">
-      <line x1="${pad}" y1="${fiftyY}" x2="${width - pad}" y2="${fiftyY}" stroke="#8b92a6" stroke-dasharray="3,3" stroke-width="1" />
-      <text x="${width - pad}" y="${fiftyY - 3}" text-anchor="end" font-size="9" fill="#8b92a6">coin flip (50%)</text>
-      ${bars}
-      ${labels}
-    </svg>
-    <div class="muted" style="font-size:11px;margin-top:4px;">${legend}</div>`;
-}
-
 // ---------- True report card (cumulative, real decisions only) ----------
 async function loadTrueReportCard() {
   const result = await fetchJSON("/api/analysis/true_report_card");
@@ -246,22 +196,18 @@ async function loadTrueReportCard() {
 async function loadReportCard() {
   const result = await fetchJSON("/api/analysis/report_card");
   const summary = document.getElementById("report-card-summary");
-  const callouts = document.getElementById("report-card-callouts");
   if (!result.available) {
-    summary.innerHTML = '<div class="empty-state">No training runs found in MLflow yet — run models/train.py to grade the model.</div>';
-    renderGroupedBarChart(document.getElementById("report-card-chart"), []);
-    callouts.innerHTML = "";
+    summary.innerHTML =
+      '<div class="empty-state">No matured real (paper/live) decisions yet — needs a price bar after the decision.</div>';
     return;
   }
   const h = result.headline;
   summary.innerHTML = `
-    <div class="stat-card"><div class="value">${h.n_folds}</div><div class="label">Folds graded</div></div>
-    <div class="stat-card"><div class="value">${fmt.pct(h.directional_accuracy, 1)}</div><div class="label">Direction right (all predictions)</div></div>
-    <div class="stat-card"><div class="value">${fmt.pct(h.directional_accuracy_when_confident, 1)}</div><div class="label">Direction right (models agreed)</div></div>
-    <div class="stat-card"><div class="value">${fmt.pct(h.pct_rows_confident, 1)}</div><div class="label">Share clearing the agreement bar</div></div>
+    <div class="stat-card"><div class="value">${h.n_months}</div><div class="label">Months graded</div></div>
+    <div class="stat-card"><div class="value">${h.n_graded}</div><div class="label">Decisions graded</div></div>
+    <div class="stat-card"><div class="value">${fmt.pct(h.success_rate, 1)}</div><div class="label">Success rate (all-time)</div></div>
+    <div class="stat-card"><div class="value">${fmt.pct(h.avg_realized_return, 2)}</div><div class="label">Avg. realized return</div></div>
   `;
-  renderGroupedBarChart(document.getElementById("report-card-chart"), result.chart);
-  callouts.innerHTML = result.callouts.map((c) => `<div class="callout">${c}</div>`).join("");
 }
 
 // ---------- Positions ----------
@@ -609,6 +555,81 @@ async function loadClosedTrades() {
     .join("");
 }
 
+// ---------- Trade log: raw, one-row-per-executed-decision study data ----------
+const TRADE_LOG_PAGE_SIZE = 20;
+let tradeLogOffset = 0;
+let tradeLogTotal = 0;
+
+async function loadTradeLog(offset = 0) {
+  tradeLogOffset = offset;
+  const result = await fetchJSON(`/api/trades/log?limit=${TRADE_LOG_PAGE_SIZE}&offset=${offset}`);
+  tradeLogTotal = result.total;
+  const tbody = document.querySelector("#trade-log-table tbody");
+  document.getElementById("trade-log-detail").innerHTML = "";
+
+  if (result.rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No executed trades logged yet.</td></tr>';
+  } else {
+    tbody.innerHTML = result.rows
+      .map((r) => {
+        const outcome = r.hit === null || r.hit === undefined ? "pending" : r.hit ? "hit" : "miss";
+        const outcomeClass = outcome === "hit" ? "pl-pos" : outcome === "miss" ? "pl-neg" : "";
+        return `
+        <tr>
+          <td><button class="btn btn-secondary trade-log-expand-btn" data-id="${r.id}">Expand</button></td>
+          <td>${fmt.time(r.ts)}</td>
+          <td><strong>${escapeHTML(r.symbol)}</strong></td>
+          <td><span class="side-badge ${r.direction}">${escapeHTML(r.direction)}</span></td>
+          <td>${fmt.pct(r.forecast)}</td>
+          <td>${escapeHTML(r.regime ?? "—")}</td>
+          <td>${fmt.pct(r.direction_agreement, 0)}</td>
+          <td class="${outcomeClass}">${outcome}</td>
+          <td>${fmt.pct(r.realized_return, 2)}</td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  const shown = result.rows.length;
+  const from = shown === 0 ? 0 : offset + 1;
+  document.getElementById("trade-log-page-info").textContent = `${from}–${offset + shown} of ${tradeLogTotal}`;
+  document.getElementById("trade-log-prev").disabled = offset === 0;
+  document.getElementById("trade-log-next").disabled = offset + shown >= tradeLogTotal;
+}
+
+async function showTradeLogDetail(id) {
+  const box = document.getElementById("trade-log-detail");
+  box.innerHTML = '<div class="empty-state">Loading…</div>';
+  const r = await fetchJSON(`/api/trades/log/${id}`);
+
+  const featureEntries = Object.entries(r.features || {});
+  const featureRows = featureEntries
+    .map(([name, value]) => `<tr><td>${escapeHTML(name)}</td><td>${fmt.num(value, 4)}</td></tr>`)
+    .join("");
+
+  box.innerHTML = `
+    <div class="chart-box">
+      <h3>${escapeHTML(r.symbol)} — ${fmt.time(r.ts)} (decision #${r.id})</h3>
+      <p class="muted">Model reasoning</p>
+      ${reasoningPhasesHTML(r.reasoning)}
+      <p class="muted">Full feature vector (${featureEntries.length})</p>
+      <div class="table-wrap"><table><tbody>${featureRows || '<tr><td class="empty-state">No stored feature snapshot matches this decision\'s timestamp.</td></tr>'}</tbody></table></div>
+      <p class="muted">Nearby headlines (approximate, +/- 3 days)</p>
+      ${newsFeedHTML(r.nearby_headlines)}
+    </div>`;
+}
+
+document.getElementById("trade-log-prev").addEventListener("click", () => {
+  loadTradeLog(Math.max(0, tradeLogOffset - TRADE_LOG_PAGE_SIZE));
+});
+document.getElementById("trade-log-next").addEventListener("click", () => {
+  if (tradeLogOffset + TRADE_LOG_PAGE_SIZE < tradeLogTotal) loadTradeLog(tradeLogOffset + TRADE_LOG_PAGE_SIZE);
+});
+document.querySelector("#trade-log-table tbody").addEventListener("click", (e) => {
+  const btn = e.target.closest(".trade-log-expand-btn");
+  if (btn) showTradeLogDetail(btn.dataset.id);
+});
+
 // ---------- Feature importance over time ----------
 async function loadFeatureImportance() {
   const rows = await fetchJSON("/api/analysis/feature_frequency");
@@ -699,7 +720,8 @@ async function loadAnalysis() {
   const rows = await fetchJSON("/api/analysis/runs");
   const tbody = document.querySelector("#analysis-table tbody");
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No walk-forward runs recorded yet — run `python -m models.train`.</td></tr>';
+    tbody.innerHTML =
+      '<tr><td colspan="4" class="empty-state">No matured real (paper/live) decisions yet — needs a price bar after the decision.</td></tr>';
     renderLineChart(document.getElementById("analysis-chart"), []);
     return;
   }
@@ -707,21 +729,17 @@ async function loadAnalysis() {
     .map(
       (r) => `
       <tr>
-        <td>${r.fold_id ?? "—"}</td>
-        <td>${r.feature_set_id ?? "—"}</td>
-        <td>${(r.test_start || "").slice(0, 10)} → ${(r.test_end || "").slice(0, 10)}</td>
-        <td>${fmt.num(r.mae, 4)}</td>
-        <td>${fmt.num(r.rmse, 4)}</td>
-        <td>${fmt.pct(r.directional_accuracy, 1)}</td>
-        <td>${fmt.pct(r.directional_accuracy_when_confident, 1)}</td>
-        <td>${fmt.pct(r.pct_rows_confident, 1)}</td>
+        <td>${r.month}</td>
+        <td>${r.n_graded}</td>
+        <td>${fmt.pct(r.success_rate, 1)}</td>
+        <td>${fmt.pct(r.avg_realized_return, 2)}</td>
       </tr>`
     )
     .join("");
 
   renderLineChart(
     document.getElementById("analysis-chart"),
-    rows.filter((r) => r.directional_accuracy !== null).map((r) => ({ y: r.directional_accuracy, label: r.start_time })),
+    rows.map((r) => ({ y: r.success_rate, label: r.month })),
     { color: "#26a65b", zeroLine: false, valueFmt: (v) => fmt.pct(v, 1) }
   );
 }
@@ -1377,6 +1395,7 @@ async function loadAll() {
     loadMarketStatus(),
     loadPositions(),
     loadClosedTrades(),
+    loadTradeLog(),
     loadEquity(),
     loadAccountOverview(),
     loadBreakers(),

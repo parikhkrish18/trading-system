@@ -195,30 +195,23 @@ def test_analysis_runs_endpoint_empty(monkeypatch, client):
 
 
 def test_analysis_runs_endpoint_returns_records(monkeypatch, client):
-    df = pd.DataFrame(
-        {
-            "fold_id": [0],
-            "feature_set_id": ["v3"],
-            "train_start": pd.to_datetime(["2024-01-01"], utc=True),
-            "train_end": pd.to_datetime(["2025-01-01"], utc=True),
-            "test_start": pd.to_datetime(["2025-01-01"], utc=True),
-            "test_end": pd.to_datetime(["2025-07-01"], utc=True),
-            "mae": [0.03],
-            "rmse": [0.05],
-            "directional_accuracy": [0.52],
-            "directional_accuracy_when_confident": [0.53],
-            "pct_rows_confident": [0.9],
-            "mean_ensemble_std": [0.01],
-            "start_time": pd.to_datetime(["2026-07-28"], utc=True),
-        }
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)
+    decisions = pd.DataFrame(
+        {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z"]), "forecast": [0.5], "mode": ["paper"]}
     )
+    prices = pd.DataFrame(
+        {"symbol": ["AAPL", "AAPL"], "ts": pd.to_datetime(["2026-07-27T00:00:00Z", "2026-07-28T00:00:00Z"]), "close": [100.0, 105.0]}
+    )
+    calls = iter([decisions, prices])
     monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
     resp = client.get("/api/analysis/runs")
     body = resp.json()
-    assert body[0]["fold_id"] == 0
-    assert body[0]["directional_accuracy"] == pytest.approx(0.52)
+    assert body[0]["month"] == "2026-07"
+    assert body[0]["n_graded"] == 1
+    assert body[0]["success_rate"] == pytest.approx(1.0)
+    assert body[0]["avg_realized_return"] == pytest.approx(0.05)
 
 
 def test_live_accuracy_no_decisions_returns_null_hit_rate(monkeypatch, client):
@@ -524,6 +517,157 @@ def test_closed_trades_still_open_position_is_not_a_trade(monkeypatch, client):
     assert resp.json() == []
 
 
+# --------------------------------------------------------------------------
+# Trade log: raw, one-row-per-executed-decision study data
+# --------------------------------------------------------------------------
+
+
+def test_trade_log_endpoint_returns_graded_rows_with_direction(monkeypatch, client):
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)
+    decisions = pd.DataFrame(
+        [
+            {
+                "id": 1, "symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "feature_set_id": "v4",
+                "model_version": "v1", "forecast": 0.5, "regime": "trending", "target_position": 0.3,
+                "executed_position": 0.3, "mode": "paper", "reasoning": None, "direction_agreement": 0.9,
+                "approval_status": "auto", "take_profit_pct": 0.1, "stop_loss_pct": 0.05,
+            }
+        ]
+    )
+    prices = pd.DataFrame(
+        {"symbol": ["AAPL", "AAPL"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]), "close": [100.0, 105.0]}
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/log")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    row = body["rows"][0]
+    assert row["symbol"] == "AAPL"
+    assert row["direction"] == "long"
+    assert row["hit"] is True
+    assert "reasoning" not in row  # kept out of the list view -- see /api/trades/log/{id}
+
+
+def test_trade_log_endpoint_includes_a_close_as_its_own_row(monkeypatch, client):
+    decisions = pd.DataFrame(
+        [
+            {
+                "id": 2, "symbol": "AAPL", "ts": pd.Timestamp("2026-07-08T00:00:00Z"), "feature_set_id": "v4",
+                "model_version": "v1", "forecast": None, "regime": "trending", "target_position": 0.0,
+                "executed_position": 0.0, "mode": "paper", "reasoning": None, "direction_agreement": None,
+                "approval_status": "auto", "take_profit_pct": None, "stop_loss_pct": None,
+            }
+        ]
+    )
+    prices = pd.DataFrame(columns=["symbol", "ts", "close"])
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/log")
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["rows"][0]["direction"] == "close"
+
+
+def test_trade_log_endpoint_paginates(monkeypatch, client):
+    rows = [
+        {
+            "id": i, "symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z") + pd.Timedelta(days=i),
+            "feature_set_id": "v4", "model_version": "v1", "forecast": 0.5, "regime": "trending",
+            "target_position": 0.3, "executed_position": 0.3, "mode": "paper", "reasoning": None,
+            "direction_agreement": None, "approval_status": "auto", "take_profit_pct": None, "stop_loss_pct": None,
+        }
+        for i in range(5)
+    ]
+    decisions = pd.DataFrame(rows)
+    prices = pd.DataFrame(columns=["symbol", "ts", "close"])
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/log", params={"limit": 2, "offset": 1})
+    body = resp.json()
+    assert body["total"] == 5
+    assert len(body["rows"]) == 2
+
+
+def test_trade_log_endpoint_no_decisions_returns_empty(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
+
+    resp = client.get("/api/trades/log")
+    assert resp.json() == {"total": 0, "rows": []}
+
+
+def test_trade_log_detail_endpoint_returns_reasoning_features_and_headlines(monkeypatch, client):
+    reasoning = json.dumps([{"phase": 2, "title": "x", "summary": "x", "lines": []}])
+    decision_row = pd.DataFrame(
+        [
+            {
+                "id": 7, "symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "feature_set_id": "v4",
+                "model_version": "v1", "forecast": 0.5, "regime": "trending", "target_position": 0.3,
+                "executed_position": 0.3, "mode": "paper", "reasoning": reasoning, "direction_agreement": 0.9,
+                "approval_status": "auto", "take_profit_pct": 0.1, "stop_loss_pct": 0.05,
+            }
+        ]
+    )
+    features_long = pd.DataFrame({"feature_name": ["mom_ret_20d"], "value": [0.08]})
+    news = pd.DataFrame(
+        {"ts": pd.to_datetime(["2026-07-01T12:00:00Z"]), "headline": ["AAPL rallies"], "source": ["wire"], "sentiment": [0.4]}
+    )
+    calls = iter([decision_row, features_long, news])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/log/7")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["direction"] == "long"
+    assert body["reasoning"][0]["phase"] == 2
+    assert body["features"] == {"mom_ret_20d": 0.08}
+    assert body["nearby_headlines"][0]["headline"] == "AAPL rallies"
+
+
+def test_trade_log_detail_endpoint_404_for_unknown_id(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
+
+    resp = client.get("/api/trades/log/999")
+    assert resp.status_code == 404
+
+
+def test_trade_log_export_endpoint_returns_csv_with_feature_and_headline_columns(monkeypatch, client):
+    decisions = pd.DataFrame(
+        [
+            {
+                "id": 1, "symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "feature_set_id": "v4",
+                "model_version": "v1", "forecast": 0.5, "regime": "trending", "target_position": 0.3,
+                "executed_position": 0.3, "mode": "paper", "reasoning": None, "direction_agreement": 0.9,
+                "approval_status": "auto", "take_profit_pct": 0.1, "stop_loss_pct": 0.05,
+            }
+        ]
+    )
+    prices = pd.DataFrame(columns=["symbol", "ts", "close"])
+    features_long = pd.DataFrame(
+        {"symbol": ["AAPL"], "feature_set_id": ["v4"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z"]), "feature_name": ["mom_ret_20d"], "value": [0.08]}
+    )
+    news = pd.DataFrame({"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-01T12:00:00Z"]), "headline": ["AAPL rallies"]})
+    calls = iter([decisions, prices, features_long, news])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/log/export")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    assert "feat_mom_ret_20d" in resp.text
+    assert "AAPL rallies" in resp.text
+
+
 def test_positions_news_returns_empty_when_nothing_held(monkeypatch, client):
     class _NoPositionsBroker:
         def get_positions(self):
@@ -800,51 +944,55 @@ def test_feature_frequency_skips_old_decisions_without_top_features(monkeypatch,
 # --- model report card ------------------------------------------------------
 
 
-def _fold_run(fold_id, accuracy, confident_accuracy, pct_confident):
-    return {
-        "run_name": f"fold_{fold_id}",
-        "fold_id": str(fold_id),
-        "metrics": {
-            "directional_accuracy": accuracy,
-            "directional_accuracy_when_confident": confident_accuracy,
-            "pct_rows_confident": pct_confident,
-            "mae": 0.01,
-            "rmse": 0.02,
-        },
-    }
-
-
-def test_report_card_endpoint_folds_metrics_into_headline_chart_and_callouts(monkeypatch, client):
-    runs = [_fold_run(2, 0.60, 0.70, 0.5), _fold_run(1, 0.50, 0.60, 0.5)]
-    monkeypatch.setattr(server.report_card, "fetch_fold_runs", lambda: runs)
+def test_report_card_endpoint_folds_real_decisions_into_an_all_time_headline(monkeypatch, client):
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)
+    decisions = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "MSFT"],
+            "ts": pd.to_datetime(["2026-07-27T00:00:00Z", "2026-08-10T00:00:00Z"]),
+            "forecast": [0.5, -0.3],
+            "mode": ["paper", "paper"],
+        }
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL", "MSFT", "MSFT"],
+            "ts": pd.to_datetime(
+                ["2026-07-27T00:00:00Z", "2026-07-28T00:00:00Z", "2026-08-10T00:00:00Z", "2026-08-11T00:00:00Z"]
+            ),
+            "close": [100.0, 105.0, 200.0, 190.0],
+        }
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
     resp = client.get("/api/analysis/report_card")
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["available"] is True
-    assert body["headline"]["n_folds"] == 2
-    assert body["headline"]["directional_accuracy"] == pytest.approx(0.55)
-    # two folds x two series = four bars
-    assert len(body["chart"]) == 4
-    assert len(body["callouts"]) == 2
-    assert any("models agreed" in c for c in body["callouts"])
+    assert body["headline"]["n_months"] == 2
+    assert body["headline"]["n_graded"] == 2
+    assert body["headline"]["success_rate"] == pytest.approx(1.0)  # both AAPL up and MSFT down calls hit
 
 
-def test_report_card_endpoint_is_empty_not_500_when_the_fold_query_fails(monkeypatch, client):
-    def _down():
-        raise ConnectionError("walk_forward_folds unreachable")
+def test_report_card_endpoint_is_empty_not_500_when_the_decision_query_fails(monkeypatch, client):
+    def _down(*a, **k):
+        raise ConnectionError("decisions unreachable")
 
-    monkeypatch.setattr(server.report_card, "fetch_fold_runs", _down)
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", _down)
 
     resp = client.get("/api/analysis/report_card")
 
     assert resp.status_code == 200
-    assert resp.json() == {"available": False, "headline": None, "chart": [], "callouts": []}
+    assert resp.json() == {"available": False, "headline": None}
 
 
-def test_report_card_endpoint_unavailable_when_no_runs(monkeypatch, client):
-    monkeypatch.setattr(server.report_card, "fetch_fold_runs", lambda: [])
+def test_report_card_endpoint_unavailable_when_no_decisions(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
 
     resp = client.get("/api/analysis/report_card")
 

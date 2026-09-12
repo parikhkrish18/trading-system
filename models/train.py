@@ -236,14 +236,16 @@ def load_training_frame(
 
 def _write_fold_result(model_name: str, feature_set_id: str, fold, row: dict) -> None:
     """
-    Persists one fold's results for the dashboard's Model Analysis / Model
-    Report Card panels (monitoring/dashboard/report_card.py, server.py) --
-    replaces the previous per-fold mlflow.log_metrics call. Written straight
-    to Postgres (the database this whole app already depends on) rather than
-    a separate always-on MLflow service: one row per fold is all either
-    panel has ever shown, so there was never a need for a full tracking
-    server, and it's one less service that can go to sleep and time out a
-    training run (see the walk-forward-job crash this replaces).
+    Persists one fold's walk-forward results -- a fast, pre-deployment sanity
+    check on a candidate model against 2 years of held-out history, not
+    something the live dashboard reports as "how accurate is the model"
+    (see monitoring/forward_test.py for that; it reports on real decisions
+    instead). Replaces the previous per-fold mlflow.log_metrics call.
+    Written straight to Postgres (the database this whole app already
+    depends on) rather than a separate always-on MLflow service: one row per
+    fold is all this has ever needed, so there was never a need for a full
+    tracking server, and it's one less service that can go to sleep and
+    time out a training run (see the walk-forward-job crash this replaces).
     """
     pd.DataFrame(
         [
