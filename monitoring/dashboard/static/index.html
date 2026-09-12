@@ -103,17 +103,16 @@
     </section>
 
     <section id="analysis-section">
-      <h2>Model Analysis <span class="muted">(walk-forward folds)</span></h2>
+      <h2>Model Analysis <span class="muted">(forward test — real trades only, by month)</span></h2>
       <div class="chart-box">
-        <h3>Directional accuracy over time</h3>
+        <h3>Success rate over time</h3>
         <div id="analysis-chart"></div>
       </div>
       <div class="table-wrap">
         <table id="analysis-table">
           <thead>
             <tr>
-              <th>Fold</th><th>Feature set</th><th>Test window</th>
-              <th>MAE</th><th>RMSE</th><th>Dir. acc.</th><th>Dir. acc. (confident)</th><th>% confident</th>
+              <th>Month</th><th>Graded</th><th>Success rate</th><th>Avg. realized return</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -122,13 +121,8 @@
     </section>
 
     <section id="report-card-section">
-      <h2>Model Report Card <span class="muted">(walk-forward folds, plain English)</span></h2>
+      <h2>Model Report Card <span class="muted">(forward test, plain English)</span></h2>
       <div class="summary-row" id="report-card-summary"></div>
-      <div class="chart-box">
-        <h3>Directional accuracy per fold — all predictions vs. only when the models agreed</h3>
-        <div id="report-card-chart"></div>
-      </div>
-      <div id="report-card-callouts"></div>
     </section>
 
     <section id="drift-section">
