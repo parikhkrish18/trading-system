@@ -478,3 +478,51 @@ def test_backfill_unscored_news_survives_a_response_missing_one_id(monkeypatch, 
     assert scored.sentiment_relevant is True
     assert missing.sentiment is None  # left unscored, not crashed on and not fabricated
     assert missing.sentiment_relevant is None
+
+
+def test_backfill_unscored_news_scores_the_newest_rows_first_when_backlog_exceeds_batch_size(monkeypatch):
+    """
+    The dashboard, contradiction monitor, and screener only ever look at
+    recent news -- a big backlog of older unscored rows must never sit
+    ahead of today's headlines in the queue. With batch_size smaller than
+    the unscored backlog, only the newest rows should be sent to Claude at
+    all; the oldest row must be left untouched (still sentiment IS NULL).
+    """
+    engine = get_engine()
+    rows = pd.DataFrame(
+        {
+            "id": [900201, 900202, 900203],
+            "symbol": ["ZZZTEST"] * 3,
+            "ts": pd.to_datetime(
+                ["2026-07-01T00:00:00Z", "2026-07-27T00:00:00Z", "2026-08-15T00:00:00Z"], utc=True
+            ),
+            "headline": ["oldest headline", "middle headline", "newest headline"],
+            "source": ["test-fixture"] * 3,
+        }
+    )
+    upsert_dataframe(rows, table="news_events", conflict_cols=["id"])
+
+    seen_ids = []
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        seen_ids.extend(item["id"] for item in items)
+        return json.dumps(
+            [{"id": item["id"], "sentiment": 0.1, "reason": "fine", "relevant": True} for item in items]
+        )
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+
+    try:
+        n = sentiment.backfill_unscored_news(batch_size=2)
+        assert n == 2
+        assert set(seen_ids) == {900203, 900202}  # newest two, oldest never even sent to Claude
+
+        with engine.connect() as conn:
+            oldest = conn.execute(
+                text("SELECT sentiment FROM news_events WHERE id = :id"), {"id": 900201}
+            ).fetchone()
+        assert oldest.sentiment is None  # left for a later run
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM news_events WHERE source = 'test-fixture'"))

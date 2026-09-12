@@ -150,8 +150,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full weekly universe-refresh + screen + trade pipeline.")
     parser.add_argument("--feature-set-id", required=True)
     parser.add_argument(
-        "--since-hours", type=int, default=24 * 8,
-        help="News lookback window — default covers a week plus a day of slack.",
+        "--since-hours", type=int, default=24 * 7,
+        help=(
+            "News lookback window — default covers a week. data/ingest/finnhub.py "
+            "hard-caps this at 7 days regardless, so a larger value here is a no-op."
+        ),
     )
     parser.add_argument(
         "--backfill-years", type=int, default=0,
