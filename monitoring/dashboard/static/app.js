@@ -555,6 +555,81 @@ async function loadClosedTrades() {
     .join("");
 }
 
+// ---------- Trade log: raw, one-row-per-executed-decision study data ----------
+const TRADE_LOG_PAGE_SIZE = 20;
+let tradeLogOffset = 0;
+let tradeLogTotal = 0;
+
+async function loadTradeLog(offset = 0) {
+  tradeLogOffset = offset;
+  const result = await fetchJSON(`/api/trades/log?limit=${TRADE_LOG_PAGE_SIZE}&offset=${offset}`);
+  tradeLogTotal = result.total;
+  const tbody = document.querySelector("#trade-log-table tbody");
+  document.getElementById("trade-log-detail").innerHTML = "";
+
+  if (result.rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No executed trades logged yet.</td></tr>';
+  } else {
+    tbody.innerHTML = result.rows
+      .map((r) => {
+        const outcome = r.hit === null || r.hit === undefined ? "pending" : r.hit ? "hit" : "miss";
+        const outcomeClass = outcome === "hit" ? "pl-pos" : outcome === "miss" ? "pl-neg" : "";
+        return `
+        <tr>
+          <td><button class="btn btn-secondary trade-log-expand-btn" data-id="${r.id}">Expand</button></td>
+          <td>${fmt.time(r.ts)}</td>
+          <td><strong>${escapeHTML(r.symbol)}</strong></td>
+          <td><span class="side-badge ${r.direction}">${escapeHTML(r.direction)}</span></td>
+          <td>${fmt.pct(r.forecast)}</td>
+          <td>${escapeHTML(r.regime ?? "—")}</td>
+          <td>${fmt.pct(r.direction_agreement, 0)}</td>
+          <td class="${outcomeClass}">${outcome}</td>
+          <td>${fmt.pct(r.realized_return, 2)}</td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  const shown = result.rows.length;
+  const from = shown === 0 ? 0 : offset + 1;
+  document.getElementById("trade-log-page-info").textContent = `${from}–${offset + shown} of ${tradeLogTotal}`;
+  document.getElementById("trade-log-prev").disabled = offset === 0;
+  document.getElementById("trade-log-next").disabled = offset + shown >= tradeLogTotal;
+}
+
+async function showTradeLogDetail(id) {
+  const box = document.getElementById("trade-log-detail");
+  box.innerHTML = '<div class="empty-state">Loading…</div>';
+  const r = await fetchJSON(`/api/trades/log/${id}`);
+
+  const featureEntries = Object.entries(r.features || {});
+  const featureRows = featureEntries
+    .map(([name, value]) => `<tr><td>${escapeHTML(name)}</td><td>${fmt.num(value, 4)}</td></tr>`)
+    .join("");
+
+  box.innerHTML = `
+    <div class="chart-box">
+      <h3>${escapeHTML(r.symbol)} — ${fmt.time(r.ts)} (decision #${r.id})</h3>
+      <p class="muted">Model reasoning</p>
+      ${reasoningPhasesHTML(r.reasoning)}
+      <p class="muted">Full feature vector (${featureEntries.length})</p>
+      <div class="table-wrap"><table><tbody>${featureRows || '<tr><td class="empty-state">No stored feature snapshot matches this decision\'s timestamp.</td></tr>'}</tbody></table></div>
+      <p class="muted">Nearby headlines (approximate, +/- 3 days)</p>
+      ${newsFeedHTML(r.nearby_headlines)}
+    </div>`;
+}
+
+document.getElementById("trade-log-prev").addEventListener("click", () => {
+  loadTradeLog(Math.max(0, tradeLogOffset - TRADE_LOG_PAGE_SIZE));
+});
+document.getElementById("trade-log-next").addEventListener("click", () => {
+  if (tradeLogOffset + TRADE_LOG_PAGE_SIZE < tradeLogTotal) loadTradeLog(tradeLogOffset + TRADE_LOG_PAGE_SIZE);
+});
+document.querySelector("#trade-log-table tbody").addEventListener("click", (e) => {
+  const btn = e.target.closest(".trade-log-expand-btn");
+  if (btn) showTradeLogDetail(btn.dataset.id);
+});
+
 // ---------- Feature importance over time ----------
 async function loadFeatureImportance() {
   const rows = await fetchJSON("/api/analysis/feature_frequency");
@@ -1320,6 +1395,7 @@ async function loadAll() {
     loadMarketStatus(),
     loadPositions(),
     loadClosedTrades(),
+    loadTradeLog(),
     loadEquity(),
     loadAccountOverview(),
     loadBreakers(),

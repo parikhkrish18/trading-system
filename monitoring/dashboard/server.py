@@ -45,6 +45,15 @@ from monitoring.dashboard import report_card
 from monitoring.equity import load_equity_curve
 from monitoring.forecast_accuracy import compute_forecast_accuracy
 from monitoring.forward_test import graded_real_decisions, headline_metrics, monthly_success_buckets
+from monitoring.trade_log import (
+    attach_feature_vectors,
+    attach_nearby_headlines,
+    grade_outcomes,
+    nearby_news,
+    pivot_feature_vector,
+    real_trade_rows,
+    trade_direction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -727,6 +736,125 @@ def get_closed_trades(limit: int = 100) -> list[dict]:
 
     trades.sort(key=lambda t: t["exit_ts"], reverse=True)
     return trades[:limit]
+
+
+_TRADE_LOG_COLUMNS = (
+    "id, ts, symbol, feature_set_id, model_version, forecast, regime, target_position, "
+    "executed_position, mode, reasoning, direction_agreement, approval_status, take_profit_pct, stop_loss_pct"
+)
+
+
+@app.get("/api/trades/log")
+def get_trade_log(limit: int = 50, offset: int = 0) -> dict:
+    """
+    Every executed real (paper/live) decision -- opens, adds, reduces, and
+    closes -- as raw study data: ticker, direction, forecast, regime,
+    confidence, outcome once matured (see monitoring/trade_log.py). Full
+    feature vectors, full reasoning, and nearby headlines are lazy-loaded
+    per row via /api/trades/log/{id} rather than embedded here, so a page
+    stays light; /api/trades/log/export gives everything in one CSV.
+    """
+    engine = get_engine()
+    decisions = pd.read_sql(
+        text(f"SELECT {_TRADE_LOG_COLUMNS} FROM decisions WHERE mode IN ('paper', 'live') ORDER BY ts DESC"),  # noqa: S608 — fixed column list, no interpolated input
+        engine,
+    )
+    trades = real_trade_rows(decisions)
+    if trades.empty:
+        return {"total": 0, "rows": []}
+
+    symbol_list = symbol_in_clause(trades["symbol"].unique())
+    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
+    graded = grade_outcomes(trades, prices, horizon_bars=settings.target_horizon_days)
+    graded["direction"] = graded["target_position"].apply(trade_direction)
+    graded = graded.drop(columns=["reasoning"]).sort_values("ts", ascending=False)
+
+    page = graded.iloc[offset : offset + limit]
+    return {"total": len(graded), "rows": _clean_records(page)}
+
+
+@app.get("/api/trades/log/export")
+def export_trade_log() -> Response:
+    """
+    The full raw trade-log dataset as CSV -- every executed real decision
+    with its full feature vector (each feature its own feat_<name> column)
+    and nearby news headlines joined in, for offline study in a
+    spreadsheet or notebook. No pagination; this is meant to be the
+    complete record.
+    """
+    engine = get_engine()
+    decisions = pd.read_sql(
+        text(f"SELECT {_TRADE_LOG_COLUMNS} FROM decisions WHERE mode IN ('paper', 'live') ORDER BY ts DESC"),  # noqa: S608 — fixed column list, no interpolated input
+        engine,
+    )
+    trades = real_trade_rows(decisions)
+    if trades.empty:
+        return Response(content="No executed trades logged yet.\n", media_type="text/csv")
+
+    symbol_list = symbol_in_clause(trades["symbol"].unique())
+    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
+    features_long = pd.read_sql(
+        f"SELECT symbol, feature_set_id, ts, feature_name, value FROM features WHERE symbol IN ({symbol_list})",  # noqa: S608 — symbols validated via symbol_in_clause
+        engine,
+    )
+    news = pd.read_sql(
+        f"SELECT symbol, ts, headline FROM news_events WHERE symbol IN ({symbol_list}) ORDER BY ts",  # noqa: S608 — symbols validated via symbol_in_clause
+        engine,
+    )
+
+    graded = grade_outcomes(trades, prices, horizon_bars=settings.target_horizon_days)
+    graded["direction"] = graded["target_position"].apply(trade_direction)
+    graded = attach_feature_vectors(graded, features_long)
+    graded = attach_nearby_headlines(graded, news)
+    graded["reasoning"] = graded["reasoning"].apply(lambda r: json.loads(r) if isinstance(r, str) else r)
+    graded["reasoning"] = graded["reasoning"].apply(json.dumps)
+    graded = graded.sort_values("ts", ascending=False)
+
+    return Response(
+        content=graded.to_csv(index=False),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=trade_log.csv"},
+    )
+
+
+@app.get("/api/trades/log/{decision_id}")
+def get_trade_log_detail(decision_id: int) -> dict:
+    """
+    Full detail for one executed decision: complete reasoning, complete
+    feature vector, and nearby news headlines -- fetched lazily when a row
+    in the Trade Log table is expanded, rather than embedded in every page
+    of /api/trades/log.
+    """
+    engine = get_engine()
+    row = pd.read_sql(
+        text(f"SELECT {_TRADE_LOG_COLUMNS} FROM decisions WHERE id = :id"),  # noqa: S608 — fixed column list, no interpolated input
+        engine,
+        params={"id": decision_id},
+    )
+    if row.empty:
+        raise HTTPException(status_code=404, detail="No decision with that id.")
+
+    record = _clean_records(row)[0]
+    if isinstance(record.get("reasoning"), str):
+        record["reasoning"] = json.loads(record["reasoning"])
+    record["direction"] = trade_direction(record.get("target_position"))
+
+    symbol, ts, feature_set_id = row.iloc[0]["symbol"], row.iloc[0]["ts"], row.iloc[0]["feature_set_id"]
+    features_long = pd.read_sql(
+        text("SELECT feature_name, value FROM features WHERE symbol = :symbol AND feature_set_id = :fsid AND ts = :ts"),
+        engine,
+        params={"symbol": symbol, "fsid": feature_set_id, "ts": ts},
+    )
+    record["features"] = pivot_feature_vector(features_long)
+
+    news = pd.read_sql(
+        text("SELECT ts, headline, source, sentiment FROM news_events WHERE symbol = :symbol ORDER BY ts"),
+        engine,
+        params={"symbol": symbol},
+    )
+    record["nearby_headlines"] = _clean_records(nearby_news(news, ts))
+
+    return record
 
 
 @app.get("/api/positions/news")
