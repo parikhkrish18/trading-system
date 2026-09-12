@@ -852,6 +852,58 @@ def test_report_card_endpoint_unavailable_when_no_runs(monkeypatch, client):
 
 
 # --------------------------------------------------------------------------
+# True report card: cumulative, real-decisions-only history
+# --------------------------------------------------------------------------
+
+
+def test_true_report_card_endpoint_returns_latest_and_history(monkeypatch, client):
+    df = pd.DataFrame(
+        {
+            "as_of_date": pd.to_datetime(["2026-01-08", "2026-01-09"]).date,
+            "n_trades_taken": [3, 4],
+            "n_matured": [0, 1],
+            "n_hits": [0, 1],
+            "hit_rate": [None, 1.0],
+            "avg_realized_return": [None, 0.05],
+            "capital_deployed_pct": [0.6, 0.7],
+        }
+    )
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: df)
+
+    resp = client.get("/api/analysis/true_report_card")
+    body = resp.json()
+
+    assert body["available"] is True
+    assert body["latest"]["n_trades_taken"] == 4
+    assert body["latest"]["hit_rate"] == 1.0
+    assert len(body["history"]) == 2
+    assert [r["n_trades_taken"] for r in body["history"]] == [3, 4]  # sorted oldest-first for charting
+
+
+def test_true_report_card_endpoint_unavailable_when_no_rows_yet(monkeypatch, client):
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
+
+    resp = client.get("/api/analysis/true_report_card")
+
+    assert resp.json() == {"available": False, "latest": None, "history": []}
+
+
+def test_true_report_card_endpoint_is_empty_not_500_on_a_db_error(monkeypatch, client):
+    def _boom(*a, **k):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", _boom)
+
+    resp = client.get("/api/analysis/true_report_card")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False, "latest": None, "history": []}
+
+
+# --------------------------------------------------------------------------
 # Where the server binds — the hosting contract
 # --------------------------------------------------------------------------
 
