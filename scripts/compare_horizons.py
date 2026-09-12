@@ -1,9 +1,13 @@
 """
 Measure — don't guess — what changing the forecast horizon does. Runs the
 existing walk-forward harness (models/train.py, purge gap + transaction
-costs included, everything logged to MLflow as usual) once per candidate
-horizon on the SAME feature set and the SAME fold boundaries, then compares
-each horizon against the baseline with a paired significance test.
+costs included) once per candidate horizon on the SAME feature set and the
+SAME fold boundaries, then compares each horizon against the baseline with
+a paired significance test. Each run still writes its folds to the
+walk_forward_folds table under the shared default model_name, so only the
+LAST horizon run here is what the dashboard shows afterward — this
+script's own printed comparison, not the dashboard, is the point of
+running it.
 
 Why the same fold boundaries matter: a longer horizon loses its last
 `horizon` days to the label shift, so naively each horizon would get

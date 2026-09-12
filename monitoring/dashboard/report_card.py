@@ -2,11 +2,12 @@
 The dashboard's "Model report card": what the walk-forward training run in
 models/train.py actually scored, fold by fold.
 
-Those numbers live in MLflow rather than Postgres — train.py logs one run per
-fold — so this module is the one place in the dashboard that talks to the
-tracking server. The fetch is kept to a single thin function; everything the
-panel actually renders is shaped by pure functions below it, so the wording and
-the maths can be tested without a server running.
+Those numbers live in the walk_forward_folds Postgres table (train.py writes
+one row per fold there — see data/schema/017_walk_forward_folds.sql) — this
+module is the one place in the dashboard that reads it. The fetch is kept to
+a single thin function; everything the panel actually renders is shaped by
+pure functions below it, so the wording and the maths can be tested without
+a database running.
 
 The reader this is written for doesn't know what a walk-forward fold is. The
 framing throughout: each fold is one honest re-run of "train on the past,
@@ -16,10 +17,13 @@ the evidence, and one good fold is a coincidence.
 from __future__ import annotations
 
 import pandas as pd
+from sqlalchemy import text
 
-# models/train.py's default `model_name`, which is also the MLflow experiment it
-# writes each fold's run into. Training with a different --model-name lands in a
-# different experiment and this panel won't see it.
+from data.ingest.db import get_engine
+
+# models/train.py's default `model_name` — this table's rows are scoped by it,
+# so training under a different --model-name writes a separate set of folds
+# this panel won't see.
 DEFAULT_EXPERIMENT = "forecast_lgbm"
 
 FOLD_LABEL = "fold_label"
@@ -49,36 +53,32 @@ LEVEL_LOW = "low"
 LEVEL_UNKNOWN = "unknown"
 
 
-def fetch_fold_runs(tracking_uri: str, experiment_name: str = DEFAULT_EXPERIMENT) -> list[dict]:
+def fetch_fold_runs(model_name: str = DEFAULT_EXPERIMENT) -> list[dict]:
     """
-    Every finished fold run in the training experiment, newest first, as plain
-    dicts — so nothing downstream has to know an MLflow object.
-
-    Raises whatever the MLflow client raises when the server is unreachable; the
-    caller decides what to show. An unreachable server usually fails fast
-    (connection refused), but a server that accepts the connection and then
-    stalls will hang for MLflow's own HTTP timeout — worth knowing before this
-    is called anywhere that isn't cached.
+    Every fold from the latest walk-forward run for this model, as plain
+    dicts — same shape this has always returned, so fold_metrics_frame and
+    everything downstream of it needs no changes. train.py deletes a
+    model's old rows before writing a new run's, so this table only ever
+    holds one run's worth of folds per model_name — no de-duplication
+    needed here the way multiple MLflow runs once required.
     """
-    from mlflow.tracking import MlflowClient
-
-    client = MlflowClient(tracking_uri=tracking_uri)
-    experiment = client.get_experiment_by_name(experiment_name)
-    if experiment is None:
-        return []
-
-    runs = client.search_runs(
-        [experiment.experiment_id],
-        filter_string="attributes.status = 'FINISHED'",
-        max_results=200,
+    engine = get_engine()
+    df = pd.read_sql(
+        text(
+            "SELECT fold_id, mae, rmse, directional_accuracy, "
+            "directional_accuracy_when_confident, pct_rows_confident, mean_ensemble_std "
+            "FROM walk_forward_folds WHERE model_name = :model_name ORDER BY fold_id"
+        ),
+        engine,
+        params={"model_name": model_name},
     )
     return [
         {
-            "run_name": run.info.run_name,
-            "fold_id": run.data.params.get("fold_id"),
-            "metrics": dict(run.data.metrics),
+            "run_name": f"fold_{row['fold_id']}",
+            "fold_id": str(row["fold_id"]),
+            "metrics": row.drop("fold_id").to_dict(),
         }
-        for run in runs
+        for _, row in df.iterrows()
     ]
 
 

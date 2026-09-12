@@ -78,7 +78,7 @@ def accuracy_drift_flag(
     if baseline_accuracy is None:
         return {
             "flagged": False,
-            "message": "No walk-forward baseline available yet (needs at least one MLflow training run) to compare live accuracy against.",
+            "message": "No walk-forward baseline available yet (needs at least one models.train run) to compare live accuracy against.",
             "weeks_checked": 0,
         }
     if weekly.empty or len(weekly) < consecutive_weeks:

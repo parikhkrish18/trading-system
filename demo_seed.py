@@ -1,12 +1,12 @@
 """
 Demo data + monkeypatches so monitoring/dashboard/server.py can run and be
-screenshotted without a live Postgres, MLflow, or broker connection.
+screenshotted without a live Postgres or broker connection.
 
 Every number here is synthetic, but it flows through the REAL application
 code: reasoning.py builds the actual 7-phase explanations, exit_levels.py
 computes the actual take-profit/stop-loss formula, picks.py/whatif.py/
 report_card.py/forecast_accuracy.py all run unmodified on this fake data.
-Only the I/O boundary (DB reads, the broker, MLflow) is faked.
+Only the I/O boundary (DB reads, the broker) is faked.
 
 Usage: uvicorn demo_seed:app --host 127.0.0.1 --port 8501
 """
@@ -297,38 +297,40 @@ FOLD_METRICS = [
 ]
 
 
-def fetch_fold_runs_fake(tracking_uri, experiment_name="forecast_lgbm"):
+def fetch_fold_runs_fake(model_name="forecast_lgbm"):
     return [
         {"run_name": f"fold-{m['fold_id']}", "fold_id": str(m["fold_id"]), "metrics": {k: v for k, v in m.items() if k != "fold_id"}}
         for m in FOLD_METRICS
     ]
 
 
-def _mlflow_runs_df() -> pd.DataFrame:
+def _walk_forward_folds_df() -> pd.DataFrame:
+    """Fakes the walk_forward_folds table /api/analysis/runs reads (data/schema/017_walk_forward_folds.sql)."""
     rows = []
     start = NOW - dt.timedelta(days=200)
     for m in FOLD_METRICS:
         fold_start = start + dt.timedelta(days=18 * m["fold_id"])
         rows.append(
             {
+                "fold_id": m["fold_id"],
+                "feature_set_id": "v4",
+                "train_start": fold_start - dt.timedelta(days=365),
+                "train_end": fold_start,
+                "test_start": fold_start,
+                "test_end": fold_start + dt.timedelta(days=18),
+                "mae": m["mae"],
+                "rmse": m["rmse"],
+                "directional_accuracy": m["directional_accuracy"],
+                "directional_accuracy_when_confident": m["directional_accuracy_when_confident"],
+                "pct_rows_confident": m["pct_rows_confident"],
+                "mean_ensemble_std": 0.012,
                 "start_time": fold_start,
-                "params.fold_id": str(m["fold_id"]),
-                "params.feature_set_id": "v4",
-                "params.train_start": (fold_start - dt.timedelta(days=365)).date().isoformat(),
-                "params.train_end": fold_start.date().isoformat(),
-                "params.test_start": fold_start.date().isoformat(),
-                "params.test_end": (fold_start + dt.timedelta(days=18)).date().isoformat(),
-                "metrics.mae": m["mae"], "metrics.rmse": m["rmse"],
-                "metrics.directional_accuracy": m["directional_accuracy"],
-                "metrics.directional_accuracy_when_confident": m["directional_accuracy_when_confident"],
-                "metrics.pct_rows_confident": m["pct_rows_confident"],
-                "metrics.mean_ensemble_std": 0.012,
             }
         )
     return pd.DataFrame(rows)
 
 
-MLFLOW_RUNS_DF = _mlflow_runs_df()
+WALK_FORWARD_FOLDS_DF = _walk_forward_folds_df()
 
 
 # --------------------------------------------------------------------------
@@ -338,6 +340,8 @@ MLFLOW_RUNS_DF = _mlflow_runs_df()
 # --------------------------------------------------------------------------
 def fake_read_sql(query, con=None, params=None, **kwargs):
     q = str(query)
+    if "FROM walk_forward_folds" in q:
+        return WALK_FORWARD_FOLDS_DF.copy()
     if "FROM news_events" in q:
         return NEWS.copy()
     if "FROM prices" in q:
@@ -365,7 +369,6 @@ def install(server_module):
     server_module.load_equity_curve = lambda mode="paper", limit=1000: EQUITY.copy()
     server_module.load_latest_breaker_state = lambda limit=200: BREAKERS.copy()
     server_module.load_exit_levels = lambda engine: dict(LEVELS_BY_SYMBOL)
-    server_module.mlflow.search_runs = lambda experiment_names: MLFLOW_RUNS_DF.copy()
     server_module.report_card.fetch_fold_runs = fetch_fold_runs_fake
 
 

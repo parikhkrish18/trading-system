@@ -1,6 +1,10 @@
 import numpy as np
 import pandas as pd
+import pytest
+from sqlalchemy import text
 
+from data.ingest.db import get_engine
+from monitoring.dashboard import report_card
 from monitoring.dashboard.report_card import (
     FOLD_LABEL,
     LEVEL_HIGH,
@@ -170,3 +174,59 @@ def test_agreement_pointing_the_wrong_way_is_stated_outright():
 def test_edge_note_handles_missing_numbers():
     assert "Not enough recorded folds" in agreement_edge_note(None, 0.55)
     assert "Not enough recorded folds" in agreement_edge_note(0.55, float("nan"))
+
+
+# --------------------------------------------------------------------------
+# fetch_fold_runs: real-DB integration test, proven against the actual
+# walk_forward_folds schema (data/schema/017_walk_forward_folds.sql), not a
+# mock -- this is the one place report_card.py talks to the database.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _walk_forward_folds_cleanup():
+    engine = get_engine()
+    yield engine
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM walk_forward_folds WHERE model_name = 'zzztest_model'"))
+
+
+def test_fetch_fold_runs_reads_back_what_was_written(_walk_forward_folds_cleanup):
+    engine = _walk_forward_folds_cleanup
+    rows = pd.DataFrame(
+        [
+            {
+                "model_name": "zzztest_model",
+                "feature_set_id": "v4",
+                "fold_id": 1,
+                "mae": 0.02,
+                "rmse": 0.03,
+                "directional_accuracy": 0.51,
+                "directional_accuracy_when_confident": 0.58,
+                "pct_rows_confident": 0.4,
+            },
+            {
+                "model_name": "zzztest_model",
+                "feature_set_id": "v4",
+                "fold_id": 0,
+                "mae": 0.01,
+                "rmse": 0.02,
+                "directional_accuracy": 0.49,
+                "directional_accuracy_when_confident": 0.52,
+                "pct_rows_confident": 0.6,
+            },
+        ]
+    )
+    rows.to_sql("walk_forward_folds", engine, if_exists="append", index=False)
+
+    runs = report_card.fetch_fold_runs(model_name="zzztest_model")
+
+    assert len(runs) == 2
+    frame = fold_metrics_frame(runs)
+    # fold_metrics_frame sorts oldest-fold-first regardless of insert order.
+    assert list(frame[FOLD_LABEL]) == ["Fold 0", "Fold 1"]
+    assert frame.loc[frame[FOLD_LABEL] == "Fold 1", "directional_accuracy"].item() == 0.51
+
+
+def test_fetch_fold_runs_is_empty_for_a_model_with_no_folds_recorded(_walk_forward_folds_cleanup):
+    assert report_card.fetch_fold_runs(model_name="zzztest_model") == []

@@ -4,8 +4,8 @@ frontend (monitoring/dashboard/static/). Replaces the Streamlit version:
 this is the full operational picture — every held position with the
 model's actual reasoning for entering it (LightGBM per-prediction feature
 contributions, see models/screener.py::_attach_reasoning), the walk-forward
-analysis history from MLflow, equity/drawdown, circuit-breaker status, and
-the test suite, runnable on demand.
+analysis history (data/schema/017_walk_forward_folds.sql), equity/drawdown,
+circuit-breaker status, and the test suite, runnable on demand.
 
 Usage:
     python -m monitoring.dashboard.server
@@ -22,7 +22,6 @@ import logging
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-import mlflow
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -466,34 +465,25 @@ def get_circuit_breakers(limit: int = 200) -> list[dict]:
 
 
 @app.get("/api/analysis/runs")
-def get_analysis_runs(experiment: str = "forecast_lgbm") -> list[dict]:
-    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-    try:
-        df = mlflow.search_runs(experiment_names=[experiment])
-    except Exception:
-        return []
-    if df.empty:
-        return []
-
-    wanted = {
-        "start_time": "start_time",
-        "params.fold_id": "fold_id",
-        "params.feature_set_id": "feature_set_id",
-        "params.train_start": "train_start",
-        "params.train_end": "train_end",
-        "params.test_start": "test_start",
-        "params.test_end": "test_end",
-        "metrics.mae": "mae",
-        "metrics.rmse": "rmse",
-        "metrics.directional_accuracy": "directional_accuracy",
-        "metrics.directional_accuracy_when_confident": "directional_accuracy_when_confident",
-        "metrics.pct_rows_confident": "pct_rows_confident",
-        "metrics.mean_ensemble_std": "mean_ensemble_std",
-    }
-    present = {k: v for k, v in wanted.items() if k in df.columns}
-    result = df[list(present.keys())].rename(columns=present)
-    result = result.sort_values("start_time")
-    return _clean_records(result)
+def get_analysis_runs(experiment: str = report_card.DEFAULT_EXPERIMENT) -> list[dict]:
+    """
+    Every fold from the latest walk-forward run, for the "Model Analysis"
+    table — see data/schema/017_walk_forward_folds.sql (models/train.py
+    writes it; report_card.fetch_fold_runs reads the same table for the
+    plain-English "Model Report Card" panel below this one).
+    """
+    engine = get_engine()
+    df = pd.read_sql(
+        text(
+            "SELECT fold_id, feature_set_id, train_start, train_end, test_start, test_end, "
+            "mae, rmse, directional_accuracy, directional_accuracy_when_confident, pct_rows_confident, "
+            "mean_ensemble_std, run_ts AS start_time "
+            "FROM walk_forward_folds WHERE model_name = :model_name ORDER BY fold_id"
+        ),
+        engine,
+        params={"model_name": experiment},
+    )
+    return _clean_records(df)
 
 
 # Decision modes that count as the system actually running. Anything else
@@ -588,7 +578,7 @@ def get_model_drift(consecutive_weeks: int = drift.DEFAULT_DRIFT_WEEKS) -> dict:
 
     baseline_accuracy = None
     try:
-        runs = report_card.fetch_fold_runs(settings.mlflow_tracking_uri)
+        runs = report_card.fetch_fold_runs()
         folds = report_card.fold_metrics_frame(runs)
         baseline_accuracy = report_card.headline_metrics(folds)["directional_accuracy"]
     except Exception:
@@ -609,11 +599,11 @@ def get_report_card() -> dict:
     The model's report card: fold-by-fold walk-forward metrics folded down to
     a headline, a grouped-bar chart, and two plain-English callouts about
     whether "the models agreed" is actually buying accuracy. Same
-    fail-empty pattern as /api/analysis/runs — an unreachable MLflow means
-    an unavailable panel, not a 500.
+    fail-empty pattern as /api/analysis/runs — a DB hiccup means an
+    unavailable panel, not a 500.
     """
     try:
-        runs = report_card.fetch_fold_runs(settings.mlflow_tracking_uri)
+        runs = report_card.fetch_fold_runs()
     except Exception:
         return {"available": False, "headline": None, "chart": [], "callouts": []}
 

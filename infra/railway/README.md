@@ -158,12 +158,17 @@ deliberately want the old `telegram` pre-trade approval gate back, in
 which case also set `APPROVAL_TIMEOUT_S` (must stay under 3600 — the
 hourly monitor shares the one bot).
 
-Left unset on purpose: `MLFLOW_TRACKING_URI` (no MLflow server is deployed;
-the two dashboard analysis panels that use it degrade to empty and nothing
-else touches it), `POLYGON_API_KEY`, `ANTHROPIC_API_KEY`, `FRED_API_KEY`,
+Left unset on purpose: `POLYGON_API_KEY`, `ANTHROPIC_API_KEY`, `FRED_API_KEY`,
 `SLACK_WEBHOOK_URL`. Each of those degrades gracefully when blank — the
 corresponding features are simply absent, and LightGBM handles the missing
 columns natively.
+
+The dashboard's "Model Analysis" and "Model Report Card" panels read walk-forward
+fold results from the `walk_forward_folds` Postgres table (see
+data/schema/017_walk_forward_folds.sql) rather than from MLflow — no separate
+tracking server is deployed or needed. Run `python -m models.train --feature-set-id
+<id> --universe` whenever you want fresh numbers there; it deletes and rewrites
+its own model's rows each run, so the dashboard always shows the latest run.
 
 ## What the password protects
 

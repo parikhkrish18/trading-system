@@ -3,9 +3,10 @@ Pure computation for the dashboard's live forecast-accuracy panel (how
 often recent real decisions' predicted direction matched what actually
 happened) — kept separate from monitoring/dashboard/server.py so it's
 unit-testable without a DB/HTTP context. Complements, not replaces, the
-walk-forward backtest metrics in MLflow (server.py's /api/analysis/runs):
-this measures live decisions after the fact, walk-forward measures the
-model on held-out history before any of them were made.
+walk-forward backtest metrics in the walk_forward_folds table (server.py's
+/api/analysis/runs, see data/schema/017_walk_forward_folds.sql): this
+measures live decisions after the fact, walk-forward measures the model on
+held-out history before any of them were made.
 """
 from __future__ import annotations
 
