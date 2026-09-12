@@ -104,6 +104,34 @@ def test_upsert_dataframe_uses_a_unique_staging_table_name_per_call(monkeypatch)
     assert "_staging_widgets" not in staging_names
 
 
+@pytest.fixture
+def _long_name_table():
+    """
+    Regression test: a 25-char table name like 'model_report_card_history'
+    combined with the "_staging_" prefix and a full 32-char uuid suffix
+    exceeds Postgres's 63-byte identifier limit and raises
+    sqlalchemy.exc.IdentifierError.
+    """
+    engine = db.get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS model_report_card_history"))
+        conn.execute(
+            text(
+                "CREATE TABLE model_report_card_history "
+                "(symbol TEXT, ts TEXT, value DOUBLE PRECISION, PRIMARY KEY (symbol, ts))"
+            )
+        )
+    yield engine
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS model_report_card_history"))
+
+
+def test_upsert_dataframe_staging_name_fits_a_long_table_name(_long_name_table):
+    df = pd.DataFrame({"symbol": ["AAPL"], "ts": ["2026-01-01"], "value": [1.0]})
+    n = db.upsert_dataframe(df, table="model_report_card_history", conflict_cols=["symbol", "ts"])
+    assert n == 1
+
+
 def test_upsert_dataframe_reuses_a_caller_provided_connection():
     """
     `conn=` lets a caller (e.g. universe.py's refresh_universe) fold several
