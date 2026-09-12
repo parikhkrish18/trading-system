@@ -325,6 +325,15 @@ class Settings(BaseSettings):
     # through.
     short_low_risk_stop_loss_pct: float = Field(default=0.06, alias="SHORT_LOW_RISK_STOP_LOSS_PCT")
 
+    # --- Macro/sector hard block (models/screener.py::apply_macro_sector_block) ---
+    # When market-wide AND a stock's own sector sentiment are both negative
+    # (or both positive), a candidate in the OPPOSITE direction is never
+    # confident, regardless of the model's own prediction -- a deliberate
+    # hard override, unlike every other macro/sector signal in this repo
+    # (see features/qualitative/macro_sentiment.py's own docstring), which
+    # are plain model features left for the ensemble to weigh on its own.
+    enable_macro_sector_block: bool = Field(default=True, alias="ENABLE_MACRO_SECTOR_BLOCK")
+
     # --- Trend pullback ranking boost (models/screener.py) ---
     # A small tie-breaker boost to rank_score (never to sizing, which still
     # runs off the model's own conviction_score) for a candidate whose
