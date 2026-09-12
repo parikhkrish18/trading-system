@@ -104,6 +104,37 @@ def test_upsert_dataframe_uses_a_unique_staging_table_name_per_call(monkeypatch)
     assert "_staging_widgets" not in staging_names
 
 
+_LONG_TABLE_NAME = "zzztest_a_deliberately_long_regression_table_name"
+
+
+@pytest.fixture
+def _long_name_table():
+    """
+    Regression test: a table name combined with the "_staging_" prefix and
+    a full 32-char uuid suffix can exceed Postgres's 63-byte identifier
+    limit and raise sqlalchemy.exc.IdentifierError -- 'model_report_card_history'
+    (25 chars) is what actually hit this in production. Uses a throwaway
+    "zzztest_"-prefixed name here rather than that real table name, so this
+    fixture's DROP TABLE can never collide with (and delete) an actual
+    production table another test relies on.
+    """
+    engine = db.get_engine()
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {_LONG_TABLE_NAME}"))
+        conn.execute(
+            text(f"CREATE TABLE {_LONG_TABLE_NAME} (symbol TEXT, ts TEXT, value DOUBLE PRECISION, PRIMARY KEY (symbol, ts))")
+        )
+    yield engine
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {_LONG_TABLE_NAME}"))
+
+
+def test_upsert_dataframe_staging_name_fits_a_long_table_name(_long_name_table):
+    df = pd.DataFrame({"symbol": ["AAPL"], "ts": ["2026-01-01"], "value": [1.0]})
+    n = db.upsert_dataframe(df, table=_LONG_TABLE_NAME, conflict_cols=["symbol", "ts"])
+    assert n == 1
+
+
 def test_upsert_dataframe_reuses_a_caller_provided_connection():
     """
     `conn=` lets a caller (e.g. universe.py's refresh_universe) fold several

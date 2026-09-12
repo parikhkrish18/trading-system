@@ -218,6 +218,30 @@ function renderGroupedBarChart(container, rows, { height = 180, colors = { [0]: 
     <div class="muted" style="font-size:11px;margin-top:4px;">${legend}</div>`;
 }
 
+// ---------- True report card (cumulative, real decisions only) ----------
+async function loadTrueReportCard() {
+  const result = await fetchJSON("/api/analysis/true_report_card");
+  const summary = document.getElementById("true-report-card-summary");
+  if (!result.available) {
+    summary.innerHTML = '<div class="empty-state">No daily snapshot yet — runs once a day after market close (scripts/refresh_model_report_card.py).</div>';
+    renderLineChart(document.getElementById("true-report-card-chart"), []);
+    return;
+  }
+  const h = result.latest;
+  summary.innerHTML = `
+    <div class="stat-card"><div class="value">${h.n_trades_taken}</div><div class="label">Real trades taken (all-time)</div></div>
+    <div class="stat-card"><div class="value">${h.n_matured}</div><div class="label">Matured (graded)</div></div>
+    <div class="stat-card"><div class="value">${fmt.pct(h.hit_rate, 1)}</div><div class="label">Cumulative hit rate</div></div>
+    <div class="stat-card"><div class="value">${fmt.pct(h.avg_realized_return, 2)}</div><div class="label">Avg. realized return (matured)</div></div>
+    <div class="stat-card"><div class="value">${fmt.pct(h.capital_deployed_pct, 1)}</div><div class="label">Capital deployed now</div></div>
+  `;
+  renderLineChart(
+    document.getElementById("true-report-card-chart"),
+    result.history.map((r) => ({ y: r.capital_deployed_pct, label: r.as_of_date })),
+    { color: "#26a65b", zeroLine: true, valueFmt: (v) => fmt.pct(v, 1) }
+  );
+}
+
 // ---------- Model report card ----------
 async function loadReportCard() {
   const result = await fetchJSON("/api/analysis/report_card");
@@ -1358,6 +1382,7 @@ async function loadAll() {
     loadBreakers(),
     loadAnalysis(),
     loadReportCard(),
+    loadTrueReportCard(),
     loadDrift(),
     loadFeatureImportance(),
     loadLiveAccuracy(),

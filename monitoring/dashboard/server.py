@@ -625,6 +625,42 @@ def get_report_card() -> dict:
     }
 
 
+@app.get("/api/analysis/true_report_card")
+def get_true_report_card(limit: int = 365) -> dict:
+    """
+    The cumulative, real-decisions-only track record — scripts/refresh_model_report_card.py
+    writes one row per day to model_report_card_history (data/schema/018_model_report_card.sql);
+    this just reads it back. Never contains a backtested/simulated number —
+    see monitoring/model_report_card.py's own docstring for what "real"
+    means here. Same fail-empty pattern as /api/analysis/report_card: no
+    rows yet (the daily job hasn't run) means an unavailable panel, not a 500.
+    """
+    engine = get_engine()
+    try:
+        history = pd.read_sql(
+            text(
+                "SELECT as_of_date, n_trades_taken, n_matured, n_hits, hit_rate, "
+                "avg_realized_return, capital_deployed_pct FROM model_report_card_history "
+                "ORDER BY as_of_date DESC LIMIT :limit"
+            ),
+            engine,
+            params={"limit": limit},
+        )
+    except Exception:
+        logger.exception("Could not load model_report_card_history for the True Report Card panel.")
+        return {"available": False, "latest": None, "history": []}
+
+    if history.empty:
+        return {"available": False, "latest": None, "history": []}
+
+    history = history.sort_values("as_of_date")
+    return {
+        "available": True,
+        "latest": _clean_records(history.tail(1))[0],
+        "history": _clean_records(history),
+    }
+
+
 def _price_at_or_before(sym_prices: pd.DataFrame, ts) -> float | None:
     """Nearest known close at or before `ts`; falls back to the earliest known close if none exists."""
     before = sym_prices[sym_prices["ts"] <= ts]

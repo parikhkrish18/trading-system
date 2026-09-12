@@ -158,7 +158,13 @@ def upsert_dataframe(
         # a long-lived streamer flushing every ~15s alongside a cron/poll
         # puller) could otherwise both run CREATE TABLE against the same
         # staging name at the same time and collide.
-        staging_table = f"_staging_{table}_{uuid.uuid4().hex}"
+        #
+        # Postgres identifiers cap at 63 bytes, so a long `table` name is
+        # truncated to make room -- the full uuid suffix is what keeps
+        # concurrent calls collision-free, so it's never the part trimmed.
+        uuid_suffix = uuid.uuid4().hex
+        max_table_len = 63 - len("_staging_") - len("_") - len(uuid_suffix)
+        staging_table = f"_staging_{table[:max_table_len]}_{uuid_suffix}"
         # S608: table/column names come from calling code, not user input.
         if update_cols:
             sql = (
