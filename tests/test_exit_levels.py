@@ -10,7 +10,7 @@ import math
 
 import pytest
 
-from execution.exit_levels import ExitLevels, describe, exit_levels_for, global_levels
+from execution.exit_levels import ExitLevels, describe, exit_levels_advised, exit_levels_for, global_levels
 
 
 def _levels(predicted=0.06, daily_vol=0.02, horizon=20):
@@ -148,3 +148,52 @@ def test_description_admits_when_the_levels_are_only_the_defaults():
     """
     assert "unavailable" in describe(global_levels())
     assert "this stock" in describe(ExitLevels(0.08, 0.12, derived=True))
+
+
+# --------------------------------------------------------------------------
+# exit_levels_advised: an LLM's suggestion, clamped to the same bounds
+# --------------------------------------------------------------------------
+
+
+def _advised(llm_tp=None, llm_sl=None, predicted=0.06, daily_vol=0.02, horizon=20):
+    return exit_levels_advised(
+        predicted_return=predicted, daily_volatility=daily_vol,
+        llm_take_profit_pct=llm_tp, llm_stop_loss_pct=llm_sl, horizon_days=horizon,
+    )
+
+
+def test_a_suggestion_within_bounds_is_used_as_given():
+    baseline = _levels(daily_vol=0.02)
+    # Pick a value strictly between the quant floor and ceiling for this vol.
+    suggestion = (baseline.take_profit_pct + 0.001, baseline.stop_loss_pct + 0.001)
+    levels = _advised(llm_tp=suggestion[0], llm_sl=suggestion[1], daily_vol=0.02)
+    assert levels.take_profit_pct == pytest.approx(suggestion[0])
+    assert levels.stop_loss_pct == pytest.approx(suggestion[1])
+
+
+def test_a_suggestion_above_the_ceiling_is_clamped_not_used_outright():
+    levels = _advised(llm_tp=5.0, llm_sl=5.0, daily_vol=0.02)
+    assert levels.take_profit_pct <= 0.20  # nowhere near the absurd 5.0 (500%) suggested
+    assert levels.stop_loss_pct <= 0.20
+
+
+def test_a_suggestion_below_the_floor_is_clamped_up():
+    levels = _advised(llm_tp=0.0001, llm_sl=0.0001, daily_vol=0.02)
+    assert levels.take_profit_pct >= 0.03
+    assert levels.stop_loss_pct >= 0.05
+
+
+def test_no_suggestion_falls_back_to_the_plain_quant_formula():
+    assert _advised(llm_tp=None, llm_sl=None) == _levels()
+
+
+def test_a_non_finite_suggestion_is_ignored_like_no_suggestion():
+    levels = _advised(llm_tp=float("nan"), llm_sl=float("inf"))
+    assert levels == _levels()
+
+
+def test_unmeasurable_volatility_ignores_the_llm_suggestion_too():
+    """No per-stock bounds to advise within -- same global fallback as exit_levels_for."""
+    levels = _advised(llm_tp=0.07, llm_sl=0.04, daily_vol=None)
+    assert levels == global_levels()
+    assert levels.derived is False

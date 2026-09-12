@@ -13,6 +13,19 @@ This module does NOT place orders — it produces candidates and logs them
 to the `decisions` table (mode="paper", executed_position left null).
 Wiring the output to execution/broker.py is a separate step.
 
+In concentrated mode, when ANTHROPIC_API_KEY is set, the pool that clears
+the gates above (score_universe's cost hurdle + Donchian gate,
+apply_macro_sector_block's hard block) gets a second pass: Claude Sonnet 5
+(models/llm_advisor.py) reasons over that pool's forecasts, top feature
+drivers, sector sentiment, and recent news, and returns its own confidence
+score, a suggested take-profit/stop-loss, and a top-N pick — replacing the
+plain conviction-score ranking and template reasoning for that cycle, but
+never able to trade a symbol outside the already-gated pool, and never
+setting a position size or exit level outside the existing risk bounds
+(see models/llm_advisor.py's own docstring). Any failure there — no key,
+an API error, an unparseable response — falls straight back to the exact
+quant-only selection this module has always used.
+
 Usage:
     python -m models.screener --feature-set-id v3 --universe
 """
@@ -28,17 +41,19 @@ from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.universe import resolve_symbols
-from execution.exit_levels import ExitLevels, exit_levels_for
+from execution.exit_levels import ExitLevels, exit_levels_advised, exit_levels_for
 from features.build_features import fundamentals_prior_context
 from features.quant.volatility import realized_vol
 from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
+from models.llm_advisor import get_llm_trade_advice
 from models.regime.trend_chop_classifier import TREND
 from models.train import cross_sectional_feature_columns, feature_columns, load_feature_frame, load_training_frame
 from monitoring import reasoning
@@ -619,6 +634,7 @@ def select_concentrated_trades(
     is_shortable_fn: Callable[[str], bool] | None = None,
     allow_shorts: bool = True,
     rank_score_col: str | None = None,
+    weight_score_col: str | None = None,
     max_positions: int = 2,
 ) -> list[TradeCandidate]:
     """
@@ -654,8 +670,17 @@ def select_concentrated_trades(
     total, across every leg combined — pass less than 1.0 for e.g.
     execution/contradiction_monitor.py's mid-week reactivation, which only
     has the freed slice of the book to redeploy.
+
+    `weight_score_col`: which column sizes each leg's SPLIT once picked —
+    defaults to "conviction_score" (unchanged original behavior) when None
+    or when the named column isn't present, same fallback convention as
+    `rank_score_col`. models/llm_advisor.py's advisory confidence score is
+    the one caller that passes something else here today: it re-weights
+    capital among the picks Claude actually recommended, still through
+    this exact same _bounded_conviction_weights floor/cap, never around it.
     """
     sort_col = rank_score_col if rank_score_col and rank_score_col in scored.columns else "conviction_score"
+    weight_col = weight_score_col if weight_score_col and weight_score_col in scored.columns else "conviction_score"
     confident = scored.loc[scored["confident"]].sort_values(sort_col, ascending=False)
 
     picks: list[pd.Series] = []
@@ -675,10 +700,112 @@ def select_concentrated_trades(
     if len(picks) == 1:
         return [_make_candidate(picks[0], weight=1.0, total_deploy_pct=total_deploy_pct)]
 
-    scores = [max(row["conviction_score"], 0.0) for row in picks]
+    scores = [max(row[weight_col], 0.0) for row in picks]
     weights = _bounded_conviction_weights(scores, max_leg_pct=max_leg_pct, min_leg_floor_fraction=min_leg_floor_fraction)
 
     return [_make_candidate(row, weight, total_deploy_pct) for row, weight in zip(picks, weights, strict=False)]
+
+
+def _load_recent_headlines(symbols: list[str], limit_per_symbol: int = 5) -> dict[str, list[dict]]:
+    """
+    Up to `limit_per_symbol` most recent, vendor-relevant headlines per
+    symbol for the LLM advisory pool (models/llm_advisor.py) -- the same
+    news_events table features/qualitative/sentiment.py scores. Bounded
+    per symbol via a window function rather than a flat LIMIT on the whole
+    query, which would silently starve whichever symbol sorts last. A
+    story flagged as mistagged (sentiment_relevant == False) is dropped;
+    NULL/unscored stays in, same convention as
+    monitoring/dashboard/server.py's news panels.
+    """
+    if not symbols:
+        return {}
+    query = (
+        "SELECT symbol, ts, headline, sentiment FROM ("  # noqa: S608 — symbols validated via symbol_in_clause
+        "  SELECT symbol, ts, headline, sentiment, sentiment_relevant, "
+        "         ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn "
+        f"  FROM news_events WHERE symbol IN ({symbol_in_clause(symbols)})"
+        ") ranked WHERE rn <= :limit_per_symbol AND sentiment_relevant IS DISTINCT FROM false"
+    )
+    news = pd.read_sql(text(query), get_engine(), params={"limit_per_symbol": limit_per_symbol})
+    if news.empty:
+        return {}
+    out: dict[str, list[dict]] = {}
+    for symbol, group in news.groupby("symbol"):
+        out[symbol] = [
+            {"headline": row["headline"], "sentiment": None if pd.isna(row["sentiment"]) else float(row["sentiment"])}
+            for _, row in group.sort_values("ts", ascending=False).iterrows()
+        ]
+    return out
+
+
+def _build_llm_candidate_pool(
+    pool: pd.DataFrame,
+    ensemble: EnsembleForecastModel,
+    latest_features: pd.DataFrame,
+    raw_features: pd.DataFrame,
+    feature_cols: list[str],
+    vol_by_symbol: dict[str, float],
+    latest_close_by_symbol: dict[str, float],
+    macro_sector_sentiment_by_symbol: dict[str, float],
+    horizon_days: int,
+    top_n: int = 5,
+) -> list[dict]:
+    """
+    Assembles the per-candidate payload models/llm_advisor.py sends to
+    Claude: the same SHAP top-features _attach_reasoning uses (so the LLM
+    reasons off the exact attribution a human reading the dashboard would
+    see), plus market price, volatility, sector sentiment, recent
+    headlines, and the existing quant formula's own take-profit/stop-loss
+    as a reference point.
+    """
+    symbols = list(pool["symbol"])
+    if not symbols:
+        return []
+    fundamentals_context = _load_fundamentals_context(symbols)
+    per_symbol_top_features = _explain_features(
+        symbols, ensemble, latest_features, raw_features, feature_cols, fundamentals_context, top_n=top_n
+    )
+    headlines_by_symbol = _load_recent_headlines(symbols)
+
+    payload = []
+    for _, row in pool.iterrows():
+        symbol = row["symbol"]
+        vol = vol_by_symbol.get(symbol)
+        quant_bounds = exit_levels_for(predicted_return=row["predicted_return"], daily_volatility=vol, horizon_days=horizon_days)
+        payload.append(
+            {
+                "symbol": symbol,
+                "side": "long" if row["predicted_return"] >= 0 else "short",
+                "predicted_return": float(row["predicted_return"]),
+                "conviction_score": float(row["conviction_score"]),
+                "macro_sector_sentiment": macro_sector_sentiment_by_symbol.get(symbol),
+                "current_price": latest_close_by_symbol.get(symbol),
+                "daily_volatility_pct": vol,
+                "top_features": per_symbol_top_features.get(symbol, []),
+                "recent_headlines": headlines_by_symbol.get(symbol, []),
+                "quant_take_profit_pct": quant_bounds.take_profit_pct,
+                "quant_stop_loss_pct": quant_bounds.stop_loss_pct,
+            }
+        )
+    return payload
+
+
+def _apply_llm_advice_to_scored(scored: pd.DataFrame, advice: dict) -> pd.DataFrame:
+    """
+    A copy of `scored` with `confident` narrowed to exactly the symbols
+    Claude picked (see models/llm_advisor.py) and a new `llm_confidence`
+    column populated for them -- handed to select_concentrated_trades so
+    its own, unmodified picking/weighting/shortability logic operates on
+    Claude's recommended pool instead of the raw conviction-score ranking.
+    """
+    result = scored.copy()
+    result["llm_confidence"] = np.nan
+    picks = set(advice["picks"])
+    result["confident"] = result["symbol"].isin(picks)
+    for symbol, info in advice["by_symbol"].items():
+        if symbol in picks:
+            result.loc[result["symbol"] == symbol, "llm_confidence"] = info["confidence"]
+    return result
 
 
 def _load_fundamentals_context(symbols: list[str]) -> dict[tuple[str, str], dict]:
@@ -901,16 +1028,36 @@ def daily_volatility(prices: pd.DataFrame, window: int = 20) -> dict[str, float]
     return out
 
 
-def attach_exit_levels(candidates: list[TradeCandidate], vol_by_symbol: dict[str, float]) -> None:
+def attach_exit_levels(
+    candidates: list[TradeCandidate],
+    vol_by_symbol: dict[str, float],
+    llm_hints: dict[str, tuple[float | None, float | None]] | None = None,
+) -> None:
     """
     Give every candidate the levels it will be proposed, approved and later
     judged against. Mutates in place, like _attach_reasoning.
+
+    `llm_hints`: {symbol: (take_profit_pct, stop_loss_pct)} suggested by
+    models/llm_advisor.py for a symbol Claude was consulted on. When
+    present, exit_levels_advised clamps that suggestion into the exact
+    same volatility-derived bounds exit_levels_for always enforces, rather
+    than using the plain quant-formula value outright.
     """
+    llm_hints = llm_hints or {}
     for candidate in candidates:
-        candidate.exit_levels = exit_levels_for(
-            predicted_return=candidate.predicted_return,
-            daily_volatility=vol_by_symbol.get(candidate.symbol),
-        )
+        hint = llm_hints.get(candidate.symbol)
+        if hint is not None:
+            candidate.exit_levels = exit_levels_advised(
+                predicted_return=candidate.predicted_return,
+                daily_volatility=vol_by_symbol.get(candidate.symbol),
+                llm_take_profit_pct=hint[0],
+                llm_stop_loss_pct=hint[1],
+            )
+        else:
+            candidate.exit_levels = exit_levels_for(
+                predicted_return=candidate.predicted_return,
+                daily_volatility=vol_by_symbol.get(candidate.symbol),
+            )
 
 
 @dataclasses.dataclass
@@ -1087,20 +1234,74 @@ def run_screen_with_scores(
                 suppressed,
             )
 
+    llm_exit_hints: dict[str, tuple[float | None, float | None]] = {}
     if settings.strategy_mode == "concentrated":
         max_positions = (
             max_positions_override if max_positions_override is not None else settings.max_concentrated_positions
         )
-        candidates = select_concentrated_trades(
-            scored,
-            max_leg_pct=settings.max_concentrated_position_pct,
-            min_leg_floor_fraction=settings.min_concentrated_leg_floor_fraction,
-            max_positions=max_positions,
-            total_deploy_pct=total_deploy_pct,
-            is_shortable_fn=is_shortable_fn,
-            allow_shorts=settings.allow_shorts,
-            rank_score_col="rank_score",
-        )
+
+        # Advisory Claude pass (models/llm_advisor.py): only ever consulted
+        # on the pool that already cleared score_universe's cost hurdle +
+        # Donchian gate, apply_macro_sector_block's hard block, and the
+        # same allow_shorts/shortability filtering select_concentrated_trades
+        # applies below -- it can rank and pick among these, never around
+        # them. Any failure (unset key, API error, unparseable response)
+        # returns None and this falls straight through to the exact
+        # pre-existing quant-only selection.
+        llm_advice = None
+        if settings.anthropic_api_key:
+            # The SHAP explanation + news query below are real work (a
+            # model-contribution pass, a DB round trip) -- worth skipping
+            # outright, not just letting get_llm_trade_advice no-op on an
+            # unset key, since an unset key is the common case (see
+            # infra/railway/README.md: left blank on Railway by default).
+            eligible = scored.loc[scored["confident"]]
+            if not settings.allow_shorts:
+                eligible = eligible[eligible["predicted_return"] >= 0]
+            if is_shortable_fn is not None:
+                eligible = eligible[
+                    eligible.apply(lambda r: r["predicted_return"] >= 0 or is_shortable_fn(r["symbol"]), axis=1)
+                ]
+            macro_sector_map = macro_sector_sentiment_by_symbol if settings.enable_macro_sector_block else {}
+            latest_close_by_symbol = train_df.sort_values("ts").groupby("symbol")["close"].last().to_dict()
+            llm_advice = get_llm_trade_advice(
+                _build_llm_candidate_pool(
+                    eligible, ensemble, latest, raw_latest, feature_cols, vol_by_symbol,
+                    latest_close_by_symbol, macro_sector_map, target_horizon_days,
+                ),
+                market_context={"regime": regime, "target_horizon_days": target_horizon_days},
+                max_picks=max_positions,
+            )
+
+        if llm_advice is not None:
+            candidates = select_concentrated_trades(
+                _apply_llm_advice_to_scored(scored, llm_advice),
+                max_leg_pct=settings.max_concentrated_position_pct,
+                min_leg_floor_fraction=settings.min_concentrated_leg_floor_fraction,
+                max_positions=len(llm_advice["picks"]),
+                total_deploy_pct=total_deploy_pct,
+                is_shortable_fn=is_shortable_fn,
+                allow_shorts=settings.allow_shorts,
+                rank_score_col="llm_confidence",
+                weight_score_col="llm_confidence",
+            )
+            for candidate in candidates:
+                info = llm_advice["by_symbol"].get(candidate.symbol)
+                if info is None:
+                    continue
+                candidate.reasoning = info["reasoning"]
+                llm_exit_hints[candidate.symbol] = (info["take_profit_pct"], info["stop_loss_pct"])
+        else:
+            candidates = select_concentrated_trades(
+                scored,
+                max_leg_pct=settings.max_concentrated_position_pct,
+                min_leg_floor_fraction=settings.min_concentrated_leg_floor_fraction,
+                max_positions=max_positions,
+                total_deploy_pct=total_deploy_pct,
+                is_shortable_fn=is_shortable_fn,
+                allow_shorts=settings.allow_shorts,
+                rank_score_col="rank_score",
+            )
         if max_positions_override is None and len(candidates) < settings.min_concentrated_positions:
             # Informational only — see settings.min_concentrated_positions:
             # this is a target the screen tries to reach, never a reason to
@@ -1160,8 +1361,14 @@ def run_screen_with_scores(
                     target_allocation=total_deploy_pct,
                 )
 
+    # A candidate the LLM advisory pass already gave reasoning to (see
+    # above) keeps that; only the rest fall through to the template
+    # generator. _attach_reasoning early-returns on an empty list, so this
+    # is a no-op cycle when every candidate came from the LLM path (or
+    # there's no LLM advice at all and this is just every candidate, same
+    # as before this feature existed).
     _attach_reasoning(
-        candidates,
+        [c for c in candidates if c.reasoning is None],
         ensemble,
         latest,
         raw_latest,
@@ -1172,14 +1379,16 @@ def run_screen_with_scores(
         settings.min_concentrated_leg_floor_fraction,
         strategy=settings.strategy_mode,
         top_k=settings.screener_top_k,
-        fundamentals_context=_load_fundamentals_context([c.symbol for c in candidates]),
+        fundamentals_context=_load_fundamentals_context([c.symbol for c in candidates if c.reasoning is None]),
     )
     # Exit levels come from the same price history the model trained on, so
     # a pick is proposed with levels sized to that stock rather than to the
     # average of every stock. Reuses vol_by_symbol computed above (same
     # numbers apply_short_preference already ranked this candidate against)
-    # rather than recomputing it a second time.
-    attach_exit_levels(candidates, vol_by_symbol)
+    # rather than recomputing it a second time. llm_exit_hints is only ever
+    # non-empty when the LLM advisory pass above succeeded and picked this
+    # candidate; every other cycle this is the exact pre-existing behavior.
+    attach_exit_levels(candidates, vol_by_symbol, llm_exit_hints)
     return ScreenResult(
         candidates=candidates,
         scored=scored,
