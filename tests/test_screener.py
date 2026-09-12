@@ -9,6 +9,7 @@ from models.screener import (
     _attach_reasoning,
     _bounded_conviction_weights,
     apply_short_preference,
+    apply_trend_pullback_boost,
     attach_exit_levels,
     build_correlation_matrix,
     daily_volatility,
@@ -80,7 +81,117 @@ def test_score_universe_empty_input_returns_empty_with_columns():
     ensemble = _FakeEnsemble(mean_prediction=[], direction_agreement=[])
     result = score_universe(ensemble, pd.DataFrame(), feature_cols=["f1"])
     assert result.empty
-    assert list(result.columns) == ["symbol", "predicted_return", "direction_agreement", "conviction_score", "confident"]
+    assert list(result.columns) == [
+        "symbol", "predicted_return", "direction_agreement", "conviction_score",
+        "donchian_breakout_20", "trend_pullback_score", "confident",
+    ]
+
+
+def test_score_universe_without_a_breakout_column_falls_back_to_cost_hurdle_only():
+    """
+    A feature set built before donchian_breakout_20 existed has no such
+    column at all -- must behave exactly as before, not treat "column
+    missing" as "no breakout, always fail the bar".
+    """
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
+
+    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02)
+
+    assert result.set_index("symbol").loc["AAPL", "confident"]
+
+
+def test_score_universe_requires_the_breakout_to_agree_with_the_prediction():
+    latest = pd.DataFrame({"symbol": ["AAPL", "MSFT"], "f1": [0.1, 0.2]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05, 0.05], direction_agreement=[1.0, 1.0])
+    # AAPL predicted UP and actually broke out to a new high (+1) -- aligned.
+    # MSFT predicted UP but broke DOWN to a new low (-1) -- not aligned.
+    raw = pd.DataFrame({"symbol": ["AAPL", "MSFT"], "donchian_breakout_20": [1.0, -1.0]})
+
+    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02, raw_features=raw)
+
+    by_symbol = result.set_index("symbol")
+    assert by_symbol.loc["AAPL", "confident"]
+    assert not by_symbol.loc["MSFT", "confident"]
+
+
+def test_score_universe_no_breakout_at_all_todays_is_not_confident():
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
+    raw = pd.DataFrame({"symbol": ["AAPL"], "donchian_breakout_20": [0.0]})
+
+    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02, raw_features=raw)
+
+    assert not result.set_index("symbol").loc["AAPL", "confident"]
+
+
+def test_score_universe_reads_the_raw_breakout_not_the_zscored_one():
+    """
+    In relative mode `latest_features` is cross-sectionally z-scored (see
+    load_latest_features) -- a stock with NO real breakout could still
+    z-score positive on a day most of the universe broke out. raw_features
+    (run_screen_with_scores' unscaled raw_latest) must be what actually
+    decides this, not whatever ends up in latest_features.
+    """
+    # latest_features' own donchian_breakout_20 column (already z-scored,
+    # would misleadingly read as "aligned" if it were consulted) --
+    # deliberately the OPPOSITE of the true raw signal below.
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1], "donchian_breakout_20": [1.0]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
+    raw = pd.DataFrame({"symbol": ["AAPL"], "donchian_breakout_20": [-1.0]})
+
+    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02, raw_features=raw)
+
+    # predicted +0.05 (up) vs raw breakout -1 (down) -- must NOT be confident.
+    assert not result.set_index("symbol").loc["AAPL", "confident"]
+
+
+class TestApplyTrendPullbackBoost:
+    def _scored(self, rows):
+        df = pd.DataFrame(rows)
+        df["conviction_score"] = df["predicted_return"].abs()
+        df["rank_score"] = df["conviction_score"]
+        return df
+
+    def test_boosts_a_candidate_whose_pullback_score_agrees_with_the_prediction(self):
+        scored = self._scored(
+            [{"symbol": "AAPL", "predicted_return": 0.05, "trend_pullback_score": 0.8}]
+        )
+        result = apply_trend_pullback_boost(scored, boost_pct=0.20, min_score=0.5)
+        assert result.loc[0, "rank_score"] == pytest.approx(0.05 * 1.20)
+
+    def test_does_not_boost_when_the_pullback_score_opposes_the_prediction(self):
+        scored = self._scored(
+            [{"symbol": "AAPL", "predicted_return": 0.05, "trend_pullback_score": -0.8}]
+        )
+        result = apply_trend_pullback_boost(scored, boost_pct=0.20, min_score=0.5)
+        assert result.loc[0, "rank_score"] == pytest.approx(0.05)
+
+    def test_does_not_boost_when_the_pullback_score_is_below_the_minimum(self):
+        scored = self._scored(
+            [{"symbol": "AAPL", "predicted_return": 0.05, "trend_pullback_score": 0.1}]
+        )
+        result = apply_trend_pullback_boost(scored, boost_pct=0.20, min_score=0.5)
+        assert result.loc[0, "rank_score"] == pytest.approx(0.05)
+
+    def test_zero_boost_pct_is_a_no_op(self):
+        scored = self._scored(
+            [{"symbol": "AAPL", "predicted_return": 0.05, "trend_pullback_score": 0.8}]
+        )
+        result = apply_trend_pullback_boost(scored, boost_pct=0.0, min_score=0.5)
+        pd.testing.assert_frame_equal(result, scored)
+
+    def test_missing_trend_pullback_score_column_is_a_no_op(self):
+        scored = pd.DataFrame([{"symbol": "AAPL", "predicted_return": 0.05, "conviction_score": 0.05, "rank_score": 0.05}])
+        result = apply_trend_pullback_boost(scored, boost_pct=0.20, min_score=0.5)
+        pd.testing.assert_frame_equal(result, scored)
+
+    def test_defaults_rank_score_to_conviction_score_when_short_preference_never_ran(self):
+        scored = pd.DataFrame(
+            [{"symbol": "AAPL", "predicted_return": 0.05, "conviction_score": 0.05, "trend_pullback_score": 0.8}]
+        )
+        result = apply_trend_pullback_boost(scored, boost_pct=0.20, min_score=0.5)
+        assert result.loc[0, "rank_score"] == pytest.approx(0.05 * 1.20)
 
 
 def _scored_df(rows):
