@@ -108,6 +108,42 @@ def exit_levels_for(
     return ExitLevels(take_profit_pct=take_profit, stop_loss_pct=stop_loss, derived=True)
 
 
+def exit_levels_advised(
+    predicted_return: float | None,
+    daily_volatility: float | None,
+    llm_take_profit_pct: float | None,
+    llm_stop_loss_pct: float | None,
+    horizon_days: int | None = None,
+) -> ExitLevels:
+    """
+    Same bounds as exit_levels_for, but the take-profit/stop-loss VALUE
+    within those bounds comes from an LLM's per-stock suggestion when one
+    is given and finite. Advisory, not authoritative: the bounds
+    themselves (volatility-derived, or the global fallback) are computed
+    exactly as exit_levels_for always has, so a stray, missing, or overly
+    aggressive LLM number can only ever be clamped into the existing safe
+    range, never escape it.
+    """
+    baseline = exit_levels_for(predicted_return, daily_volatility, horizon_days)
+    if not baseline.derived:
+        return baseline  # global fallback -- no per-stock bounds to advise within
+
+    horizon = horizon_days if horizon_days is not None else settings.target_horizon_days
+    horizon_sigma = daily_volatility * math.sqrt(max(horizon, 1))
+    tp_lo, tp_hi = settings.exit_min_take_profit_pct, max(settings.exit_take_profit_max_sigmas * horizon_sigma, settings.exit_min_take_profit_pct)
+    sl_lo, sl_hi = settings.exit_min_stop_loss_pct, settings.exit_max_stop_loss_pct
+
+    take_profit = baseline.take_profit_pct
+    if llm_take_profit_pct is not None and math.isfinite(llm_take_profit_pct):
+        take_profit = min(max(llm_take_profit_pct, tp_lo), tp_hi)
+
+    stop_loss = baseline.stop_loss_pct
+    if llm_stop_loss_pct is not None and math.isfinite(llm_stop_loss_pct):
+        stop_loss = min(max(llm_stop_loss_pct, sl_lo), sl_hi)
+
+    return ExitLevels(take_profit_pct=take_profit, stop_loss_pct=stop_loss, derived=True)
+
+
 def describe(levels: ExitLevels) -> str:
     """One line for the proposal message, so the human approves known levels."""
     basis = "sized to this stock" if levels.derived else "default levels — volatility unavailable"

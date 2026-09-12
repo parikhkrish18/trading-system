@@ -2,10 +2,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from execution.exit_levels import exit_levels_for
 from models.regime.trend_chop_classifier import TREND
 from models.screener import (
     ScreenResult,
     TradeCandidate,
+    _apply_llm_advice_to_scored,
     _attach_reasoning,
     _bounded_conviction_weights,
     apply_macro_sector_block,
@@ -577,6 +579,40 @@ class TestSelectionRespectsRankScoreCol:
         by_symbol = {c.symbol: c for c in candidates}
         assert by_symbol["AAPL"].target_position_pct > by_symbol["MMM"].target_position_pct
 
+    def test_select_concentrated_trades_uses_weight_score_col_when_given(self):
+        """
+        models/llm_advisor.py's advisory confidence score re-weights capital
+        among the picks it recommended, without changing conviction_score
+        itself (which Phase 3's narrative still quotes as the real forecast).
+        """
+        scored = _scored_df(
+            [
+                {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+                {"symbol": "TSLA", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
+            ]
+        )
+        # Raw conviction split would favor AAPL 2:1 -- invert it via an
+        # llm_confidence column so TSLA gets the bigger leg instead.
+        scored["llm_confidence"] = [0.2, 0.8]
+        candidates = select_concentrated_trades(
+            scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, weight_score_col="llm_confidence"
+        )
+        by_symbol = {c.symbol: c for c in candidates}
+        assert by_symbol["TSLA"].target_position_pct > by_symbol["AAPL"].target_position_pct
+
+    def test_select_concentrated_trades_weight_score_col_falls_back_when_column_missing(self):
+        scored = _scored_df(
+            [
+                {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+                {"symbol": "TSLA", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
+            ]
+        )
+        candidates = select_concentrated_trades(
+            scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6, weight_score_col="not_a_real_column"
+        )
+        by_symbol = {c.symbol: c for c in candidates}
+        assert by_symbol["AAPL"].target_position_pct == pytest.approx(2 / 3, rel=1e-6)
+
 
 def test_select_concentrated_trades_splits_by_relative_conviction():
     scored = _scored_df(
@@ -1087,6 +1123,63 @@ def test_run_screen_concentrated_mode_passes_position_count_and_split_settings(m
     assert calls["concentrated"]["max_positions"] == 3
 
 
+def test_run_screen_concentrated_mode_uses_llm_advice_when_available(monkeypatch):
+    """
+    When models/llm_advisor.py returns advice, select_concentrated_trades
+    is re-invoked over Claude's picks (rank/weight by llm_confidence, capped
+    at len(picks)), and the resulting candidate gets Claude's reasoning and
+    TP/SL hint rather than the template path.
+    """
+    scr, calls = _run_screen_harness(monkeypatch, "concentrated")
+    monkeypatch.setattr(scr.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(scr, "_build_llm_candidate_pool", lambda *a, **k: [{"symbol": "A"}])
+
+    advice = {
+        "by_symbol": {
+            "A": {
+                "confidence": 0.9,
+                "take_profit_pct": 0.08,
+                "stop_loss_pct": 0.04,
+                "reasoning": [{"phase": 2, "title": "x", "summary": "s", "lines": []}],
+            }
+        },
+        "picks": ["A"],
+    }
+    monkeypatch.setattr(scr, "get_llm_trade_advice", lambda *a, **k: advice)
+
+    candidate = scr.TradeCandidate(
+        symbol="A", side="long", predicted_return=0.05, direction_agreement=1.0,
+        conviction_score=0.05, target_position_pct=1.0,
+    )
+
+    def fake_select_concentrated(scored, **kwargs):
+        calls["concentrated"] = kwargs
+        return [candidate]
+
+    monkeypatch.setattr(scr, "select_concentrated_trades", fake_select_concentrated)
+    monkeypatch.setattr(scr, "attach_exit_levels", lambda *a, **k: calls.__setitem__("exit_levels_args", a))
+
+    result = scr.run_screen("v3", ["A"])
+
+    assert calls["concentrated"]["rank_score_col"] == "llm_confidence"
+    assert calls["concentrated"]["weight_score_col"] == "llm_confidence"
+    assert calls["concentrated"]["max_positions"] == 1
+    assert result[0].reasoning == advice["by_symbol"]["A"]["reasoning"]
+    llm_hints = calls["exit_levels_args"][2]
+    assert llm_hints["A"] == (0.08, 0.04)
+
+
+def test_run_screen_concentrated_mode_falls_back_to_quant_only_when_llm_advice_is_none(monkeypatch):
+    scr, calls = _run_screen_harness(monkeypatch, "concentrated")
+    monkeypatch.setattr(scr.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(scr, "_build_llm_candidate_pool", lambda *a, **k: [{"symbol": "A"}])
+    monkeypatch.setattr(scr, "get_llm_trade_advice", lambda *a, **k: None)
+
+    scr.run_screen("v3", ["A"])
+
+    assert calls["concentrated"]["rank_score_col"] == "rank_score"
+
+
 def test_run_screen_concentrated_mode_max_positions_override_wins_over_setting(monkeypatch):
     """execution/contradiction_monitor.py's reactivation passes this to cap new picks at the open slot count."""
     scr, calls = _run_screen_harness(monkeypatch, "concentrated")
@@ -1310,3 +1403,51 @@ def test_attach_exit_levels_falls_back_when_a_symbol_has_no_volatility():
     attach_exit_levels([candidate], {})
 
     assert candidate.exit_levels.derived is False
+
+
+def test_attach_exit_levels_uses_the_llm_hint_when_one_is_given():
+    candidate = TradeCandidate("AAPL", "long", 0.04, 1.0, 0.04, 0.1)
+
+    attach_exit_levels([candidate], {"AAPL": 0.02}, llm_hints={"AAPL": (0.09, 0.06)})
+
+    assert candidate.exit_levels.take_profit_pct == pytest.approx(0.09)
+    assert candidate.exit_levels.stop_loss_pct == pytest.approx(0.06)
+
+
+def test_attach_exit_levels_ignores_hints_for_a_symbol_not_in_the_map():
+    """A candidate the LLM path never advised on gets the plain quant formula, exactly as before this feature."""
+    with_hint = TradeCandidate("AAPL", "long", 0.04, 1.0, 0.04, 0.1)
+    without_hint = TradeCandidate("MSFT", "long", 0.04, 1.0, 0.04, 0.1)
+
+    attach_exit_levels([with_hint, without_hint], {"AAPL": 0.02, "MSFT": 0.02}, llm_hints={"AAPL": (0.09, 0.06)})
+
+    assert without_hint.exit_levels == exit_levels_for(predicted_return=0.04, daily_volatility=0.02)
+
+
+# --------------------------------------------------------------------------
+# _apply_llm_advice_to_scored
+# --------------------------------------------------------------------------
+
+
+def test_apply_llm_advice_to_scored_narrows_confident_to_exactly_the_picks():
+    scored = _scored_df(
+        [
+            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "TSLA", "predicted_return": 0.02, "direction_agreement": 1.0, "confident": True},
+            {"symbol": "MMM", "predicted_return": 0.01, "direction_agreement": 1.0, "confident": False},
+        ]
+    )
+    advice = {"by_symbol": {"AAPL": {"confidence": 0.8}}, "picks": ["AAPL"]}
+
+    result = _apply_llm_advice_to_scored(scored, advice)
+
+    assert list(result.loc[result["confident"], "symbol"]) == ["AAPL"]
+    assert result.set_index("symbol").loc["AAPL", "llm_confidence"] == pytest.approx(0.8)
+    assert pd.isna(result.set_index("symbol").loc["TSLA", "llm_confidence"])
+
+
+def test_apply_llm_advice_to_scored_never_mutates_the_original():
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True}])
+    _apply_llm_advice_to_scored(scored, {"by_symbol": {}, "picks": []})
+    assert "llm_confidence" not in scored.columns
+    assert scored["confident"].iloc[0]

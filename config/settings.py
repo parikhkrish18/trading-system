@@ -58,7 +58,8 @@ class Settings(BaseSettings):
     # blocks automated requests, see that module's docstring).
     fred_api_key: str = Field(default="", alias="FRED_API_KEY")
 
-    # --- LLM (sentiment scoring) ---
+    # --- LLM (news sentiment scoring, features/qualitative/sentiment.py;
+    # concentrated-mode trade advisory, models/llm_advisor.py) ---
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 
     # --- DB ---
