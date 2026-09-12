@@ -8,6 +8,7 @@ from models.screener import (
     TradeCandidate,
     _attach_reasoning,
     _bounded_conviction_weights,
+    apply_macro_sector_block,
     apply_short_preference,
     apply_trend_pullback_boost,
     attach_exit_levels,
@@ -144,6 +145,58 @@ def test_score_universe_reads_the_raw_breakout_not_the_zscored_one():
 
     # predicted +0.05 (up) vs raw breakout -1 (down) -- must NOT be confident.
     assert not result.set_index("symbol").loc["AAPL", "confident"]
+
+
+class TestApplyMacroSectorBlock:
+    def _scored(self, rows):
+        df = pd.DataFrame(rows)
+        df["confident"] = True
+        return df
+
+    def test_blocks_a_long_when_market_and_sector_are_both_bearish(self):
+        scored = self._scored([{"symbol": "AAPL", "predicted_return": 0.05}])
+        result = apply_macro_sector_block(scored, macro_mkt_sentiment=-0.41, macro_sector_sentiment_by_symbol={"AAPL": -0.35})
+        assert not result.loc[0, "confident"]
+
+    def test_blocks_a_short_when_market_and_sector_are_both_bullish(self):
+        scored = self._scored([{"symbol": "AAPL", "predicted_return": -0.05}])
+        result = apply_macro_sector_block(scored, macro_mkt_sentiment=0.30, macro_sector_sentiment_by_symbol={"AAPL": 0.20})
+        assert not result.loc[0, "confident"]
+
+    def test_does_not_block_a_short_when_market_and_sector_are_bearish(self):
+        """Bearish backdrop blocks longs, not shorts -- the direction it actually agrees with is untouched."""
+        scored = self._scored([{"symbol": "AAPL", "predicted_return": -0.05}])
+        result = apply_macro_sector_block(scored, macro_mkt_sentiment=-0.41, macro_sector_sentiment_by_symbol={"AAPL": -0.35})
+        assert result.loc[0, "confident"]
+
+    def test_does_not_block_when_market_and_sector_disagree(self):
+        scored = self._scored([{"symbol": "AAPL", "predicted_return": 0.05}])
+        result = apply_macro_sector_block(scored, macro_mkt_sentiment=-0.41, macro_sector_sentiment_by_symbol={"AAPL": 0.10})
+        assert result.loc[0, "confident"]
+
+    def test_does_not_block_when_sector_sentiment_is_missing(self):
+        scored = self._scored([{"symbol": "AAPL", "predicted_return": 0.05}])
+        result = apply_macro_sector_block(scored, macro_mkt_sentiment=-0.41, macro_sector_sentiment_by_symbol={})
+        assert result.loc[0, "confident"]
+
+    def test_does_not_block_when_market_sentiment_is_none(self):
+        scored = self._scored([{"symbol": "AAPL", "predicted_return": 0.05}])
+        result = apply_macro_sector_block(scored, macro_mkt_sentiment=None, macro_sector_sentiment_by_symbol={"AAPL": -0.35})
+        assert result.loc[0, "confident"]
+
+    def test_leaves_other_symbols_confidence_untouched(self):
+        scored = self._scored(
+            [
+                {"symbol": "AAPL", "predicted_return": 0.05},
+                {"symbol": "MSFT", "predicted_return": 0.05},
+            ]
+        )
+        result = apply_macro_sector_block(
+            scored, macro_mkt_sentiment=-0.41, macro_sector_sentiment_by_symbol={"AAPL": -0.35}
+        )
+        by_symbol = result.set_index("symbol")
+        assert not by_symbol.loc["AAPL", "confident"]
+        assert by_symbol.loc["MSFT", "confident"]  # no sector reading for MSFT -- untouched, not guessed
 
 
 class TestApplyTrendPullbackBoost:

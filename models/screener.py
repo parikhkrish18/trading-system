@@ -40,7 +40,7 @@ from features.quant.volatility import realized_vol
 from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND
-from models.train import feature_columns, load_feature_frame, load_training_frame
+from models.train import cross_sectional_feature_columns, feature_columns, load_feature_frame, load_training_frame
 from monitoring import reasoning
 from risk.sizing import scale_to_full_deployment, target_position_size
 
@@ -82,7 +82,8 @@ def load_latest_features(
     The most recent feature row per symbol — what gets scored "as of today".
 
     In relative mode the features are cross-sectionally z-scored across the
-    snapshot, exactly as load_training_frame z-scores each training date.
+    snapshot, exactly as load_training_frame z-scores each training date
+    (same NON_CROSS_SECTIONAL_FEATURES exception — see its docstring).
     That has to match: a model trained on per-date z-scores and then scored
     on raw feature levels would be reading a completely different scale from
     the one it learned on, and would produce confident nonsense.
@@ -99,7 +100,7 @@ def load_latest_features(
     if target_mode == "absolute":
         return latest
 
-    cols = feature_columns(latest)
+    cols = cross_sectional_feature_columns(latest)
     snapshot = latest.assign(_as_of="snapshot")
     return cross_sectional_zscore(snapshot, cols, date_col="_as_of").drop(columns="_as_of")
 
@@ -211,6 +212,62 @@ def score_universe(
     )
     result["confident"] = (result["predicted_return"].abs() >= min_abs_return) & breakout_aligned
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
+
+
+def apply_macro_sector_block(
+    scored: pd.DataFrame,
+    macro_mkt_sentiment: float | None,
+    macro_sector_sentiment_by_symbol: dict[str, float] | None,
+) -> pd.DataFrame:
+    """
+    Hard block, not a ranking nudge: when the market-wide sentiment AND a
+    stock's own sector sentiment are BOTH negative, a long candidate in
+    that stock is never confident, whatever the model itself predicted.
+    Symmetric for the mirror case (both positive -> no shorts). Sets
+    `confident` to False on the blocked rows rather than dropping them, so
+    they still show up in `scored` (counts, reasoning, debugging) exactly
+    like any other row that failed to clear the bar — select_trades/
+    select_concentrated_trades already only ever pick from
+    scored.loc[scored["confident"]].
+
+    Either sentiment being missing/NaN, or the two disagreeing in sign,
+    leaves `confident` untouched — this only fires when the backdrop is
+    genuinely aligned against the trade's own direction, never guessed
+    from incomplete data.
+
+    This is a deliberate exception to how every other macro/sector signal
+    in this codebase works (see features/qualitative/macro_sentiment.py's
+    own module docstring: those are plain model features the ensemble
+    weighs on its own, by design, not hand-coded rules). This one is an
+    explicit override: being long against a market AND sector that are
+    both genuinely rolling over — or short against both genuinely
+    rallying — is a setup this system should never take regardless of
+    what one stock's own signals say.
+
+    macro_mkt_sentiment/macro_sector_sentiment_by_symbol must be the RAW
+    (un-z-scored) values — see score_universe's own raw_features docstring
+    for why: in TARGET_MODE=relative, macro_mkt_sentiment is broadcast
+    identically to every symbol on a given date, so z-scoring it across
+    the snapshot divides by a zero cross-sectional std and erases it
+    entirely. Callers should read these from run_screen_with_scores'
+    unscaled `raw_latest`, never from the (possibly z-scored) `latest`
+    passed to score_universe.
+    """
+    if (
+        scored.empty
+        or macro_mkt_sentiment is None
+        or pd.isna(macro_mkt_sentiment)
+        or not macro_sector_sentiment_by_symbol
+    ):
+        return scored
+
+    out = scored.copy()
+    sector_sentiment = out["symbol"].map(macro_sector_sentiment_by_symbol)
+    aligned_bearish = (macro_mkt_sentiment < 0) & (sector_sentiment < 0)
+    aligned_bullish = (macro_mkt_sentiment > 0) & (sector_sentiment > 0)
+    blocked = (aligned_bearish & (out["predicted_return"] > 0)) | (aligned_bullish & (out["predicted_return"] < 0))
+    out.loc[blocked.fillna(False), "confident"] = False
+    return out
 
 
 def apply_trend_pullback_boost(
@@ -990,6 +1047,16 @@ def run_screen_with_scores(
         feature_set_id, symbols, target_mode="absolute"
     )
     scored = score_universe(ensemble, latest, feature_cols, min_abs_return, raw_features=raw_latest)
+
+    if settings.enable_macro_sector_block:
+        macro_mkt_sentiment = None
+        macro_sector_sentiment_by_symbol: dict[str, float] = {}
+        if "macro_mkt_sentiment" in raw_latest.columns:
+            mkt_values = raw_latest["macro_mkt_sentiment"].dropna()
+            macro_mkt_sentiment = float(mkt_values.iloc[0]) if not mkt_values.empty else None
+        if "macro_sector_sentiment" in raw_latest.columns:
+            macro_sector_sentiment_by_symbol = raw_latest.set_index("symbol")["macro_sector_sentiment"].to_dict()
+        scored = apply_macro_sector_block(scored, macro_mkt_sentiment, macro_sector_sentiment_by_symbol)
 
     # Computed once, up front, so it can inform BOTH which candidates get
     # picked (the long/short ranking preference below, when configured) and
