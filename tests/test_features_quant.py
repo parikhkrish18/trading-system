@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from features.quant import mean_reversion, momentum, volatility
+from features.quant import donchian, mean_reversion, momentum, volatility
 
 # ---------------------------------------------------------------------
 # momentum.py
@@ -113,6 +113,101 @@ def test_cross_sectional_rank_single_symbol_is_the_max_percentile():
     values = pd.Series({"AAPL": 0.01})
     ranked = momentum.cross_sectional_rank(values)
     assert ranked["AAPL"] == 1.0
+
+
+def test_trend_pullback_score_positive_for_an_uptrend_with_a_pullback():
+    up = 100 * np.exp(np.cumsum([0.02] * 30))
+    pullback = up[-1] * np.exp(np.cumsum([-0.01] * 5))
+    close = pd.Series(np.concatenate([up, pullback]))
+    result = momentum.trend_pullback_score(close, trend_window=20, pullback_window=5)
+    assert result.iloc[-1] > 0
+
+
+def test_trend_pullback_score_negative_for_a_downtrend_with_a_bounce():
+    down = 100 * np.exp(np.cumsum([-0.02] * 30))
+    bounce = down[-1] * np.exp(np.cumsum([0.01] * 5))
+    close = pd.Series(np.concatenate([down, bounce]))
+    result = momentum.trend_pullback_score(close, trend_window=20, pullback_window=5)
+    assert result.iloc[-1] < 0
+
+
+def test_trend_pullback_score_is_zero_on_straight_continuation_without_a_pullback():
+    """Continuing straight up with no counter-move isn't the pullback pattern -- 0, not a big positive number."""
+    close = pd.Series(100 * np.exp(np.cumsum([0.02] * 40)))
+    result = momentum.trend_pullback_score(close, trend_window=20, pullback_window=5)
+    assert result.iloc[-1] == 0.0
+
+
+def test_trend_pullback_score_does_not_divide_by_zero_on_a_flat_series():
+    close = pd.Series([100.0] * 40)
+    result = momentum.trend_pullback_score(close, trend_window=20, pullback_window=5)
+    assert not np.isinf(result.dropna()).any()
+
+
+# ---------------------------------------------------------------------
+# donchian.py
+# ---------------------------------------------------------------------
+
+
+def test_donchian_pct_hand_computed_value():
+    high = pd.Series([10.0, 12.0, 9.0, 11.0])
+    low = pd.Series([9.0, 10.0, 7.0, 9.5])
+    close = pd.Series([9.5, 11.0, 8.0, 10.5])
+    result = donchian.donchian_pct(high, low, close, window=3)
+    # window covers idx0-2: upper=max(high[:3])=12.0, lower=min(low[:3])=7.0, span=5.0
+    # close[2]=8.0 -> (8.0-7.0)/5.0 = 0.2
+    assert result.iloc[2] == pytest.approx(0.2)
+
+
+def test_donchian_pct_is_nan_on_a_perfectly_flat_range():
+    high = pd.Series([10.0] * 5)
+    low = pd.Series([10.0] * 5)
+    close = pd.Series([10.0] * 5)
+    result = donchian.donchian_pct(high, low, close, window=3)
+    assert result.dropna().empty
+
+
+def test_donchian_pct_is_bounded_zero_to_one():
+    rng = np.random.default_rng(5)
+    high = pd.Series(100 + np.cumsum(rng.normal(0, 1, 60)))
+    low = high - rng.uniform(0.5, 2.0, 60)
+    close = low + rng.uniform(0, 1, 60) * (high - low)
+    result = donchian.donchian_pct(high, low, close, window=20).dropna()
+    assert (result >= 0).all() and (result <= 1).all()
+
+
+def test_donchian_breakout_flags_a_fresh_high():
+    high = pd.Series([100.0] * 5 + [105.0])
+    low = pd.Series([99.0] * 5 + [104.0])
+    close = pd.Series([99.5] * 5 + [104.5])
+    result = donchian.donchian_breakout(high, low, close, window=5)
+    assert result.iloc[-1] == 1.0
+
+
+def test_donchian_breakout_flags_a_fresh_low():
+    high = pd.Series([100.0] * 5 + [95.0])
+    low = pd.Series([99.0] * 5 + [90.0])
+    close = pd.Series([99.5] * 5 + [90.5])
+    result = donchian.donchian_breakout(high, low, close, window=5)
+    assert result.iloc[-1] == -1.0
+
+
+def test_donchian_breakout_is_zero_within_the_existing_range():
+    high = pd.Series([100.0] * 10)
+    low = pd.Series([99.0] * 10)
+    close = pd.Series([99.5] * 10)
+    result = donchian.donchian_breakout(high, low, close, window=5)
+    assert (result.dropna() == 0.0).all()
+
+
+def test_donchian_breakout_is_nan_during_warmup():
+    """Today's own bar can't count toward the range it's compared against -- see the shift(1) in the implementation."""
+    high = pd.Series([100.0] * 10)
+    low = pd.Series([99.0] * 10)
+    close = pd.Series([99.5] * 10)
+    result = donchian.donchian_breakout(high, low, close, window=5)
+    assert result.iloc[:5].isna().all()
+    assert result.iloc[5:].notna().all()
 
 
 # ---------------------------------------------------------------------

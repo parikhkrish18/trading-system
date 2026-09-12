@@ -325,6 +325,18 @@ class Settings(BaseSettings):
     # through.
     short_low_risk_stop_loss_pct: float = Field(default=0.06, alias="SHORT_LOW_RISK_STOP_LOSS_PCT")
 
+    # --- Trend pullback ranking boost (models/screener.py) ---
+    # A small tie-breaker boost to rank_score (never to sizing, which still
+    # runs off the model's own conviction_score) for a candidate whose
+    # trend_pullback_score (features/quant/momentum.py) agrees with the
+    # predicted direction -- an uptrend pulling back that the model ALSO
+    # calls a buy, or a downtrend bouncing that it ALSO calls a sell.
+    # 0.0 disables the boost entirely.
+    trend_pullback_boost_pct: float = Field(default=0.15, alias="TREND_PULLBACK_BOOST_PCT")
+    # How large |trend_pullback_score| (risk-adjusted-return units) must be
+    # before the pattern counts as a real setup rather than noise.
+    trend_pullback_min_score: float = Field(default=0.5, alias="TREND_PULLBACK_MIN_SCORE")
+
     # --- Strategy selection ---
     # "diversified" (default) = top-k book sized by risk.sizing.select_trades
     # under the conservative caps above. "concentrated" = the small

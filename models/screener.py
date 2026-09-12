@@ -26,6 +26,7 @@ import logging
 import math
 from collections.abc import Callable
 
+import numpy as np
 import pandas as pd
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -119,32 +120,56 @@ def score_universe(
     latest_features: pd.DataFrame,
     feature_cols: list[str],
     min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
+    raw_features: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     latest_features: one row per symbol (see load_latest_features), with a
     'symbol' column plus all of `feature_cols` (missing ones are fine —
     LightGBM handles NaN features natively).
-    Returns: symbol, predicted_return, direction_agreement, conviction_score, confident.
+    Returns: symbol, predicted_return, direction_agreement, conviction_score,
+    donchian_breakout_20, trend_pullback_score, confident.
 
-    One bar decides "confident": the predicted move must be bigger than
-    what the round trip costs. A prediction smaller than the cost of acting
-    on it is a guaranteed loser even when its direction is right.
+    Two bars decide "confident": the predicted move must be bigger than
+    what the round trip costs (a prediction smaller than the cost of acting
+    on it is a guaranteed loser even when its direction is right), AND —
+    when donchian_breakout_20 is present in the data — price must actually
+    be breaking a real 20-day high/low in the SAME direction as the
+    prediction: a bullish call needs a fresh 20-day high, a bearish one a
+    fresh 20-day low. A feature set built before this feature existed (no
+    donchian_breakout_20 column at all) falls back to the cost hurdle alone,
+    same as before this existed — this is a stricter bar layered on top,
+    not a replacement that could silently break an older feature set.
 
-    There used to be a second bar — at least 80% of the ensemble agreeing
-    on direction — and it was measured to carry no information. The members
-    are near-clones, so ~96% of predictions passed it, accuracy on the rows
-    it called "confident" matched accuracy overall, and making the members
-    structurally diverse did not change that. A filter that admits almost
-    everything and predicts nothing is not a safeguard; it is a number that
-    makes a system look more careful than it is.
+    `raw_features`: donchian_breakout_20 is read from here when given,
+    falling back to latest_features otherwise. In TARGET_MODE=relative,
+    latest_features is cross-sectionally z-scored (see load_latest_features)
+    — a z-scored breakout flag no longer means "this stock broke out today",
+    only "more or less than the day's universe average", which could read a
+    stock with NO breakout at all as positive on a day most of the universe
+    happens to be breaking out. raw_features (run_screen_with_scores passes
+    its unscaled `raw_latest`) is the actual, un-relativized signal. Matched
+    to `latest_features` by symbol, not row position, since the two may come
+    from separate load_latest_features calls.
+
+    There used to be a second bar here — at least 80% of the ensemble
+    agreeing on direction — and it was measured to carry no information.
+    The members are near-clones, so ~96% of predictions passed it, accuracy
+    on the rows it called "confident" matched accuracy overall, and making
+    the members structurally diverse did not change that. A filter that
+    admits almost everything and predicts nothing is not a safeguard; it is
+    a number that makes a system look more careful than it is. The
+    Donchian bar above replaces it with an actual price-action condition
+    instead of a model-internal number that didn't predict being right.
 
     direction_agreement is still computed and recorded, because it is
-    evidence about the ensemble worth keeping. It just no longer selects or
-    ranks anything, and it is not shown anywhere that would invite reading
-    confidence into it.
+    evidence about the ensemble worth keeping. It plays no part in
+    `confident` above.
     """
     empty = pd.DataFrame(
-        columns=["symbol", "predicted_return", "direction_agreement", "conviction_score", "confident"]
+        columns=[
+            "symbol", "predicted_return", "direction_agreement", "conviction_score",
+            "donchian_breakout_20", "trend_pullback_score", "confident",
+        ]
     )
     if latest_features.empty:
         return empty
@@ -159,12 +184,71 @@ def score_universe(
             "direction_agreement": preds["direction_agreement"].to_numpy(),
         }
     )
+
+    signal_source = raw_features if raw_features is not None else latest_features
+    has_breakout_signal = (
+        signal_source is not None and "symbol" in signal_source.columns and "donchian_breakout_20" in signal_source.columns
+    )
+    if has_breakout_signal:
+        breakout_by_symbol = signal_source.set_index("symbol")["donchian_breakout_20"]
+        result["donchian_breakout_20"] = result["symbol"].map(breakout_by_symbol).fillna(0.0)
+    else:
+        result["donchian_breakout_20"] = np.nan
+
+    if signal_source is not None and "symbol" in signal_source.columns and "mom_pullback_20_5" in signal_source.columns:
+        pullback_by_symbol = signal_source.set_index("symbol")["mom_pullback_20_5"]
+        result["trend_pullback_score"] = result["symbol"].map(pullback_by_symbol).fillna(0.0)
+    else:
+        result["trend_pullback_score"] = 0.0
+
     # Rank on the size of the predicted move alone. Multiplying by
     # agreement mixed a noise term into the ordering, so which pick got the
     # most capital was partly decided by a number that means nothing.
     result["conviction_score"] = result["predicted_return"].abs()
-    result["confident"] = result["predicted_return"].abs() >= min_abs_return
+
+    breakout_aligned = (
+        np.sign(result["predicted_return"]) == result["donchian_breakout_20"] if has_breakout_signal else True
+    )
+    result["confident"] = (result["predicted_return"].abs() >= min_abs_return) & breakout_aligned
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
+
+
+def apply_trend_pullback_boost(
+    scored: pd.DataFrame,
+    boost_pct: float = 0.0,
+    min_score: float = 0.0,
+) -> pd.DataFrame:
+    """
+    A ranking tie-breaker (never a sizing change — sizing still runs off the
+    model's own conviction_score untouched) for a candidate whose
+    trend_pullback_score (see features/quant/momentum.py, and score_universe
+    above for where this column comes from) agrees with the direction the
+    model predicted: an uptrend pulling back that the model ALSO calls a
+    buy, or a downtrend bouncing that it ALSO calls a sell. This is a boost
+    on top of the ML forecast, not a substitute for it — a candidate the
+    model doesn't like at all gets no boost no matter how textbook the
+    pullback looks, and nothing here can select a candidate score_universe
+    didn't already mark confident.
+
+    Call this AFTER apply_short_preference (or standalone, if the short
+    preference isn't in use) — it boosts whatever `rank_score` already holds,
+    defaulting to conviction_score when apply_short_preference hasn't run.
+
+    boost_pct=0.0 (the default) makes this a no-op, matching every existing
+    caller that predates this.
+    """
+    if scored.empty or boost_pct <= 0.0 or "trend_pullback_score" not in scored.columns:
+        return scored
+
+    out = scored.copy()
+    if "rank_score" not in out.columns:
+        out["rank_score"] = out["conviction_score"]
+
+    aligned = (np.sign(out["predicted_return"]) == np.sign(out["trend_pullback_score"])) & (
+        out["trend_pullback_score"].abs() >= min_score
+    )
+    out.loc[aligned, "rank_score"] = out.loc[aligned, "rank_score"] * (1.0 + boost_pct)
+    return out
 
 
 def apply_short_preference(
@@ -905,7 +989,7 @@ def run_screen_with_scores(
     raw_latest = latest if settings.target_mode == "absolute" else load_latest_features(
         feature_set_id, symbols, target_mode="absolute"
     )
-    scored = score_universe(ensemble, latest, feature_cols, min_abs_return)
+    scored = score_universe(ensemble, latest, feature_cols, min_abs_return, raw_features=raw_latest)
 
     # Computed once, up front, so it can inform BOTH which candidates get
     # picked (the long/short ranking preference below, when configured) and
@@ -916,6 +1000,11 @@ def run_screen_with_scores(
         scored, vol_by_symbol, target_horizon_days,
         penalty=settings.short_ranking_penalty,
         low_risk_stop_loss_pct=settings.short_low_risk_stop_loss_pct,
+    )
+    scored = apply_trend_pullback_boost(
+        scored,
+        boost_pct=settings.trend_pullback_boost_pct,
+        min_score=settings.trend_pullback_min_score,
     )
 
     if not settings.allow_shorts and not scored.empty:

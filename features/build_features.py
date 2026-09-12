@@ -25,8 +25,9 @@ from features.qualitative.macro_sentiment import (
     build_macro_interaction_features,
     build_macro_sentiment_features,
 )
+from features.quant.donchian import donchian_breakout, donchian_pct
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
-from features.quant.momentum import adx, rolling_return
+from features.quant.momentum import adx, rolling_return, trend_pullback_score
 from features.quant.volatility import atr, realized_vol, vol_of_vol
 
 # Macro categories tracked in the macro_calendar table (see
@@ -45,6 +46,15 @@ QUANT_FEATURES = {
     "meanrev_zscore_20d": lambda df: zscore(df["close"], 20),
     "meanrev_bollinger_pctb": lambda df: bollinger_pct_b(df["close"]),
     "meanrev_rsi_14": lambda df: rsi(df["close"], 14),
+    # Where price sits in its own 20-day range (support/resistance), and
+    # whether today actually broke out of it -- see models/screener.py's
+    # score_universe for how the breakout flag also gates live "confident"
+    # trades, not just feeding the forecast model.
+    "donchian_pct_20": lambda df: donchian_pct(df["high"], df["low"], df["close"], 20),
+    "donchian_breakout_20": lambda df: donchian_breakout(df["high"], df["low"], df["close"], 20),
+    # Uptrend-with-a-pullback / downtrend-with-a-bounce continuation setup —
+    # see trend_pullback_score's own docstring.
+    "mom_pullback_20_5": lambda df: trend_pullback_score(df["close"], 20, 5),
 }
 
 
