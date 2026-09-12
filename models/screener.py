@@ -1264,16 +1264,25 @@ def run_screen_with_scores(
                 ]
             macro_sector_map = macro_sector_sentiment_by_symbol if settings.enable_macro_sector_block else {}
             latest_close_by_symbol = train_df.sort_values("ts").groupby("symbol")["close"].last().to_dict()
+            llm_pool = _build_llm_candidate_pool(
+                eligible, ensemble, latest, raw_latest, feature_cols, vol_by_symbol,
+                latest_close_by_symbol, macro_sector_map, target_horizon_days,
+            )
             llm_advice = get_llm_trade_advice(
-                _build_llm_candidate_pool(
-                    eligible, ensemble, latest, raw_latest, feature_cols, vol_by_symbol,
-                    latest_close_by_symbol, macro_sector_map, target_horizon_days,
-                ),
+                llm_pool,
                 market_context={"regime": regime, "target_horizon_days": target_horizon_days},
                 max_picks=max_positions,
             )
 
         if llm_advice is not None:
+            # The SHAP top_features every candidate was given as input, so
+            # Claude's phase 2 can carry them alongside its own narrative --
+            # same convention reasoning.phase_signals uses (top_features
+            # verbatim for machine consumers like the Feature Importance
+            # panel, prose for humans) -- without it, a decision Claude
+            # advised on would silently vanish from that chart even though
+            # the attribution was computed and shown to Claude as input.
+            top_features_by_symbol = {c["symbol"]: c["top_features"] for c in llm_pool}
             candidates = select_concentrated_trades(
                 _apply_llm_advice_to_scored(scored, llm_advice),
                 max_leg_pct=settings.max_concentrated_position_pct,
@@ -1290,6 +1299,9 @@ def run_screen_with_scores(
                 if info is None:
                     continue
                 candidate.reasoning = info["reasoning"]
+                for phase in candidate.reasoning:
+                    if phase["phase"] == 2:
+                        phase["top_features"] = top_features_by_symbol.get(candidate.symbol, [])
                 llm_exit_hints[candidate.symbol] = (info["take_profit_pct"], info["stop_loss_pct"])
         else:
             candidates = select_concentrated_trades(

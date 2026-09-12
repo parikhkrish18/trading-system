@@ -1132,7 +1132,10 @@ def test_run_screen_concentrated_mode_uses_llm_advice_when_available(monkeypatch
     """
     scr, calls = _run_screen_harness(monkeypatch, "concentrated")
     monkeypatch.setattr(scr.settings, "anthropic_api_key", "test-key")
-    monkeypatch.setattr(scr, "_build_llm_candidate_pool", lambda *a, **k: [{"symbol": "A"}])
+    given_top_features = [{"feature_name": "mom_ret_20d", "value": 0.08, "contribution": 0.01}]
+    monkeypatch.setattr(
+        scr, "_build_llm_candidate_pool", lambda *a, **k: [{"symbol": "A", "top_features": given_top_features}]
+    )
 
     advice = {
         "by_symbol": {
@@ -1164,6 +1167,12 @@ def test_run_screen_concentrated_mode_uses_llm_advice_when_available(monkeypatch
     assert calls["concentrated"]["rank_score_col"] == "llm_confidence"
     assert calls["concentrated"]["weight_score_col"] == "llm_confidence"
     assert calls["concentrated"]["max_positions"] == 1
+    # The SHAP top_features the candidate was given as input travel back
+    # out on phase 2, same convention monitoring/reasoning.py's own
+    # phase_signals uses -- otherwise this decision would silently
+    # contribute nothing to the Feature Importance Over Time panel.
+    phase2 = next(p for p in result[0].reasoning if p["phase"] == 2)
+    assert phase2["top_features"] == given_top_features
     assert result[0].reasoning == advice["by_symbol"]["A"]["reasoning"]
     llm_hints = calls["exit_levels_args"][2]
     assert llm_hints["A"] == (0.08, 0.04)
