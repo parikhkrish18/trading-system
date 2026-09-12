@@ -141,6 +141,45 @@ def test_feature_columns_excludes_both_label_columns():
     assert train.feature_columns(df) == ["rsi", "macd"]
 
 
+def test_cross_sectional_feature_columns_excludes_broadcast_macro_features():
+    """
+    macro_mkt_sentiment is still a real, active model input -- feature_columns()
+    must keep it. It's only excluded from the cross-sectional z-scoring pass
+    (see NON_CROSS_SECTIONAL_FEATURES's own docstring for why).
+    """
+    df = pd.DataFrame(
+        columns=["symbol", "ts", "close", "fwd_return", "target", "rsi", "macro_mkt_sentiment"]
+    )
+    assert train.cross_sectional_feature_columns(df) == ["rsi"]
+    assert "macro_mkt_sentiment" in train.feature_columns(df)
+
+
+def test_relative_mode_leaves_a_broadcast_macro_feature_raw_not_zeroed(monkeypatch):
+    """
+    Regression: macro_mkt_sentiment is the SAME value for every symbol on a
+    given date (see features/qualitative/macro_sentiment.py) -- a column
+    with zero cross-sectional variation has its per-date std pinned at
+    exactly 0.0 every day, so blindly cross-sectionally z-scoring it (like
+    every other feature) would collapse it to a permanent 0.0 regardless of
+    the real value (see cross_sectional_zscore's own zero-variance guard).
+    NON_CROSS_SECTIONAL_FEATURES exists specifically to keep this one raw.
+    """
+    df = _feature_frame()
+    dates = df["ts"].unique()
+    macro_by_date = dict(zip(dates, np.linspace(-0.4, 0.4, len(dates)), strict=False))
+    df = df.assign(macro_mkt_sentiment=df["ts"].map(macro_by_date))
+    monkeypatch.setattr(train, "load_feature_frame", lambda *a, **k: df)
+
+    result = train.load_training_frame("v4", ["AAA", "BBB", "CCC"], 2, target_mode="relative")
+
+    expected = result["ts"].map(macro_by_date)
+    assert list(result["macro_mkt_sentiment"]) == pytest.approx(list(expected))
+    assert not (result["macro_mkt_sentiment"] == 0.0).all()
+    # A genuinely cross-sectional feature in the same frame is still z-scored normally.
+    per_date = result.groupby("ts")["rsi"]
+    assert per_date.mean().abs().max() == pytest.approx(0.0, abs=1e-12)
+
+
 def test_relative_labels_are_smaller_than_absolute_ones_in_a_trending_market(monkeypatch):
     """
     Sanity check on the premise: the absolute label carries the market's
@@ -256,6 +295,29 @@ def test_the_screener_scores_on_the_same_scale_it_trained_on(monkeypatch):
     assert latest["rsi"].iloc[0] < 0 < latest["rsi"].iloc[2]  # ranking preserved
     assert "_as_of" not in latest.columns
     assert list(latest["close"]) == [100.0, 200.0, 300.0]  # not a feature, untouched
+
+
+def test_the_screener_leaves_a_broadcast_macro_feature_raw_in_relative_mode(monkeypatch):
+    """Same regression as train.load_training_frame's, for the live-scoring path."""
+    monkeypatch.setattr(scr.settings, "target_mode", "relative")
+    monkeypatch.setattr(
+        scr,
+        "load_feature_frame",
+        lambda *a, **k: pd.DataFrame(
+            {
+                "symbol": ["AAA", "BBB", "CCC"],
+                "ts": pd.to_datetime(["2026-02-02"] * 3),
+                "close": [100.0, 200.0, 300.0],
+                "rsi": [30.0, 50.0, 70.0],
+                "macro_mkt_sentiment": [-0.41, -0.41, -0.41],
+            }
+        ),
+    )
+
+    latest = scr.load_latest_features("v4", ["AAA", "BBB", "CCC"])
+
+    assert list(latest["macro_mkt_sentiment"]) == [-0.41, -0.41, -0.41]
+    assert latest["rsi"].mean() == pytest.approx(0.0, abs=1e-12)  # rsi still z-scored normally
 
 
 def test_the_screener_leaves_features_raw_in_absolute_mode(monkeypatch):

@@ -40,7 +40,7 @@ from features.quant.volatility import realized_vol
 from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
 from models.regime.trend_chop_classifier import TREND
-from models.train import feature_columns, load_feature_frame, load_training_frame
+from models.train import cross_sectional_feature_columns, feature_columns, load_feature_frame, load_training_frame
 from monitoring import reasoning
 from risk.sizing import scale_to_full_deployment, target_position_size
 
@@ -82,7 +82,8 @@ def load_latest_features(
     The most recent feature row per symbol — what gets scored "as of today".
 
     In relative mode the features are cross-sectionally z-scored across the
-    snapshot, exactly as load_training_frame z-scores each training date.
+    snapshot, exactly as load_training_frame z-scores each training date
+    (same NON_CROSS_SECTIONAL_FEATURES exception — see its docstring).
     That has to match: a model trained on per-date z-scores and then scored
     on raw feature levels would be reading a completely different scale from
     the one it learned on, and would produce confident nonsense.
@@ -99,7 +100,7 @@ def load_latest_features(
     if target_mode == "absolute":
         return latest
 
-    cols = feature_columns(latest)
+    cols = cross_sectional_feature_columns(latest)
     snapshot = latest.assign(_as_of="snapshot")
     return cross_sectional_zscore(snapshot, cols, date_col="_as_of").drop(columns="_as_of")
 

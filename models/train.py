@@ -149,10 +149,29 @@ def load_feature_frame(feature_set_id: str, symbols: list[str]) -> pd.DataFrame:
 
 NON_FEATURE_COLUMNS = ("symbol", "ts", "close", "fwd_return", "target")
 
+# Feature columns broadcast identically to every symbol on a given date --
+# currently just macro_mkt_sentiment (features/qualitative/macro_sentiment.py:
+# the whole-market sentiment read, the same value across the entire universe
+# that day), unlike macro_sector_sentiment which genuinely varies by sector.
+# cross_sectional_zscore subtracts each date's cross-sectional mean and
+# divides by its cross-sectional std; a column with zero cross-sectional
+# variation has that std pinned at exactly 0.0 every single day, so its own
+# zero-variance guard (see its docstring) collapses the z-score to a
+# permanent 0.0 regardless of what the real value was -- not a coincidental
+# flat day, an every-day structural one. These stay real, active model
+# inputs (feature_columns() below still includes them) -- excluded only from
+# the cross-sectional RELATIVIZING step, left in their raw units instead.
+NON_CROSS_SECTIONAL_FEATURES = frozenset({"macro_mkt_sentiment"})
+
 
 def feature_columns(df: pd.DataFrame) -> list[str]:
     """Everything in a training frame that is a model input, in frame order."""
     return [c for c in df.columns if c not in NON_FEATURE_COLUMNS]
+
+
+def cross_sectional_feature_columns(df: pd.DataFrame) -> list[str]:
+    """feature_columns(), minus the ones that must not be cross-sectionally z-scored (see NON_CROSS_SECTIONAL_FEATURES)."""
+    return [c for c in feature_columns(df) if c not in NON_CROSS_SECTIONAL_FEATURES]
 
 
 def load_training_frame(
@@ -179,10 +198,13 @@ def load_training_frame(
       "absolute"  target == fwd_return. The original behaviour.
       "relative"  target = fwd_return minus the equal-weight mean fwd_return
                   of the universe on the same date, and every feature is
-                  replaced by its cross-sectional z-score within its date.
-                  The market move cancels out of both label and features, so
-                  the model can only earn its keep by ranking stocks against
-                  each other.
+                  replaced by its cross-sectional z-score within its date
+                  (except NON_CROSS_SECTIONAL_FEATURES, which have no
+                  cross-sectional variation to z-score against in the first
+                  place and are left in their raw units instead). The market
+                  move cancels out of both label and features, so the model
+                  can only earn its keep by ranking stocks against each
+                  other.
 
     The cross-sectional transforms are computed on the whole frame before
     the walk-forward splits it. That is not leakage: both use only rows
@@ -209,7 +231,7 @@ def load_training_frame(
         return merged
 
     merged["target"] = cross_sectional_excess(merged, "fwd_return", "ts")
-    return cross_sectional_zscore(merged, feature_columns(merged), "ts")
+    return cross_sectional_zscore(merged, cross_sectional_feature_columns(merged), "ts")
 
 
 def _write_fold_result(model_name: str, feature_set_id: str, fold, row: dict) -> None:
