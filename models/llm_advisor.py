@@ -148,7 +148,16 @@ def _call_claude(client: Anthropic, payload: dict) -> str:
         system=[{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": json.dumps(payload)}],
     )
-    return resp.content[0].text
+    # Sonnet 5 runs adaptive extended thinking by default (no `thinking`
+    # param needed to turn it on), so resp.content[0] is very often a
+    # ThinkingBlock ahead of the TextBlock -- content[0].text blew up with
+    # "'ThinkingBlock' object has no attribute 'text'" on every single
+    # call in production, silently falling back to quant-only selection
+    # every cycle. Find the actual text block instead of assuming position 0.
+    for block in resp.content:
+        if block.type == "text":
+            return block.text
+    raise ValueError("Claude's response contained no text block (thinking/other content only).")
 
 
 def get_llm_trade_advice(candidates: list[dict], market_context: dict, max_picks: int) -> dict | None:
