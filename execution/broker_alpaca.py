@@ -19,8 +19,8 @@ import logging
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest
 
 from config.settings import settings
 
@@ -175,6 +175,30 @@ class AlpacaBroker:
         multiplier = 1 + _EXTENDED_HOURS_LIMIT_BUFFER_PCT if side == OrderSide.BUY else 1 - _EXTENDED_HOURS_LIMIT_BUFFER_PCT
         return round(reference_price * multiplier, 2)
 
+    def _cancel_open_orders(self, symbol: str) -> None:
+        """
+        Cancels any still-open order for `symbol` before a new target gets
+        submitted for it.
+
+        Without this, a second call for the same symbol while an earlier
+        order is still open/unfilled (e.g. the hourly contradiction-monitor
+        reactivating a symbol while a weekly-cycle order for it is still
+        queued) computes its delta against get_positions() -- which only
+        reflects FILLED positions -- and stacks a second, independent order
+        on top of the first instead of replacing it. Once both eventually
+        fill, the position ends up double or triple the intended size. This
+        is the fix for that: always clear anything still open for this
+        symbol first, so the delta this call computes reflects the one
+        order actually in flight.
+        """
+        open_orders = self.client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
+        for order in open_orders:
+            logger.warning(
+                "Canceling still-open order %s for %s (%s %s shares) before submitting a new target position.",
+                order.id, symbol, order.side, order.qty,
+            )
+            self.client.cancel_order_by_id(order.id)
+
     def submit_target_position(self, symbol: str, target_shares: float) -> dict | None:
         """
         Submits a single order to move from the current position in
@@ -193,6 +217,7 @@ class AlpacaBroker:
         this falls back to the old behavior: submit a normal DAY market
         order and let it queue until the next open.
         """
+        self._cancel_open_orders(symbol)
         current_positions = self.get_positions()
         current_shares = current_positions.get(symbol, 0.0)
         delta = target_shares - current_shares

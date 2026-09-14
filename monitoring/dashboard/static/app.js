@@ -491,29 +491,40 @@ async function loadAccountOverview() {
     return;
   }
 
-  const investedPct = account.invested_pct;
   const cashPct = account.cash_pct;
+  const grossLongPct = account.gross_long_pct;
+  const grossShortPct = account.gross_short_pct;
+  // Long and short exposure shown separately, never netted: a $50k long +
+  // $50k short book is $100k of real deployed capital, not the ~$0 that
+  // long.market_value + short.market_value (a negative number) would
+  // suggest. Net is still shown too, but only as a third, clearly-labeled
+  // figure alongside the two gross ones, not in place of them.
   summary.innerHTML = `
     <div class="stat-card"><div class="value">${fmt.money(account.portfolio_value)}</div><div class="label">Total portfolio value</div></div>
     <div class="stat-card"><div class="value">${fmt.money(account.cash)}</div><div class="label">Cash${cashPct === null ? "" : ` (${fmt.pct(cashPct, 1)})`}</div></div>
-    <div class="stat-card"><div class="value">${fmt.money(account.invested)}</div><div class="label">Invested in equities${investedPct === null ? "" : ` (${fmt.pct(investedPct, 1)})`}</div></div>
+    <div class="stat-card"><div class="value">${fmt.money(account.gross_long)}</div><div class="label">Long exposure${grossLongPct === null ? "" : ` (${fmt.pct(grossLongPct, 1)})`}</div></div>
+    <div class="stat-card"><div class="value">${fmt.money(account.gross_short)}</div><div class="label">Short exposure${grossShortPct === null ? "" : ` (${fmt.pct(grossShortPct, 1)})`}</div></div>
+    <div class="stat-card"><div class="value">${fmt.money(account.invested)}</div><div class="label">Net exposure</div></div>
     <div class="stat-card"><div class="value">${account.n_positions}</div><div class="label">Open positions</div></div>
     ${account.buying_power === null ? "" : `<div class="stat-card"><div class="value">${fmt.money(account.buying_power)}</div><div class="label">Buying power</div></div>`}
   `;
 
-  // Clamped to [0,1] for the bar's width math -- a net-short book can push
-  // invested_pct negative or above 1, which is real and shown correctly in
-  // the stat card above, but has no sane bar-segment width. The bar is a
-  // rough visual proportion, not the source of truth for those numbers.
-  const investedFrac = investedPct === null ? 0 : Math.max(0, Math.min(1, investedPct));
-  const cashFrac = 1 - investedFrac;
+  // The bar visualizes deployed capital vs. cash using GROSS exposure
+  // (long + short), not the net invested figure -- a book that's $50k long
+  // and $50k short has $100k actually at risk, and a bar built from the
+  // netted ~$0 would show it as all cash. Clamped to [0,1] for the bar's
+  // width math; the stat cards above remain the source of truth for the
+  // real (possibly >100%) numbers.
+  const grossFrac =
+    account.portfolio_value ? Math.max(0, Math.min(1, (account.gross_long + account.gross_short) / account.portfolio_value)) : 0;
+  const cashFrac = 1 - grossFrac;
   bar.innerHTML = `
     <div class="alloc-bar">
-      <div class="alloc-bar-invested" style="width:${(investedFrac * 100).toFixed(1)}%" title="Invested: ${fmt.money(account.invested)}"></div>
+      <div class="alloc-bar-invested" style="width:${(grossFrac * 100).toFixed(1)}%" title="Long + short exposure: ${fmt.money(account.gross_long + account.gross_short)}"></div>
       <div class="alloc-bar-cash" style="width:${(cashFrac * 100).toFixed(1)}%" title="Cash: ${fmt.money(account.cash)}"></div>
     </div>
     <div class="alloc-bar-legend">
-      <span><span class="legend-swatch" style="background:var(--accent)"></span>Invested ${fmt.pct(investedFrac, 1)}</span>
+      <span><span class="legend-swatch" style="background:var(--accent)"></span>Deployed ${fmt.pct(grossFrac, 1)}</span>
       <span><span class="legend-swatch" style="background:var(--text-muted)"></span>Cash ${fmt.pct(cashFrac, 1)}</span>
     </div>`;
 }

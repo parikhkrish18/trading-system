@@ -344,6 +344,14 @@ def get_account() -> dict:
     than an equity/positions arithmetic approximation; a get_account()
     failure (network hiccup, or IBKR's non-matching keys) just falls back
     to the derived figure rather than failing the whole endpoint.
+
+    invested is kept as the signed net figure (cash + invested ==
+    portfolio_value holds exactly) for anything that still needs that
+    identity, but a mixed long/short book nets those against each other —
+    $50k long + $50k short reads as $0 invested, hiding that $100k of
+    capital is actually deployed. gross_long/gross_short break that back
+    out so the dashboard can show real exposure on both sides instead of a
+    misleading net.
     """
     broker = get_broker()
     portfolio_value = broker.get_portfolio_value()
@@ -352,6 +360,8 @@ def get_account() -> dict:
     # and IBKR both report it that way), so this sum is net exposure and
     # cash + invested == portfolio_value holds exactly, long or short.
     invested = sum(p["market_value"] for p in positions)
+    gross_long = sum(p["market_value"] for p in positions if p["side"] == "long")
+    gross_short = sum(-p["market_value"] for p in positions if p["side"] == "short")
 
     cash = None
     buying_power = None
@@ -372,6 +382,10 @@ def get_account() -> dict:
         "invested": invested,
         "invested_pct": (invested / portfolio_value) if portfolio_value else None,
         "cash_pct": (cash / portfolio_value) if portfolio_value else None,
+        "gross_long": gross_long,
+        "gross_short": gross_short,
+        "gross_long_pct": (gross_long / portfolio_value) if portfolio_value else None,
+        "gross_short_pct": (gross_short / portfolio_value) if portfolio_value else None,
         "buying_power": buying_power,
         "n_positions": len(positions),
         "mode": broker.mode,

@@ -47,12 +47,28 @@ class _FakeOrder:
         return self._data
 
 
+@dataclass
+class _FakeOpenOrder:
+    id: str
+    symbol: str
+    qty: float = 1.0
+    side: str = "buy"
+
+
 class _FakeTradingClient:
-    def __init__(self, asset: _FakeAsset | None = None, positions: dict | None = None, is_open: bool = True):
+    def __init__(
+        self,
+        asset: _FakeAsset | None = None,
+        positions: dict | None = None,
+        is_open: bool = True,
+        open_orders: list | None = None,
+    ):
         self._asset = asset
         self._positions = positions or {}
         self._is_open = is_open
         self.submitted_orders = []
+        self._open_orders = open_orders or []
+        self.canceled_order_ids = []
 
     def get_asset(self, symbol):
         return self._asset
@@ -66,6 +82,14 @@ class _FakeTradingClient:
     def submit_order(self, order_request):
         self.submitted_orders.append(order_request)
         return _FakeOrder(symbol=order_request.symbol, qty=order_request.qty, side=str(order_request.side))
+
+    def get_orders(self, filter=None):
+        symbols = set(filter.symbols) if filter is not None and filter.symbols else None
+        return [o for o in self._open_orders if symbols is None or o.symbol in symbols]
+
+    def cancel_order_by_id(self, order_id):
+        self.canceled_order_ids.append(order_id)
+        self._open_orders = [o for o in self._open_orders if o.id != order_id]
 
 
 class _FakeDataClient:
@@ -83,10 +107,11 @@ def _make_broker(
     positions: dict | None = None,
     is_open: bool = True,
     quotes: dict | None = None,
+    open_orders: list | None = None,
 ) -> tuple[AlpacaBroker, _FakeTradingClient]:
     monkeypatch.setattr("execution.broker_alpaca.settings.alpaca_paper_api_key", "key")
     monkeypatch.setattr("execution.broker_alpaca.settings.alpaca_paper_secret_key", "secret")
-    client = _FakeTradingClient(asset, positions, is_open=is_open)
+    client = _FakeTradingClient(asset, positions, is_open=is_open, open_orders=open_orders)
     data_client = _FakeDataClient(quotes)
     monkeypatch.setattr("execution.broker_alpaca.TradingClient", lambda *a, **k: client)
     monkeypatch.setattr("execution.broker_alpaca.StockHistoricalDataClient", lambda *a, **k: data_client)
@@ -317,3 +342,42 @@ def test_explicit_credentials_override_settings_and_are_passed_to_the_sdk(monkey
 def test_explicit_credentials_still_require_confirm_live_for_live_mode():
     with pytest.raises(RuntimeError, match="confirm_live"):
         AlpacaBroker(mode="live", api_key="clients-own-key", secret_key="clients-own-secret")
+
+
+def test_submit_target_position_cancels_a_still_open_order_for_the_same_symbol(monkeypatch):
+    """
+    Regression test: without this, a second call for a symbol that already
+    has an unfilled order sitting on Alpaca would compute its delta against
+    get_positions() (which only reflects FILLED positions) and stack a
+    second order on top of the first -- doubling/tripling the position once
+    both fill. The old order must be canceled before the new delta is
+    computed and submitted.
+    """
+    broker, client = _make_broker(
+        monkeypatch, open_orders=[_FakeOpenOrder(id="stale-order-1", symbol="AAPL", qty=5.0, side="buy")]
+    )
+
+    broker.submit_target_position("AAPL", 3.5631)
+
+    assert client.canceled_order_ids == ["stale-order-1"]
+    assert client.submitted_orders[0].qty == 3.5631  # delta computed fresh, not stacked on the stale order
+
+
+def test_submit_target_position_only_cancels_open_orders_for_the_same_symbol(monkeypatch):
+    broker, client = _make_broker(
+        monkeypatch,
+        open_orders=[
+            _FakeOpenOrder(id="keep-me", symbol="MSFT", qty=2.0, side="buy"),
+            _FakeOpenOrder(id="cancel-me", symbol="AAPL", qty=5.0, side="buy"),
+        ],
+    )
+
+    broker.submit_target_position("AAPL", 1.0)
+
+    assert client.canceled_order_ids == ["cancel-me"]
+
+
+def test_submit_target_position_does_not_cancel_when_no_open_orders_exist(monkeypatch):
+    broker, client = _make_broker(monkeypatch)
+    broker.submit_target_position("AAPL", 3.0)
+    assert client.canceled_order_ids == []

@@ -1709,7 +1709,7 @@ def test_account_prefers_the_brokers_own_cash_figure_when_available(monkeypatch,
     monkeypatch.setattr(
         server, "get_broker",
         lambda: _FakeAccountBroker(
-            [{"symbol": "TSLA", "market_value": 21000.0}],
+            [{"symbol": "TSLA", "market_value": 21000.0, "side": "long"}],
             portfolio_value=100_000.0,
             account={"cash": 79500.0, "buying_power": 159000.0},
         ),
@@ -1730,7 +1730,7 @@ def test_account_derives_cash_when_the_broker_has_no_cash_figure(monkeypatch, cl
     monkeypatch.setattr(
         server, "get_broker",
         lambda: _FakeAccountBroker(
-            [{"symbol": "AAPL", "market_value": 30000.0}],
+            [{"symbol": "AAPL", "market_value": 30000.0, "side": "long"}],
             portfolio_value=100_000.0,
             account=None,  # get_account() raises
         ),
@@ -1748,7 +1748,10 @@ def test_account_nets_short_market_value_against_cash(monkeypatch, client):
     monkeypatch.setattr(
         server, "get_broker",
         lambda: _FakeAccountBroker(
-            [{"symbol": "TSLA", "market_value": 20000.0}, {"symbol": "GME", "market_value": -5000.0}],
+            [
+                {"symbol": "TSLA", "market_value": 20000.0, "side": "long"},
+                {"symbol": "GME", "market_value": -5000.0, "side": "short"},
+            ],
             portfolio_value=100_000.0,
             account=None,
         ),
@@ -1758,6 +1761,33 @@ def test_account_nets_short_market_value_against_cash(monkeypatch, client):
     assert body["invested"] == pytest.approx(15000.0)
     assert body["cash"] == pytest.approx(85000.0)
     assert body["cash"] + body["invested"] == pytest.approx(body["portfolio_value"])
+
+
+def test_account_reports_gross_long_and_short_exposure_separately(monkeypatch, client):
+    """
+    Regression test: netting long/short market_value against each other
+    (the 'invested' figure) hides real exposure -- $50k long + $50k short
+    nets to $0 invested despite $100k of capital actually being deployed.
+    gross_long/gross_short must reflect each side's real size, not the net.
+    """
+    monkeypatch.setattr(
+        server, "get_broker",
+        lambda: _FakeAccountBroker(
+            [
+                {"symbol": "AAPL", "market_value": 50000.0, "side": "long"},
+                {"symbol": "TSLA", "market_value": -50000.0, "side": "short"},
+            ],
+            portfolio_value=100_000.0,
+            account=None,
+        ),
+    )
+    resp = client.get("/api/account")
+    body = resp.json()
+    assert body["invested"] == pytest.approx(0.0)  # nets to zero, as before
+    assert body["gross_long"] == pytest.approx(50000.0)
+    assert body["gross_short"] == pytest.approx(50000.0)
+    assert body["gross_long_pct"] == pytest.approx(0.5)
+    assert body["gross_short_pct"] == pytest.approx(0.5)
 
 
 def test_account_with_no_open_positions_is_all_cash(monkeypatch, client):
