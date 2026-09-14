@@ -13,22 +13,30 @@ import logging
 import time
 from collections.abc import Callable, Iterable
 
+import pandas as pd
+
 from config.settings import settings
 from data.ingest.universe import load_active_universe
 from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.client_fanout import replicate_to_clients
+from execution.exit_levels import ExitLevels
 from execution.trading_loop import (
     _allocation_confirmation,
     _apply_allocation,
     _correlation_matrix,
     _deployable_fraction,
 )
-from models.screener import TradeCandidate, run_screen
+from models.candidate_pool_store import load_recent_pool
+from models.screener import TradeCandidate, run_screen, select_concentrated_trades
 from risk.sizing import allocate_by_conviction
 
 logger = logging.getLogger(__name__)
 
 _MIN_REBALANCE_FRACTION = 0.05
+# concentrated-mode-only fallback when settings.max_concentrated_positions
+# isn't the active cap (diversified mode never reaches this function's fast
+# path at all — see _candidates_from_recent_pool).
+_DEFAULT_MAX_POSITIONS = 2
 
 # A market close doesn't always settle at the broker instantly -- a
 # get_positions() read taken right after submit_target_position(0.0) can
@@ -47,6 +55,57 @@ def _freed_capital_fraction(broker, engine) -> float:
     from execution.contradiction_monitor import _freed_capital_fraction as freed_capital_fraction
 
     return freed_capital_fraction(broker, engine)
+
+
+def _candidates_from_recent_pool(
+    excluded: set[str], is_shortable_fn, max_positions: int
+) -> list[TradeCandidate] | None:
+    """
+    Tries to build this cycle's candidates from the persisted Claude-advised
+    pool (models/candidate_pool_store.py) — this week's already-computed
+    analysis — instead of a fresh ensemble retrain + rescreen, which costs
+    several minutes on top of what a full-book reactivation otherwise needs.
+    Concentrated-mode only, the shape that pool was written in.
+
+    Returns None (never []) when there's nothing usable to redeploy from —
+    no persisted pool, everything in it excluded, or nothing clears
+    select_concentrated_trades's own gates — so the caller can tell "use
+    this" apart from "fall back to a fresh screen" and never silently skip
+    a redeploy just because the fast path came up empty.
+    """
+    if settings.strategy_mode != "concentrated":
+        return None
+    pool = [c for c in load_recent_pool(settings.feature_set_id) if c["symbol"] not in excluded]
+    if not pool:
+        return None
+
+    df = pd.DataFrame(pool)
+    df["confident"] = True
+    df["llm_confidence"] = df["confidence"]
+
+    candidates = select_concentrated_trades(
+        df,
+        max_leg_pct=settings.max_concentrated_position_pct,
+        min_leg_floor_fraction=settings.min_concentrated_leg_floor_fraction,
+        max_positions=max_positions,
+        total_deploy_pct=1.0,
+        is_shortable_fn=is_shortable_fn,
+        allow_shorts=settings.allow_shorts,
+        rank_score_col="llm_confidence",
+        weight_score_col="llm_confidence",
+    )
+    if not candidates:
+        return None
+
+    info_by_symbol = {c["symbol"]: c for c in pool}
+    for candidate in candidates:
+        info = info_by_symbol.get(candidate.symbol)
+        if info is None:
+            continue
+        candidate.reasoning = info["reasoning"]
+        if info.get("take_profit_pct") is not None and info.get("stop_loss_pct") is not None:
+            candidate.exit_levels = ExitLevels(take_profit_pct=info["take_profit_pct"], stop_loss_pct=info["stop_loss_pct"])
+    return candidates
 
 
 def rebalance_after_exit(
@@ -91,25 +150,29 @@ def rebalance_after_exit(
     if freed_fraction < _MIN_REBALANCE_FRACTION:
         return
 
-    universe = [s for s in load_active_universe() if s not in excluded]
-    if not universe:
-        return
-
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
     max_positions_override = (
         settings.max_concentrated_positions if settings.strategy_mode == "concentrated" else None
     )
-    try:
-        candidates = run_screen(
-            settings.feature_set_id,
-            universe,
-            is_shortable_fn=is_shortable_fn,
-            total_deploy_pct=1.0,
-            max_positions_override=max_positions_override,
-        )
-    except Exception:
-        logger.exception("Full-book reactivation screen failed — leaving the current post-exit book unchanged.")
-        return
+
+    candidates = _candidates_from_recent_pool(excluded, is_shortable_fn, max_positions_override or _DEFAULT_MAX_POSITIONS)
+    if candidates is not None:
+        logger.info("Reactivating from this week's already-computed candidate pool — skipping a fresh retrain.")
+    else:
+        universe = [s for s in load_active_universe() if s not in excluded]
+        if not universe:
+            return
+        try:
+            candidates = run_screen(
+                settings.feature_set_id,
+                universe,
+                is_shortable_fn=is_shortable_fn,
+                total_deploy_pct=1.0,
+                max_positions_override=max_positions_override,
+            )
+        except Exception:
+            logger.exception("Full-book reactivation screen failed — leaving the current post-exit book unchanged.")
+            return
 
     if not candidates:
         logger.info("No confident candidates after the exit — keeping surviving positions and cash as-is.")
