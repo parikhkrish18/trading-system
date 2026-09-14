@@ -17,26 +17,34 @@ So the levels are derived per pick, from the two things that describe it:
     stop    how far this stock normally wanders anyway
 
 Both are expressed against the forecast horizon rather than per day, since
-that is the period the position is meant to be held for.
+that is the period the position is meant to be held for — a weekly swing
+book (see settings.target_horizon_days), not a buy-and-hold one.
 
     horizon_sigma = daily volatility x sqrt(horizon days)
 
-    take profit = the predicted move, floored so it is worth the round trip
-                  and capped so an extreme forecast doesn't set a target the
-                  stock has no history of reaching
+    take profit = the predicted move, bounded to a MULTIPLE OF THIS STOCK'S
+                  OWN ATR (2x-4x by default — see
+                  exit_take_profit_min_atr_mult/exit_take_profit_max_atr_mult)
+                  rather than a flat percentage, so a target on a stock that
+                  genuinely moves is a real, tradeable one instead of a
+                  floor sized for a much calmer name. Falls back to the
+                  older horizon_sigma-based bounds when ATR isn't available
+                  for this stock (see atr_pct below) rather than guessing.
 
     stop loss   = a multiple of horizon_sigma, bounded — wide enough that
                   ordinary movement doesn't reach it, tight enough to still
-                  be a stop
+                  be a stop. Deliberately NOT moved onto the ATR basis above
+                  — stop-loss sizing is unchanged, only take-profit sizing
+                  reflects the ATR-relative swing-trade target.
 
 The bounds matter as much as the formula. Volatility is estimated from a
 short window and can be badly wrong for a stock that has just gapped;
 without bounds, one quiet month would produce a 1% stop that closes on the
 first ordinary day.
 
-When volatility is unknown — a new listing, a gap in prices — this falls
-back to the global settings rather than guessing. Guessing a stop is worse
-than using a blunt one.
+When volatility (or ATR) is unknown — a new listing, a gap in prices — this
+falls back to the global settings rather than guessing. Guessing a stop is
+worse than using a blunt one.
 """
 from __future__ import annotations
 
@@ -72,17 +80,47 @@ def global_levels() -> ExitLevels:
     )
 
 
+def _take_profit_bounds(daily_volatility: float, atr_pct: float | None, horizon: int) -> tuple[float, float]:
+    """
+    (floor, ceiling) for take-profit, in units of this stock's own movement.
+
+    ATR-relative when this stock's ATR is available (atr_pct — Average True
+    Range as a fraction of price, e.g. vol_atr_14 / close): 2x-4x its
+    horizon-scaled ATR by default, matching the weekly/biweekly swing
+    target this system is sized for. Falls back to the older
+    horizon-sigma-based bounds (a multiple of close-to-close volatility)
+    when ATR isn't available for this stock — a new listing, or a gap in
+    the high/low history ATR needs — rather than guessing an ATR.
+    """
+    if atr_pct is not None and math.isfinite(atr_pct) and atr_pct > 0:
+        atr_horizon = atr_pct * math.sqrt(max(horizon, 1))
+        floor = settings.exit_take_profit_min_atr_mult * atr_horizon
+        ceiling = max(settings.exit_take_profit_max_atr_mult * atr_horizon, floor)
+        return floor, ceiling
+
+    horizon_sigma = daily_volatility * math.sqrt(max(horizon, 1))
+    ceiling = max(settings.exit_take_profit_max_sigmas * horizon_sigma, settings.exit_min_take_profit_pct)
+    return settings.exit_min_take_profit_pct, ceiling
+
+
 def exit_levels_for(
     predicted_return: float | None,
     daily_volatility: float | None,
     horizon_days: int | None = None,
+    atr_pct: float | None = None,
 ) -> ExitLevels:
     """
     `predicted_return`: the model's forecast for this pick, signed. Only its
         size matters here — a -5% forecast on a short is a 5% target.
     `daily_volatility`: standard deviation of this stock's daily returns,
-        NOT annualized. None when it couldn't be measured.
+        NOT annualized. None when it couldn't be measured. Still the sole
+        basis for stop-loss sizing, and the take-profit fallback when ATR
+        isn't available.
     `horizon_days`: trading days the position is meant to be held.
+    `atr_pct`: this stock's 14-day Average True Range as a fraction of
+        price (vol_atr_14 / close). When available, take-profit is sized as
+        a multiple of it instead of daily_volatility — see
+        _take_profit_bounds. None falls back to the older behavior.
     """
     if daily_volatility is None or not math.isfinite(daily_volatility) or daily_volatility <= 0:
         return global_levels()
@@ -92,14 +130,12 @@ def exit_levels_for(
     horizon = horizon_days if horizon_days is not None else settings.target_horizon_days
     horizon_sigma = daily_volatility * math.sqrt(max(horizon, 1))
 
-    take_profit = min(
-        max(abs(predicted_return), settings.exit_min_take_profit_pct),
-        settings.exit_take_profit_max_sigmas * horizon_sigma,
-    )
-    # The floor is applied last as well: capping at a small sigma must not
-    # produce a target below what the round trip costs, or the position
+    tp_floor, tp_ceiling = _take_profit_bounds(daily_volatility, atr_pct, horizon)
+    take_profit = min(max(abs(predicted_return), tp_floor), tp_ceiling)
+    # The floor is applied last as well: capping at a small ATR/sigma must
+    # not produce a target below what the round trip costs, or the position
     # would be closed into a guaranteed loss.
-    take_profit = max(take_profit, settings.exit_min_take_profit_pct)
+    take_profit = max(take_profit, tp_floor, settings.exit_min_take_profit_pct)
 
     stop_loss = min(
         max(settings.exit_stop_loss_sigmas * horizon_sigma, settings.exit_min_stop_loss_pct),
@@ -114,23 +150,23 @@ def exit_levels_advised(
     llm_take_profit_pct: float | None,
     llm_stop_loss_pct: float | None,
     horizon_days: int | None = None,
+    atr_pct: float | None = None,
 ) -> ExitLevels:
     """
     Same bounds as exit_levels_for, but the take-profit/stop-loss VALUE
     within those bounds comes from an LLM's per-stock suggestion when one
     is given and finite. Advisory, not authoritative: the bounds
-    themselves (volatility-derived, or the global fallback) are computed
-    exactly as exit_levels_for always has, so a stray, missing, or overly
-    aggressive LLM number can only ever be clamped into the existing safe
-    range, never escape it.
+    themselves (ATR- or volatility-derived, or the global fallback) are
+    computed exactly as exit_levels_for always has, so a stray, missing, or
+    overly aggressive LLM number can only ever be clamped into the existing
+    safe range, never escape it.
     """
-    baseline = exit_levels_for(predicted_return, daily_volatility, horizon_days)
+    baseline = exit_levels_for(predicted_return, daily_volatility, horizon_days, atr_pct=atr_pct)
     if not baseline.derived:
         return baseline  # global fallback -- no per-stock bounds to advise within
 
     horizon = horizon_days if horizon_days is not None else settings.target_horizon_days
-    horizon_sigma = daily_volatility * math.sqrt(max(horizon, 1))
-    tp_lo, tp_hi = settings.exit_min_take_profit_pct, max(settings.exit_take_profit_max_sigmas * horizon_sigma, settings.exit_min_take_profit_pct)
+    tp_lo, tp_hi = _take_profit_bounds(daily_volatility, atr_pct, horizon)
     sl_lo, sl_hi = settings.exit_min_stop_loss_pct, settings.exit_max_stop_loss_pct
 
     take_profit = baseline.take_profit_pct

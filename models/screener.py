@@ -750,18 +750,20 @@ def _build_llm_candidate_pool(
     macro_sector_sentiment_by_symbol: dict[str, float],
     horizon_days: int,
     top_n: int = 5,
+    atr_pct_by_symbol: dict[str, float] | None = None,
 ) -> list[dict]:
     """
     Assembles the per-candidate payload models/llm_advisor.py sends to
     Claude: the same SHAP top-features _attach_reasoning uses (so the LLM
     reasons off the exact attribution a human reading the dashboard would
-    see), plus market price, volatility, sector sentiment, recent
+    see), plus market price, volatility, ATR, sector sentiment, recent
     headlines, and the existing quant formula's own take-profit/stop-loss
-    as a reference point.
+    (now ATR-relative — see execution/exit_levels.py) as a reference point.
     """
     symbols = list(pool["symbol"])
     if not symbols:
         return []
+    atr_pct_by_symbol = atr_pct_by_symbol or {}
     fundamentals_context = _load_fundamentals_context(symbols)
     per_symbol_top_features = _explain_features(
         symbols, ensemble, latest_features, raw_features, feature_cols, fundamentals_context, top_n=top_n
@@ -772,7 +774,10 @@ def _build_llm_candidate_pool(
     for _, row in pool.iterrows():
         symbol = row["symbol"]
         vol = vol_by_symbol.get(symbol)
-        quant_bounds = exit_levels_for(predicted_return=row["predicted_return"], daily_volatility=vol, horizon_days=horizon_days)
+        atr_pct = atr_pct_by_symbol.get(symbol)
+        quant_bounds = exit_levels_for(
+            predicted_return=row["predicted_return"], daily_volatility=vol, horizon_days=horizon_days, atr_pct=atr_pct
+        )
         payload.append(
             {
                 "symbol": symbol,
@@ -782,6 +787,7 @@ def _build_llm_candidate_pool(
                 "macro_sector_sentiment": macro_sector_sentiment_by_symbol.get(symbol),
                 "current_price": latest_close_by_symbol.get(symbol),
                 "daily_volatility_pct": vol,
+                "atr_pct": atr_pct,
                 "top_features": per_symbol_top_features.get(symbol, []),
                 "recent_headlines": headlines_by_symbol.get(symbol, []),
                 "quant_take_profit_pct": quant_bounds.take_profit_pct,
@@ -1033,6 +1039,7 @@ def attach_exit_levels(
     candidates: list[TradeCandidate],
     vol_by_symbol: dict[str, float],
     llm_hints: dict[str, tuple[float | None, float | None]] | None = None,
+    atr_pct_by_symbol: dict[str, float] | None = None,
 ) -> None:
     """
     Give every candidate the levels it will be proposed, approved and later
@@ -1041,23 +1048,31 @@ def attach_exit_levels(
     `llm_hints`: {symbol: (take_profit_pct, stop_loss_pct)} suggested by
     models/llm_advisor.py for a symbol Claude was consulted on. When
     present, exit_levels_advised clamps that suggestion into the exact
-    same volatility-derived bounds exit_levels_for always enforces, rather
-    than using the plain quant-formula value outright.
+    same ATR- (or volatility-) derived bounds exit_levels_for always
+    enforces, rather than using the plain quant-formula value outright.
+
+    `atr_pct_by_symbol`: this stock's ATR as a fraction of price, when
+    available — see exit_levels_for's atr_pct. None/missing falls back to
+    the older volatility-sigma-based take-profit bounds for that symbol.
     """
     llm_hints = llm_hints or {}
+    atr_pct_by_symbol = atr_pct_by_symbol or {}
     for candidate in candidates:
         hint = llm_hints.get(candidate.symbol)
+        atr_pct = atr_pct_by_symbol.get(candidate.symbol)
         if hint is not None:
             candidate.exit_levels = exit_levels_advised(
                 predicted_return=candidate.predicted_return,
                 daily_volatility=vol_by_symbol.get(candidate.symbol),
                 llm_take_profit_pct=hint[0],
                 llm_stop_loss_pct=hint[1],
+                atr_pct=atr_pct,
             )
         else:
             candidate.exit_levels = exit_levels_for(
                 predicted_return=candidate.predicted_return,
                 daily_volatility=vol_by_symbol.get(candidate.symbol),
+                atr_pct=atr_pct,
             )
 
 
@@ -1196,6 +1211,20 @@ def run_screen_with_scores(
     )
     scored = score_universe(ensemble, latest, feature_cols, min_abs_return, raw_features=raw_latest)
 
+    # This stock's own 14-day Average True Range (vol_atr_14, a QUANT_FEATURES
+    # entry — see features/build_features.py) as a fraction of price, for
+    # take-profit sizing (execution/exit_levels.py targets a multiple of
+    # this, 2x-4x by default, for the weekly swing horizon this system
+    # targets). raw_latest carries vol_atr_14 in absolute price units
+    # (dollars), never cross-sectionally z-scored, same reasoning as every
+    # other raw_latest read in this function.
+    atr_pct_by_symbol: dict[str, float] = {}
+    if "vol_atr_14" in raw_latest.columns and "close" in raw_latest.columns:
+        for _, row in raw_latest.iterrows():
+            atr_val, price = row.get("vol_atr_14"), row.get("close")
+            if pd.notna(atr_val) and pd.notna(price) and price > 0:
+                atr_pct_by_symbol[str(row["symbol"])] = float(atr_val) / float(price)
+
     if settings.enable_macro_sector_block:
         macro_mkt_sentiment = None
         macro_sector_sentiment_by_symbol: dict[str, float] = {}
@@ -1268,6 +1297,7 @@ def run_screen_with_scores(
             llm_pool = _build_llm_candidate_pool(
                 eligible, ensemble, latest, raw_latest, feature_cols, vol_by_symbol,
                 latest_close_by_symbol, macro_sector_map, target_horizon_days,
+                atr_pct_by_symbol=atr_pct_by_symbol,
             )
             llm_advice = get_llm_trade_advice(
                 llm_pool,
@@ -1424,7 +1454,7 @@ def run_screen_with_scores(
     # rather than recomputing it a second time. llm_exit_hints is only ever
     # non-empty when the LLM advisory pass above succeeded and picked this
     # candidate; every other cycle this is the exact pre-existing behavior.
-    attach_exit_levels(candidates, vol_by_symbol, llm_exit_hints)
+    attach_exit_levels(candidates, vol_by_symbol, llm_exit_hints, atr_pct_by_symbol=atr_pct_by_symbol)
     return ScreenResult(
         candidates=candidates,
         scored=scored,

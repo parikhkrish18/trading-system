@@ -197,3 +197,74 @@ def test_unmeasurable_volatility_ignores_the_llm_suggestion_too():
     levels = _advised(llm_tp=0.07, llm_sl=0.04, daily_vol=None)
     assert levels == global_levels()
     assert levels.derived is False
+
+
+# --------------------------------------------------------------------------
+# atr_pct: take-profit sized as a multiple of this stock's own ATR
+# --------------------------------------------------------------------------
+
+
+def test_take_profit_is_bounded_by_atr_multiples_when_atr_is_available():
+    """
+    A stock with a real ATR gets its take-profit sized between
+    exit_take_profit_min_atr_mult and exit_take_profit_max_atr_mult times
+    its own horizon-scaled ATR, not the flat/sigma-based bounds.
+    """
+    # atr_pct=0.02, horizon=5 -> atr_horizon = 0.02 * sqrt(5) ~= 0.0447
+    # bounds: [2x, 4x] ~= [0.0894, 0.1789]
+    levels = exit_levels_for(predicted_return=0.15, daily_volatility=0.01, horizon_days=5, atr_pct=0.02)
+    assert 0.089 < levels.take_profit_pct < 0.179
+
+
+def test_take_profit_floors_at_the_minimum_atr_multiple_even_for_a_tiny_forecast():
+    levels = exit_levels_for(predicted_return=0.0001, daily_volatility=0.01, horizon_days=5, atr_pct=0.02)
+    assert levels.take_profit_pct == pytest.approx(2.0 * 0.02 * math.sqrt(5))
+
+
+def test_take_profit_caps_at_the_maximum_atr_multiple_for_an_extreme_forecast():
+    levels = exit_levels_for(predicted_return=0.90, daily_volatility=0.01, horizon_days=5, atr_pct=0.02)
+    assert levels.take_profit_pct == pytest.approx(4.0 * 0.02 * math.sqrt(5))
+
+
+def test_a_more_volatile_stocks_atr_produces_a_bigger_take_profit_band():
+    calm = exit_levels_for(predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.01)
+    volatile = exit_levels_for(predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.05)
+    assert volatile.take_profit_pct > calm.take_profit_pct
+
+
+def test_atr_pct_does_not_change_stop_loss_sizing():
+    """Stop-loss stays on its existing volatility-sigma basis regardless of atr_pct -- only take-profit moves."""
+    without_atr = exit_levels_for(predicted_return=0.06, daily_volatility=0.02, horizon_days=5, atr_pct=None)
+    with_atr = exit_levels_for(predicted_return=0.06, daily_volatility=0.02, horizon_days=5, atr_pct=0.09)
+    assert without_atr.stop_loss_pct == pytest.approx(with_atr.stop_loss_pct)
+
+
+@pytest.mark.parametrize("bad_atr", [None, 0.0, -0.01, float("nan"), float("inf")])
+def test_an_unusable_atr_pct_falls_back_to_the_sigma_based_bounds(bad_atr):
+    """A missing/invalid atr_pct (new listing, gap in high/low history) must not raise or silently zero the target."""
+    with_bad_atr = exit_levels_for(predicted_return=0.06, daily_volatility=0.02, horizon_days=5, atr_pct=bad_atr)
+    without_atr = exit_levels_for(predicted_return=0.06, daily_volatility=0.02, horizon_days=5, atr_pct=None)
+    assert with_bad_atr == without_atr
+
+
+def test_advised_clamps_the_llm_suggestion_into_the_atr_band_not_the_sigma_one():
+    """
+    Regression test: exit_levels_advised must advise within the SAME bounds
+    exit_levels_for actually used (ATR-relative here), not the older
+    sigma-based ones -- otherwise a suggestion inside the sigma band but
+    outside the (tighter or wider) ATR band would pass through unclamped.
+    """
+    # ATR band (2x-4x of 0.02*sqrt(5)~=0.0447): [0.0894, 0.1789]
+    levels = exit_levels_advised(
+        predicted_return=0.15, daily_volatility=0.01, llm_take_profit_pct=0.50,
+        llm_stop_loss_pct=None, horizon_days=5, atr_pct=0.02,
+    )
+    assert levels.take_profit_pct == pytest.approx(4.0 * 0.02 * math.sqrt(5))
+
+
+def test_advised_uses_the_llm_suggestion_within_the_atr_band_as_given():
+    levels = exit_levels_advised(
+        predicted_return=0.15, daily_volatility=0.01, llm_take_profit_pct=0.10,
+        llm_stop_loss_pct=None, horizon_days=5, atr_pct=0.02,
+    )
+    assert levels.take_profit_pct == pytest.approx(0.10)

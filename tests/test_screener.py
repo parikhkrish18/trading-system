@@ -1,7 +1,10 @@
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from config.settings import settings
 from execution.exit_levels import exit_levels_for
 from models.regime.trend_chop_classifier import TREND
 from models.screener import (
@@ -1110,6 +1113,33 @@ def test_run_screen_concentrated_mode_uses_the_two_trade_split(monkeypatch):
     assert "concentrated" in calls and "diversified" not in calls
 
 
+def test_run_screen_computes_atr_pct_from_vol_atr_14_and_close(monkeypatch):
+    """
+    vol_atr_14 (a raw QUANT_FEATURES entry -- see features/build_features.py
+    -- in absolute price units) divided by close gives atr_pct, the
+    fraction of price this stock's ATR represents. execution/exit_levels.py
+    sizes take-profit as a multiple of this for the weekly swing horizon.
+    """
+    scr, _ = _run_screen_harness(monkeypatch, "concentrated")
+    monkeypatch.setattr(scr.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        scr, "load_latest_features",
+        lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3], "vol_atr_14": [2.0], "close": [100.0]}),
+    )
+    captured = {}
+
+    def fake_build_pool(*args, **kwargs):
+        captured["atr_pct_by_symbol"] = kwargs.get("atr_pct_by_symbol")
+        return []
+
+    monkeypatch.setattr(scr, "_build_llm_candidate_pool", fake_build_pool)
+    monkeypatch.setattr(scr, "get_llm_trade_advice", lambda *a, **k: None)
+
+    scr.run_screen("v3", ["A"])
+
+    assert captured["atr_pct_by_symbol"]["A"] == pytest.approx(0.02)  # 2.0 / 100.0
+
+
 def test_run_screen_concentrated_mode_passes_position_count_and_split_settings(monkeypatch):
     scr, calls = _run_screen_harness(monkeypatch, "concentrated")
     monkeypatch.setattr(scr.settings, "max_concentrated_position_pct", 0.70)
@@ -1417,10 +1447,25 @@ def test_attach_exit_levels_falls_back_when_a_symbol_has_no_volatility():
 def test_attach_exit_levels_uses_the_llm_hint_when_one_is_given():
     candidate = TradeCandidate("AAPL", "long", 0.04, 1.0, 0.04, 0.1)
 
-    attach_exit_levels([candidate], {"AAPL": 0.02}, llm_hints={"AAPL": (0.09, 0.06)})
+    # vol chosen so the sigma-based fallback ceiling comfortably clears
+    # 0.09 regardless of settings.target_horizon_days (no atr_pct given
+    # here, so this exercises that fallback, not the ATR-relative bounds).
+    attach_exit_levels([candidate], {"AAPL": 0.05}, llm_hints={"AAPL": (0.09, 0.06)})
 
     assert candidate.exit_levels.take_profit_pct == pytest.approx(0.09)
     assert candidate.exit_levels.stop_loss_pct == pytest.approx(0.06)
+
+
+def test_attach_exit_levels_sizes_take_profit_off_atr_when_available():
+    candidate = TradeCandidate("AAPL", "long", 0.30, 1.0, 0.30, 0.1)
+
+    attach_exit_levels(
+        [candidate], {"AAPL": 0.01}, atr_pct_by_symbol={"AAPL": 0.02},
+    )
+
+    # 4x cap of horizon-scaled ATR (0.02 * sqrt(settings.target_horizon_days))
+    expected_cap = 4.0 * 0.02 * math.sqrt(settings.target_horizon_days)
+    assert candidate.exit_levels.take_profit_pct == pytest.approx(expected_cap)
 
 
 def test_attach_exit_levels_ignores_hints_for_a_symbol_not_in_the_map():

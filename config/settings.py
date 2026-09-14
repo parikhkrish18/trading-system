@@ -200,13 +200,14 @@ class Settings(BaseSettings):
 
     # --- Forecast horizon ---
     # How many trading days ahead the model predicts (and therefore how
-    # long a position is meant to be held). 20 ≈ a calendar month: the
-    # swing-trade posture — multi-week holds targeting 3-10% moves, where
-    # the fixed round-trip cost floor eats proportionally less of the
-    # expected move than it does at 5 days. Used as the default by
-    # models/train.py and models/screener.py; scripts/compare_horizons.py
-    # measures whether a given value actually earns its keep.
-    target_horizon_days: int = Field(default=20, alias="TARGET_HORIZON_DAYS")
+    # long a position is meant to be held). 5 ≈ one calendar week: the
+    # weekly swing-trade posture this system targets, sized against
+    # exit_take_profit_min_atr_mult/exit_take_profit_max_atr_mult (2x-4x
+    # this stock's own ATR over the horizon) rather than a fixed percentage.
+    # Used as the default by models/train.py and models/screener.py;
+    # scripts/compare_horizons.py measures whether a given value actually
+    # earns its keep.
+    target_horizon_days: int = Field(default=5, alias="TARGET_HORIZON_DAYS")
 
     # --- Prediction target ---
     # What the model is trained to predict.
@@ -230,8 +231,8 @@ class Settings(BaseSettings):
     target_mode: str = Field(default="relative", alias="TARGET_MODE")  # "absolute" | "relative"
 
     # --- Hold rules (execution/hold_rules.py) ---
-    # With multi-week holds (TARGET_HORIZON_DAYS above), a position must NOT
-    # be closed just because something else scored marginally higher on
+    # With weekly holds (TARGET_HORIZON_DAYS above), a position must NOT be
+    # closed just because something else scored marginally higher on
     # Monday. A held position is closed only when a real exit condition
     # fires; these settings define "real".
     #
@@ -241,8 +242,10 @@ class Settings(BaseSettings):
     hold_max_missed_cycles: int = Field(default=2, alias="HOLD_MAX_MISSED_CYCLES")
     # Unrealized-loss fraction at which a close is proposed (stop loss).
     hold_stop_loss_pct: float = Field(default=0.08, alias="HOLD_STOP_LOSS_PCT")
-    # Unrealized-gain fraction at which a close is proposed — the top of the
-    # 3-10% move band the swing horizon targets.
+    # Unrealized-gain fraction at which a close is proposed — the blunt
+    # global fallback used only when a stock's own ATR/volatility can't be
+    # measured (see exit_take_profit_min_atr_mult/max_atr_mult below for
+    # the normal, per-stock ATR-relative target).
     hold_take_profit_pct: float = Field(default=0.10, alias="HOLD_TAKE_PROFIT_PCT")
 
     # --- Per-pick exit levels (execution/exit_levels.py) ---
@@ -252,9 +255,18 @@ class Settings(BaseSettings):
     # particular stock normally moves — one pair of numbers cannot be right
     # for both a utility and a biotech.
     #
-    # Take profit is the predicted move itself, bounded: never below what a
-    # round trip costs (closing into a guaranteed loss), never above this
-    # many horizon-sigmas (a target the stock has no history of reaching).
+    # Take profit is the predicted move itself, bounded to a multiple of
+    # this stock's own ATR (2x-4x by default) when ATR is available for it
+    # — sized for the weekly/biweekly swing this system targets, not a
+    # flat percentage that's wrong for both a calm stock and a volatile
+    # one. exit_take_profit_max_sigmas/exit_min_take_profit_pct remain the
+    # fallback bounds (a multiple of horizon-sigma) for the rarer case
+    # where a stock has no ATR yet (a new listing, a gap in high/low
+    # history) — never below what a round trip costs either way (closing
+    # into a guaranteed loss), never above this many horizon-sigmas (a
+    # target the stock has no history of reaching).
+    exit_take_profit_min_atr_mult: float = Field(default=2.0, alias="EXIT_TAKE_PROFIT_MIN_ATR_MULT")
+    exit_take_profit_max_atr_mult: float = Field(default=4.0, alias="EXIT_TAKE_PROFIT_MAX_ATR_MULT")
     exit_take_profit_max_sigmas: float = Field(default=2.0, alias="EXIT_TAKE_PROFIT_MAX_SIGMAS")
     exit_min_take_profit_pct: float = Field(default=0.03, alias="EXIT_MIN_TAKE_PROFIT_PCT")
     # Stop loss in horizon-sigmas. 1.5 is deliberately wider than one
