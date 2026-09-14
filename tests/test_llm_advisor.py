@@ -6,13 +6,24 @@ from models import llm_advisor
 
 
 class _FakeTextBlock:
+    type = "text"
+
     def __init__(self, text):
         self.text = text
 
 
+class _FakeThinkingBlock:
+    """Sonnet 5 runs adaptive thinking by default -- no .text attribute at all."""
+
+    type = "thinking"
+
+    def __init__(self, thinking="reasoning about it..."):
+        self.thinking = thinking
+
+
 class _FakeMessage:
-    def __init__(self, text):
-        self.content = [_FakeTextBlock(text)]
+    def __init__(self, text, leading_blocks=()):
+        self.content = [*leading_blocks, _FakeTextBlock(text)]
 
 
 class _FakeMessages:
@@ -123,6 +134,29 @@ def test_a_hallucinated_symbol_not_in_the_pool_is_dropped(monkeypatch):
     result = llm_advisor.get_llm_trade_advice([_candidate("AAPL")], {}, max_picks=2)
 
     assert "NOTREAL" not in result["by_symbol"]
+    assert result["picks"] == ["AAPL"]
+
+
+def test_a_leading_thinking_block_does_not_break_response_parsing(monkeypatch):
+    """
+    Regression test: Sonnet 5 runs adaptive extended thinking by default,
+    so resp.content[0] is very often a ThinkingBlock (no .text attribute)
+    ahead of the TextBlock -- this broke every single production call
+    ('ThinkingBlock' object has no attribute 'text') before the fix.
+    """
+    monkeypatch.setattr(llm_advisor.settings, "anthropic_api_key", "test-key")
+
+    class _ThinkingFirstMessages:
+        def create(self, model, max_tokens, system, messages):
+            return _FakeMessage(_valid_response(["AAPL"]), leading_blocks=[_FakeThinkingBlock()])
+
+    class _ThinkingFirstAnthropic:
+        def __init__(self, api_key=None):
+            self.messages = _ThinkingFirstMessages()
+
+    monkeypatch.setattr(llm_advisor, "Anthropic", _ThinkingFirstAnthropic)
+
+    result = llm_advisor.get_llm_trade_advice([_candidate("AAPL")], {}, max_picks=1)
     assert result["picks"] == ["AAPL"]
 
 
