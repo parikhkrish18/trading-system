@@ -51,6 +51,7 @@ from data.ingest.universe import resolve_symbols
 from execution.exit_levels import ExitLevels, exit_levels_advised, exit_levels_for
 from features.build_features import fundamentals_prior_context
 from features.quant.volatility import realized_vol
+from models.candidate_pool_store import save_candidate_pool
 from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
 from models.llm_advisor import get_llm_trade_advice
@@ -1303,6 +1304,29 @@ def run_screen_with_scores(
                     if phase["phase"] == 2:
                         phase["top_features"] = top_features_by_symbol.get(candidate.symbol, [])
                 llm_exit_hints[candidate.symbol] = (info["take_profit_pct"], info["stop_loss_pct"])
+
+            # The FULL scored pool Claude advised on, not just this cycle's
+            # picks -- so a later flat-book reactivation can redeploy
+            # against this week's already-computed analysis (see
+            # models/candidate_pool_store.py) instead of paying for a fresh
+            # ensemble retrain + rescreen every time it finds the book
+            # empty. Best-effort: never worth failing a live screen over.
+            try:
+                extra_by_symbol = scored.set_index("symbol")[["direction_agreement", "conviction_score"]].to_dict("index")
+                pool_to_save = [
+                    {
+                        "symbol": c["symbol"],
+                        "side": c.get("side"),
+                        "predicted_return": c.get("predicted_return"),
+                        **extra_by_symbol.get(c["symbol"], {}),
+                        **llm_advice["by_symbol"][c["symbol"]],
+                    }
+                    for c in llm_pool
+                    if c["symbol"] in llm_advice["by_symbol"]
+                ]
+                save_candidate_pool(feature_set_id, pool_to_save)
+            except Exception:
+                logger.exception("Could not persist this cycle's candidate pool for later reactivation reuse.")
         else:
             candidates = select_concentrated_trades(
                 scored,
