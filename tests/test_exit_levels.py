@@ -268,3 +268,89 @@ def test_advised_uses_the_llm_suggestion_within_the_atr_band_as_given():
         llm_stop_loss_pct=None, horizon_days=5, atr_pct=0.02,
     )
     assert levels.take_profit_pct == pytest.approx(0.10)
+
+
+# --------------------------------------------------------------------------
+# Donchian channel solidification: exits tighten toward a real level,
+# never widen past the ATR/sigma bound
+# --------------------------------------------------------------------------
+
+
+def test_take_profit_tightens_toward_a_closer_resistance_on_a_long():
+    """
+    ATR band is [2x, 4x]*0.02*sqrt(5) ~= [0.089, 0.179] -- a resistance
+    distance strictly inside that band should replace the ceiling.
+    """
+    levels = exit_levels_for(
+        predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.02,
+        resistance_distance_pct=0.12,
+    )
+    assert levels.take_profit_pct == pytest.approx(0.12)
+
+
+def test_take_profit_never_widens_past_the_atr_ceiling_even_with_a_far_resistance():
+    atr_ceiling = 4.0 * 0.02 * math.sqrt(5)
+    levels = exit_levels_for(
+        predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.02,
+        resistance_distance_pct=10.0,  # miles away -- must not stretch the target out to it
+    )
+    assert levels.take_profit_pct == pytest.approx(atr_ceiling)
+
+
+def test_take_profit_never_crushes_below_the_atr_floor_even_with_a_very_close_resistance():
+    atr_floor = 2.0 * 0.02 * math.sqrt(5)
+    levels = exit_levels_for(
+        predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.02,
+        resistance_distance_pct=0.001,  # resistance right on top of entry
+    )
+    assert levels.take_profit_pct == pytest.approx(atr_floor)
+
+
+def test_a_resistance_the_price_has_already_cleared_does_not_tighten_anything():
+    """distance_pct <= 0 means price is already through the level -- no ceiling left to speak of."""
+    atr_ceiling = 4.0 * 0.02 * math.sqrt(5)
+    levels = exit_levels_for(
+        predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.02,
+        resistance_distance_pct=0.0,
+    )
+    assert levels.take_profit_pct == pytest.approx(atr_ceiling)
+
+
+def test_stop_loss_tightens_toward_a_closer_support_on_a_long():
+    # sigma stop = min(max(1.5*0.02*sqrt(5), 0.05), 0.20) ~= 0.067 -- pick a
+    # support distance strictly between the 0.05 floor and that ceiling.
+    sigma_stop = min(max(1.5 * 0.02 * math.sqrt(5), 0.05), 0.20)
+    levels = exit_levels_for(predicted_return=0.06, daily_volatility=0.02, horizon_days=5, support_distance_pct=0.06)
+    assert levels.stop_loss_pct == pytest.approx(0.06)
+    assert levels.stop_loss_pct < sigma_stop
+
+
+def test_stop_loss_never_tightens_below_its_own_minimum():
+    levels = exit_levels_for(
+        predicted_return=0.06, daily_volatility=0.02, horizon_days=5, support_distance_pct=0.001,
+    )
+    assert levels.stop_loss_pct == pytest.approx(0.05)  # exit_min_stop_loss_pct default
+
+
+def test_short_uses_support_for_take_profit_and_resistance_for_stop_loss():
+    """
+    A short's roles are the mirror of a long's -- profit is downside room
+    (support), risk is upside room (resistance). Both distances chosen
+    strictly inside their respective leg's [floor, ceiling] band -- TP:
+    [0.089, 0.179] (ATR-based), SL: [0.05, 0.067] (sigma-based) -- so each
+    actually tightens rather than getting floored back out.
+    """
+    levels = exit_levels_for(
+        predicted_return=-0.5, daily_volatility=0.02, horizon_days=5, atr_pct=0.02,
+        support_distance_pct=0.12, resistance_distance_pct=0.06,
+    )
+    assert levels.take_profit_pct == pytest.approx(0.12)
+    assert levels.stop_loss_pct == pytest.approx(0.06)
+
+
+def test_advised_clamps_the_llm_suggestion_into_the_channel_tightened_band():
+    levels = exit_levels_advised(
+        predicted_return=0.5, daily_volatility=0.01, llm_take_profit_pct=0.15,
+        llm_stop_loss_pct=None, horizon_days=5, atr_pct=0.02, resistance_distance_pct=0.12,
+    )
+    assert levels.take_profit_pct == pytest.approx(0.12)  # clamped down to resistance, not the raw 0.15

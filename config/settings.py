@@ -267,6 +267,14 @@ class Settings(BaseSettings):
     # target the stock has no history of reaching).
     exit_take_profit_min_atr_mult: float = Field(default=2.0, alias="EXIT_TAKE_PROFIT_MIN_ATR_MULT")
     exit_take_profit_max_atr_mult: float = Field(default=4.0, alias="EXIT_TAKE_PROFIT_MAX_ATR_MULT")
+    # Both take-profit AND stop-loss are additionally tightened toward the
+    # nearest real Donchian support/resistance level within this many
+    # trading days of history, when one sits closer than the ATR/sigma
+    # bound already would -- never further out than ATR alone allows, only
+    # ever pulled in toward a level the stock has actually shown. Matches
+    # the window models/screener.py's donchian_pct_20/donchian_breakout_20
+    # features already use, so no separate backfill is needed for this.
+    donchian_exit_window: int = Field(default=20, alias="DONCHIAN_EXIT_WINDOW")
     exit_take_profit_max_sigmas: float = Field(default=2.0, alias="EXIT_TAKE_PROFIT_MAX_SIGMAS")
     exit_min_take_profit_pct: float = Field(default=0.03, alias="EXIT_MIN_TAKE_PROFIT_PCT")
     # Stop loss in horizon-sigmas. 1.5 is deliberately wider than one
