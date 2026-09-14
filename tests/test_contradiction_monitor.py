@@ -167,10 +167,33 @@ def test_no_open_positions_is_a_clean_noop(monkeypatch):
     broker = _FakeBroker({})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
 
     results = cm.run_contradiction_check()
 
     assert results == []
+
+
+def test_no_open_positions_attempts_to_redeploy_idle_capital(monkeypatch):
+    """
+    Regression test: a fully flat book (e.g. right after a circuit-breaker
+    flatten) used to return before ever reaching _attempt_reactivation, so
+    the account stayed in cash until the next weekly cycle even though
+    _freed_capital_fraction already returns 1.0 for an empty book and the
+    full-book rebalance path handles zero current positions fine on its own.
+    """
+    broker = _FakeBroker({})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    calls = []
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: calls.append((a, k)))
+
+    cm.run_contradiction_check()
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] is broker
+    assert kwargs["excluded_symbols"] == set()
 
 
 # --- hourly equity snapshot (dashboard equity/drawdown chart resolution) ----
@@ -185,6 +208,7 @@ def test_hourly_check_records_an_equity_snapshot_when_the_book_is_flat(monkeypat
     broker = _FakeBroker({}, portfolio_value=105_000.0)
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
     calls = []
     monkeypatch.setattr(cm, "record_equity_snapshot", lambda value, mode: calls.append((value, mode)))
 
