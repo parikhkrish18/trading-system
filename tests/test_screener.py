@@ -1,7 +1,10 @@
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from config.settings import settings
 from execution.exit_levels import exit_levels_for
 from models.regime.trend_chop_classifier import TREND
 from models.screener import (
@@ -10,12 +13,14 @@ from models.screener import (
     _apply_llm_advice_to_scored,
     _attach_reasoning,
     _bounded_conviction_weights,
+    _channel_distances,
     apply_macro_sector_block,
     apply_short_preference,
     apply_trend_pullback_boost,
     attach_exit_levels,
     build_correlation_matrix,
     daily_volatility,
+    donchian_channel_levels,
     explain_held_symbols,
     score_universe,
     select_concentrated_trades,
@@ -1073,6 +1078,8 @@ def _run_screen_harness(monkeypatch, mode, *, full_deployment=False, diversified
     monkeypatch.setattr(scr, "build_correlation_matrix", lambda *a, **k: pd.DataFrame())
     monkeypatch.setattr(scr, "_attach_reasoning", lambda *a, **k: None)
     monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
+    # Real usage hits the DB; tests opt in per-case with their own levels.
+    monkeypatch.setattr(scr, "donchian_channel_levels", lambda *a, **k: {})
 
     calls = {}
 
@@ -1108,6 +1115,153 @@ def test_run_screen_concentrated_mode_uses_the_two_trade_split(monkeypatch):
     scr.run_screen("v3", ["A"])
 
     assert "concentrated" in calls and "diversified" not in calls
+
+
+def test_donchian_channel_levels_computes_support_and_resistance(monkeypatch):
+    from sqlalchemy import create_engine, text
+
+    import models.screener as scr
+
+    eng = create_engine("sqlite://")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE prices (symbol TEXT, ts TEXT, high REAL, low REAL)"))
+        for i in range(25):
+            conn.execute(
+                text("INSERT INTO prices (symbol, ts, high, low) VALUES (:symbol, :ts, :high, :low)"),
+                {"symbol": "AAPL", "ts": f"2026-01-{i + 1:02d}", "high": 100.0 + i, "low": 90.0 + i},
+            )
+    monkeypatch.setattr(scr, "get_engine", lambda: eng)
+
+    levels = scr.donchian_channel_levels(["AAPL"], window=20)
+
+    # Last 20 of 25 rows by ts (i=5..24): support = min(low) = 95.0, resistance = max(high) = 124.0.
+    assert levels["AAPL"] == pytest.approx((95.0, 124.0))
+
+
+def test_donchian_channel_levels_excludes_a_symbol_with_too_little_history(monkeypatch):
+    from sqlalchemy import create_engine, text
+
+    import models.screener as scr
+
+    eng = create_engine("sqlite://")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE prices (symbol TEXT, ts TEXT, high REAL, low REAL)"))
+        for i in range(5):  # fewer than the 20-bar window
+            conn.execute(
+                text("INSERT INTO prices (symbol, ts, high, low) VALUES (:symbol, :ts, :high, :low)"),
+                {"symbol": "NEWCO", "ts": f"2026-01-{i + 1:02d}", "high": 10.0, "low": 9.0},
+            )
+    monkeypatch.setattr(scr, "get_engine", lambda: eng)
+
+    assert scr.donchian_channel_levels(["NEWCO"], window=20) == {}
+
+
+def test_donchian_channel_levels_with_no_symbols_is_a_noop():
+    assert donchian_channel_levels([]) == {}
+
+
+# --------------------------------------------------------------------------
+# _channel_distances: turning raw support/resistance into a solidification cap
+# --------------------------------------------------------------------------
+
+
+def test_channel_distances_computes_both_when_price_is_inside_the_range():
+    support_distance, resistance_distance = _channel_distances(100.0, (90.0, 120.0))
+    assert support_distance == pytest.approx(0.10)  # (100-90)/100
+    assert resistance_distance == pytest.approx(0.20)  # (120-100)/100
+
+
+def test_channel_distances_resistance_is_none_once_price_has_cleared_it():
+    support_distance, resistance_distance = _channel_distances(125.0, (90.0, 120.0))
+    assert resistance_distance is None
+    assert support_distance is not None
+
+
+def test_channel_distances_support_is_none_once_price_has_broken_it():
+    support_distance, resistance_distance = _channel_distances(85.0, (90.0, 120.0))
+    assert support_distance is None
+    assert resistance_distance is not None
+
+
+def test_channel_distances_with_no_channel_data_is_none_none():
+    assert _channel_distances(100.0, None) == (None, None)
+
+
+def test_channel_distances_with_no_price_is_none_none():
+    assert _channel_distances(None, (90.0, 120.0)) == (None, None)
+
+
+def test_run_screen_computes_atr_pct_from_vol_atr_14_and_close(monkeypatch):
+    """
+    vol_atr_14 (a raw QUANT_FEATURES entry -- see features/build_features.py
+    -- in absolute price units) divided by close gives atr_pct, the
+    fraction of price this stock's ATR represents. execution/exit_levels.py
+    sizes take-profit as a multiple of this for the weekly swing horizon.
+    """
+    scr, _ = _run_screen_harness(monkeypatch, "concentrated")
+    monkeypatch.setattr(scr.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        scr, "load_latest_features",
+        lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3], "vol_atr_14": [2.0], "close": [100.0]}),
+    )
+    captured = {}
+
+    def fake_build_pool(*args, **kwargs):
+        captured["atr_pct_by_symbol"] = kwargs.get("atr_pct_by_symbol")
+        return []
+
+    monkeypatch.setattr(scr, "_build_llm_candidate_pool", fake_build_pool)
+    monkeypatch.setattr(scr, "get_llm_trade_advice", lambda *a, **k: None)
+
+    scr.run_screen("v3", ["A"])
+
+    assert captured["atr_pct_by_symbol"]["A"] == pytest.approx(0.02)  # 2.0 / 100.0
+
+
+def test_run_screen_passes_donchian_channel_levels_to_the_llm_pool_builder(monkeypatch):
+    scr, _ = _run_screen_harness(monkeypatch, "concentrated")
+    monkeypatch.setattr(scr.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        scr, "load_latest_features",
+        lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3], "close": [100.0]}),
+    )
+    monkeypatch.setattr(scr, "donchian_channel_levels", lambda symbols, window=None: {"A": (90.0, 120.0)})
+    captured = {}
+
+    def fake_build_pool(*args, **kwargs):
+        captured["channel_levels_by_symbol"] = kwargs.get("channel_levels_by_symbol")
+        return []
+
+    monkeypatch.setattr(scr, "_build_llm_candidate_pool", fake_build_pool)
+    monkeypatch.setattr(scr, "get_llm_trade_advice", lambda *a, **k: None)
+
+    scr.run_screen("v3", ["A"])
+
+    assert captured["channel_levels_by_symbol"]["A"] == pytest.approx((90.0, 120.0))
+
+
+def test_build_llm_candidate_pool_includes_donchian_levels_and_solidified_quant_bounds(monkeypatch):
+    import models.screener as scr
+
+    monkeypatch.setattr(scr.settings, "target_horizon_days", 5)
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
+    monkeypatch.setattr(scr, "_explain_features", lambda *a, **k: {})
+    monkeypatch.setattr(scr, "_load_recent_headlines", lambda *a, **k: {})
+
+    pool_df = pd.DataFrame({"symbol": ["A"], "predicted_return": [0.5], "conviction_score": [0.5]})
+    payload = scr._build_llm_candidate_pool(
+        pool_df, ensemble=None, latest_features=pd.DataFrame(), raw_features=pd.DataFrame(),
+        feature_cols=[], vol_by_symbol={"A": 0.01}, latest_close_by_symbol={"A": 100.0},
+        macro_sector_sentiment_by_symbol={}, horizon_days=5,
+        atr_pct_by_symbol={"A": 0.02}, channel_levels_by_symbol={"A": (90.0, 112.0)},
+    )
+
+    assert len(payload) == 1
+    row = payload[0]
+    assert row["donchian_support"] == pytest.approx(90.0)
+    assert row["donchian_resistance"] == pytest.approx(112.0)
+    # resistance_distance = (112-100)/100 = 0.12, inside the ATR band [0.089, 0.179] -- solidifies the ceiling.
+    assert row["quant_take_profit_pct"] == pytest.approx(0.12)
 
 
 def test_run_screen_concentrated_mode_passes_position_count_and_split_settings(monkeypatch):
@@ -1417,10 +1571,38 @@ def test_attach_exit_levels_falls_back_when_a_symbol_has_no_volatility():
 def test_attach_exit_levels_uses_the_llm_hint_when_one_is_given():
     candidate = TradeCandidate("AAPL", "long", 0.04, 1.0, 0.04, 0.1)
 
-    attach_exit_levels([candidate], {"AAPL": 0.02}, llm_hints={"AAPL": (0.09, 0.06)})
+    # vol chosen so the sigma-based fallback ceiling comfortably clears
+    # 0.09 regardless of settings.target_horizon_days (no atr_pct given
+    # here, so this exercises that fallback, not the ATR-relative bounds).
+    attach_exit_levels([candidate], {"AAPL": 0.05}, llm_hints={"AAPL": (0.09, 0.06)})
 
     assert candidate.exit_levels.take_profit_pct == pytest.approx(0.09)
     assert candidate.exit_levels.stop_loss_pct == pytest.approx(0.06)
+
+
+def test_attach_exit_levels_sizes_take_profit_off_atr_when_available():
+    candidate = TradeCandidate("AAPL", "long", 0.30, 1.0, 0.30, 0.1)
+
+    attach_exit_levels(
+        [candidate], {"AAPL": 0.01}, atr_pct_by_symbol={"AAPL": 0.02},
+    )
+
+    # 4x cap of horizon-scaled ATR (0.02 * sqrt(settings.target_horizon_days))
+    expected_cap = 4.0 * 0.02 * math.sqrt(settings.target_horizon_days)
+    assert candidate.exit_levels.take_profit_pct == pytest.approx(expected_cap)
+
+
+def test_attach_exit_levels_solidifies_take_profit_toward_a_closer_resistance():
+    candidate = TradeCandidate("AAPL", "long", 0.30, 1.0, 0.30, 0.1)
+
+    attach_exit_levels(
+        [candidate], {"AAPL": 0.01}, atr_pct_by_symbol={"AAPL": 0.02},
+        resistance_distance_by_symbol={"AAPL": 0.12},
+    )
+
+    # ATR band ~= [0.089, 0.179] (2x-4x of 0.02*sqrt(settings.target_horizon_days))
+    # -- 0.12 sits inside it and should replace the ceiling.
+    assert candidate.exit_levels.take_profit_pct == pytest.approx(0.12)
 
 
 def test_attach_exit_levels_ignores_hints_for_a_symbol_not_in_the_map():

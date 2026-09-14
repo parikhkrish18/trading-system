@@ -750,18 +750,24 @@ def _build_llm_candidate_pool(
     macro_sector_sentiment_by_symbol: dict[str, float],
     horizon_days: int,
     top_n: int = 5,
+    atr_pct_by_symbol: dict[str, float] | None = None,
+    channel_levels_by_symbol: dict[str, tuple[float, float]] | None = None,
 ) -> list[dict]:
     """
     Assembles the per-candidate payload models/llm_advisor.py sends to
     Claude: the same SHAP top-features _attach_reasoning uses (so the LLM
     reasons off the exact attribution a human reading the dashboard would
-    see), plus market price, volatility, sector sentiment, recent
-    headlines, and the existing quant formula's own take-profit/stop-loss
-    as a reference point.
+    see), plus market price, volatility, ATR, this stock's own Donchian
+    support/resistance, sector sentiment, recent headlines, and the
+    existing quant formula's own take-profit/stop-loss (now ATR-relative
+    and channel-solidified — see execution/exit_levels.py) as a reference
+    point.
     """
     symbols = list(pool["symbol"])
     if not symbols:
         return []
+    atr_pct_by_symbol = atr_pct_by_symbol or {}
+    channel_levels_by_symbol = channel_levels_by_symbol or {}
     fundamentals_context = _load_fundamentals_context(symbols)
     per_symbol_top_features = _explain_features(
         symbols, ensemble, latest_features, raw_features, feature_cols, fundamentals_context, top_n=top_n
@@ -772,7 +778,14 @@ def _build_llm_candidate_pool(
     for _, row in pool.iterrows():
         symbol = row["symbol"]
         vol = vol_by_symbol.get(symbol)
-        quant_bounds = exit_levels_for(predicted_return=row["predicted_return"], daily_volatility=vol, horizon_days=horizon_days)
+        atr_pct = atr_pct_by_symbol.get(symbol)
+        price = latest_close_by_symbol.get(symbol)
+        channel = channel_levels_by_symbol.get(symbol)
+        support_distance, resistance_distance = _channel_distances(price, channel)
+        quant_bounds = exit_levels_for(
+            predicted_return=row["predicted_return"], daily_volatility=vol, horizon_days=horizon_days,
+            atr_pct=atr_pct, support_distance_pct=support_distance, resistance_distance_pct=resistance_distance,
+        )
         payload.append(
             {
                 "symbol": symbol,
@@ -780,8 +793,11 @@ def _build_llm_candidate_pool(
                 "predicted_return": float(row["predicted_return"]),
                 "conviction_score": float(row["conviction_score"]),
                 "macro_sector_sentiment": macro_sector_sentiment_by_symbol.get(symbol),
-                "current_price": latest_close_by_symbol.get(symbol),
+                "current_price": price,
                 "daily_volatility_pct": vol,
+                "atr_pct": atr_pct,
+                "donchian_support": channel[0] if channel else None,
+                "donchian_resistance": channel[1] if channel else None,
                 "top_features": per_symbol_top_features.get(symbol, []),
                 "recent_headlines": headlines_by_symbol.get(symbol, []),
                 "quant_take_profit_pct": quant_bounds.take_profit_pct,
@@ -1029,10 +1045,70 @@ def daily_volatility(prices: pd.DataFrame, window: int = 20) -> dict[str, float]
     return out
 
 
+def donchian_channel_levels(symbols: list[str], window: int | None = None) -> dict[str, tuple[float, float]]:
+    """
+    symbol -> (support, resistance): the rolling `window`-bar low/high in
+    raw price terms -- this stock's own Donchian channel, used to solidify
+    take-profit/stop-loss against real support/resistance rather than a
+    pure ATR/volatility guess (see execution/exit_levels.py's
+    resistance_distance_pct/support_distance_pct).
+
+    A fresh, targeted price read rather than reusing load_training_frame's
+    train_df: that frame only carries close (see load_feature_frame),
+    deliberately -- adding high/low there would feed them to the model as
+    unrecognised, unscaled raw-price features (feature_columns() treats any
+    column outside NON_FEATURE_COLUMNS as a model input). window defaults
+    to settings.donchian_exit_window, the same window
+    donchian_pct_20/donchian_breakout_20 already use as model features, so
+    this needs no separate history backfill to be usable.
+    """
+    if not symbols:
+        return {}
+    window = settings.donchian_exit_window if window is None else window
+    prices = pd.read_sql(
+        f"SELECT symbol, ts, high, low FROM prices WHERE symbol IN ({symbol_in_clause(symbols)}) ORDER BY ts",  # noqa: S608 — symbols validated via symbol_in_clause
+        get_engine(),
+    )
+    if prices.empty:
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for symbol, group in prices.sort_values("ts").groupby("symbol"):
+        if len(group) < window:
+            continue
+        support = float(group["low"].tail(window).min())
+        resistance = float(group["high"].tail(window).max())
+        if math.isfinite(support) and math.isfinite(resistance):
+            out[str(symbol)] = (support, resistance)
+    return out
+
+
+def _channel_distances(
+    price: float | None, support_resistance: tuple[float, float] | None
+) -> tuple[float | None, float | None]:
+    """
+    (support_distance_pct, resistance_distance_pct) for execution/exit_levels.py
+    -- positive fractions of price, or None when price has already cleared
+    that side of the channel (no room left to tighten toward) or either
+    input is unavailable.
+    """
+    if price is None or not price > 0 or support_resistance is None:
+        return None, None
+    support, resistance = support_resistance
+    support_distance = (price - support) / price
+    resistance_distance = (resistance - price) / price
+    return (
+        support_distance if support_distance > 0 else None,
+        resistance_distance if resistance_distance > 0 else None,
+    )
+
+
 def attach_exit_levels(
     candidates: list[TradeCandidate],
     vol_by_symbol: dict[str, float],
     llm_hints: dict[str, tuple[float | None, float | None]] | None = None,
+    atr_pct_by_symbol: dict[str, float] | None = None,
+    support_distance_by_symbol: dict[str, float] | None = None,
+    resistance_distance_by_symbol: dict[str, float] | None = None,
 ) -> None:
     """
     Give every candidate the levels it will be proposed, approved and later
@@ -1041,23 +1117,45 @@ def attach_exit_levels(
     `llm_hints`: {symbol: (take_profit_pct, stop_loss_pct)} suggested by
     models/llm_advisor.py for a symbol Claude was consulted on. When
     present, exit_levels_advised clamps that suggestion into the exact
-    same volatility-derived bounds exit_levels_for always enforces, rather
-    than using the plain quant-formula value outright.
+    same ATR-/volatility-/channel-derived bounds exit_levels_for always
+    enforces, rather than using the plain quant-formula value outright.
+
+    `atr_pct_by_symbol`: this stock's ATR as a fraction of price, when
+    available — see exit_levels_for's atr_pct. None/missing falls back to
+    the older volatility-sigma-based take-profit bounds for that symbol.
+
+    `support_distance_by_symbol`/`resistance_distance_by_symbol`: this
+    stock's distance to its own Donchian channel bounds (see
+    donchian_channel_levels/_channel_distances), as a positive fraction of
+    price. Solidifies (tightens, never widens) whichever leg each applies
+    to — see exit_levels_for's docstring for which leg is which per side.
     """
     llm_hints = llm_hints or {}
+    atr_pct_by_symbol = atr_pct_by_symbol or {}
+    support_distance_by_symbol = support_distance_by_symbol or {}
+    resistance_distance_by_symbol = resistance_distance_by_symbol or {}
     for candidate in candidates:
         hint = llm_hints.get(candidate.symbol)
+        atr_pct = atr_pct_by_symbol.get(candidate.symbol)
+        support_distance = support_distance_by_symbol.get(candidate.symbol)
+        resistance_distance = resistance_distance_by_symbol.get(candidate.symbol)
         if hint is not None:
             candidate.exit_levels = exit_levels_advised(
                 predicted_return=candidate.predicted_return,
                 daily_volatility=vol_by_symbol.get(candidate.symbol),
                 llm_take_profit_pct=hint[0],
                 llm_stop_loss_pct=hint[1],
+                atr_pct=atr_pct,
+                support_distance_pct=support_distance,
+                resistance_distance_pct=resistance_distance,
             )
         else:
             candidate.exit_levels = exit_levels_for(
                 predicted_return=candidate.predicted_return,
                 daily_volatility=vol_by_symbol.get(candidate.symbol),
+                atr_pct=atr_pct,
+                support_distance_pct=support_distance,
+                resistance_distance_pct=resistance_distance,
             )
 
 
@@ -1196,6 +1294,41 @@ def run_screen_with_scores(
     )
     scored = score_universe(ensemble, latest, feature_cols, min_abs_return, raw_features=raw_latest)
 
+    # This stock's own 14-day Average True Range (vol_atr_14, a QUANT_FEATURES
+    # entry — see features/build_features.py) as a fraction of price, for
+    # take-profit sizing (execution/exit_levels.py targets a multiple of
+    # this, 2x-4x by default, for the weekly swing horizon this system
+    # targets). raw_latest carries vol_atr_14 in absolute price units
+    # (dollars), never cross-sectionally z-scored, same reasoning as every
+    # other raw_latest read in this function. Also captures each symbol's
+    # current price here, reused below for the Donchian channel distances.
+    atr_pct_by_symbol: dict[str, float] = {}
+    price_by_symbol: dict[str, float] = {}
+    if "close" in raw_latest.columns:
+        for _, row in raw_latest.iterrows():
+            symbol, price = str(row["symbol"]), row.get("close")
+            if pd.notna(price) and price > 0:
+                price_by_symbol[symbol] = float(price)
+            atr_val = row.get("vol_atr_14") if "vol_atr_14" in raw_latest.columns else None
+            if pd.notna(atr_val) and symbol in price_by_symbol:
+                atr_pct_by_symbol[symbol] = float(atr_val) / price_by_symbol[symbol]
+
+    # Solidifies the ATR/sigma-derived bounds above against this stock's own
+    # recent trading range (settings.donchian_exit_window) -- take-profit
+    # and stop-loss are tightened toward real support/resistance when one
+    # sits closer than the ATR/sigma bound alone would allow (see
+    # execution/exit_levels.py's resistance_distance_pct/support_distance_pct
+    # and _channel_cap there for exactly how).
+    channel_levels_by_symbol = donchian_channel_levels(list(price_by_symbol.keys()))
+    support_distance_by_symbol: dict[str, float] = {}
+    resistance_distance_by_symbol: dict[str, float] = {}
+    for symbol, price in price_by_symbol.items():
+        support_distance, resistance_distance = _channel_distances(price, channel_levels_by_symbol.get(symbol))
+        if support_distance is not None:
+            support_distance_by_symbol[symbol] = support_distance
+        if resistance_distance is not None:
+            resistance_distance_by_symbol[symbol] = resistance_distance
+
     if settings.enable_macro_sector_block:
         macro_mkt_sentiment = None
         macro_sector_sentiment_by_symbol: dict[str, float] = {}
@@ -1268,6 +1401,7 @@ def run_screen_with_scores(
             llm_pool = _build_llm_candidate_pool(
                 eligible, ensemble, latest, raw_latest, feature_cols, vol_by_symbol,
                 latest_close_by_symbol, macro_sector_map, target_horizon_days,
+                atr_pct_by_symbol=atr_pct_by_symbol, channel_levels_by_symbol=channel_levels_by_symbol,
             )
             llm_advice = get_llm_trade_advice(
                 llm_pool,
@@ -1424,7 +1558,11 @@ def run_screen_with_scores(
     # rather than recomputing it a second time. llm_exit_hints is only ever
     # non-empty when the LLM advisory pass above succeeded and picked this
     # candidate; every other cycle this is the exact pre-existing behavior.
-    attach_exit_levels(candidates, vol_by_symbol, llm_exit_hints)
+    attach_exit_levels(
+        candidates, vol_by_symbol, llm_exit_hints, atr_pct_by_symbol=atr_pct_by_symbol,
+        support_distance_by_symbol=support_distance_by_symbol,
+        resistance_distance_by_symbol=resistance_distance_by_symbol,
+    )
     return ScreenResult(
         candidates=candidates,
         scored=scored,
