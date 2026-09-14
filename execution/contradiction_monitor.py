@@ -682,7 +682,14 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 
     positions = {s: q for s, q in broker.get_positions().items() if q != 0}
     if not positions:
-        logger.info("No open positions — nothing to check.")
+        # A fully flat book (e.g. right after a circuit-breaker flatten) had
+        # nothing here to redeploy it: this returned before ever reaching
+        # _attempt_reactivation below, so the book stayed in cash until the
+        # next weekly cycle even though _freed_capital_fraction already
+        # returns 1.0 for an empty book and the full-book rebalance path
+        # handles zero current_positions/excluded_symbols fine on its own.
+        logger.info("No open positions — attempting to redeploy idle capital.")
+        _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set())
         return []
 
     symbols = list(positions.keys())
