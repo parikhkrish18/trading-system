@@ -1,3 +1,5 @@
+import pytest
+
 from monitoring import reasoning
 from risk.circuit_breakers import BreakerResult
 
@@ -162,6 +164,32 @@ def test_phase_forecast_never_mentions_model_agreement():
     text = " ".join([reasoning.phase_forecast(0.03, 0.03)["summary"], *reasoning.phase_forecast(0.03, 0.03)["lines"]])
 
     assert "agree" not in text.lower()
+
+
+def test_phase_forecast_includes_signal_to_noise_when_given():
+    phase = reasoning.phase_forecast(0.03, 0.03, signal_to_noise=2.5)
+    assert phase["signal_to_noise"] == pytest.approx(2.5)
+    assert any("signal-to-noise" in line.lower() for line in phase["lines"])
+
+
+def test_phase_forecast_omits_signal_to_noise_line_when_not_given():
+    phase = reasoning.phase_forecast(0.03, 0.03)
+    assert phase["signal_to_noise"] is None
+    assert not any("signal-to-noise" in line.lower() for line in phase["lines"])
+
+
+@pytest.mark.parametrize("bad_snr", [float("nan"), float("inf")])
+def test_phase_forecast_treats_a_non_finite_signal_to_noise_as_missing(bad_snr):
+    """A raw NaN/inf would break JSON serialization once this dict reaches the decisions table's reasoning column."""
+    phase = reasoning.phase_forecast(0.03, 0.03, signal_to_noise=bad_snr)
+    assert phase["signal_to_noise"] is None
+    assert not any("signal-to-noise" in line.lower() for line in phase["lines"])
+
+
+def test_phase_forecast_frames_signal_to_noise_as_informational_not_a_bar():
+    phase = reasoning.phase_forecast(0.03, 0.03, signal_to_noise=1.5)
+    snr_line = next(line for line in phase["lines"] if "signal-to-noise" in line.lower())
+    assert "pass/fail" in snr_line or "informational" in snr_line
 
 
 def test_phase_selection_single_candidate_notes_fallback():

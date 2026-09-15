@@ -71,6 +71,12 @@ _MODEL_VERSION = "ensemble_v1"
 # instead of the old 0.0, which passed literally any nonzero forecast.
 DEFAULT_MIN_ABS_RETURN = round_trip_cost_fraction()
 
+# signal_to_noise (models/forecast/ensemble.py) is +inf when every ensemble
+# member predicts the identical number -- capped here to a large-but-finite
+# sentinel since it ends up in JSON (the dashboard API, Claude's candidate
+# payload), which has no representation for infinity.
+_SIGNAL_TO_NOISE_CAP = 999.0
+
 
 @dataclasses.dataclass
 class TradeCandidate:
@@ -80,6 +86,10 @@ class TradeCandidate:
     direction_agreement: float
     conviction_score: float
     target_position_pct: float
+    # |predicted_return| / ensemble spread -- see models/forecast/ensemble.py.
+    # None only for candidates built outside run_screen; the two builders
+    # below (select_trades's loop, _make_candidate) always set it.
+    signal_to_noise: float | None = None
     # The take-profit/stop-loss pair this pick is proposed with, sized to
     # this stock rather than shared with every other position. None only
     # for candidates built outside run_screen; attach_exit_levels fills it.
@@ -184,7 +194,7 @@ def score_universe(
     """
     empty = pd.DataFrame(
         columns=[
-            "symbol", "predicted_return", "direction_agreement", "conviction_score",
+            "symbol", "predicted_return", "direction_agreement", "signal_to_noise", "conviction_score",
             "donchian_breakout_20", "trend_pullback_score", "confident",
         ]
     )
@@ -194,11 +204,18 @@ def score_universe(
     X = latest_features.reindex(columns=feature_cols)
     preds = ensemble.predict(X)
 
+    # +inf (every member predicted the identical number) capped to a large
+    # finite sentinel -- JSON (the dashboard API, Claude's payload) has no
+    # representation for infinity, and an uncapped value would either break
+    # serialization or silently become null depending on the encoder.
+    signal_to_noise = np.minimum(preds["signal_to_noise"].to_numpy(), _SIGNAL_TO_NOISE_CAP)
+
     result = pd.DataFrame(
         {
             "symbol": latest_features["symbol"].to_numpy(),
             "predicted_return": preds["mean_prediction"].to_numpy(),
             "direction_agreement": preds["direction_agreement"].to_numpy(),
+            "signal_to_noise": signal_to_noise,
         }
     )
 
@@ -473,6 +490,7 @@ def select_trades(
                 direction_agreement=float(row["direction_agreement"]),
                 conviction_score=float(row["conviction_score"]),
                 target_position_pct=float(size),
+                signal_to_noise=_safe_signal_to_noise(row),
             )
         )
         # Fold this pick into the running exposure so the NEXT candidate
@@ -480,6 +498,12 @@ def select_trades(
         current_positions[symbol] = size
 
     return candidates
+
+
+def _safe_signal_to_noise(row: pd.Series) -> float | None:
+    """None when the column is absent or NaN, rather than a NaN that breaks JSON serialization downstream."""
+    value = row.get("signal_to_noise")
+    return float(value) if value is not None and pd.notna(value) else None
 
 
 def _make_candidate(row: pd.Series, weight: float, total_deploy_pct: float) -> TradeCandidate:
@@ -493,6 +517,7 @@ def _make_candidate(row: pd.Series, weight: float, total_deploy_pct: float) -> T
         direction_agreement=float(row["direction_agreement"]),
         conviction_score=float(row["conviction_score"]),
         target_position_pct=float(sign * weight * total_deploy_pct),
+        signal_to_noise=_safe_signal_to_noise(row),
     )
 
 
@@ -796,6 +821,7 @@ def _build_llm_candidate_pool(
                 "current_price": price,
                 "daily_volatility_pct": vol,
                 "atr_pct": atr_pct,
+                "signal_to_noise": _safe_signal_to_noise(row),
                 "donchian_support": channel[0] if channel else None,
                 "donchian_resistance": channel[1] if channel else None,
                 "top_features": per_symbol_top_features.get(symbol, []),
@@ -925,11 +951,15 @@ def explain_held_symbols(
     per_symbol_top_features = _explain_features(usable, ensemble, latest_features, raw_features, feature_cols, fundamentals_context)
     predicted_by_symbol = dict(zip(scored["symbol"], scored["predicted_return"], strict=False))
     conviction_by_symbol = dict(zip(scored["symbol"], scored["conviction_score"], strict=False))
+    snr_by_symbol = dict(zip(scored["symbol"], scored.get("signal_to_noise", []), strict=False))
 
     return {
         symbol: [
             reasoning.phase_signals(regime, per_symbol_top_features[symbol]),
-            reasoning.phase_forecast(predicted_by_symbol.get(symbol, 0.0), conviction_by_symbol.get(symbol, 0.0)),
+            reasoning.phase_forecast(
+                predicted_by_symbol.get(symbol, 0.0), conviction_by_symbol.get(symbol, 0.0),
+                signal_to_noise=snr_by_symbol.get(symbol),
+            ),
         ]
         for symbol in usable
     }
@@ -1017,7 +1047,9 @@ def _attach_reasoning(
             )
         candidate.reasoning = [
             reasoning.phase_signals(regime, top_features),
-            reasoning.phase_forecast(candidate.predicted_return, candidate.conviction_score),
+            reasoning.phase_forecast(
+                candidate.predicted_return, candidate.conviction_score, signal_to_noise=candidate.signal_to_noise
+            ),
             phase4,
         ]
 
@@ -1281,8 +1313,19 @@ def run_screen_with_scores(
     # universe by this much over the horizon", not "expected to rise this
     # much", and the confidence thresholds downstream are interpreted in
     # those units.
-    ensemble = EnsembleForecastModel(n_models=n_ensemble_models)
-    ensemble.fit(train_df[feature_cols], train_df["target"])
+    # diversity="structural" (not the "seed" default): members differing only
+    # by bagging/feature-sampling seed turned out to be near-clones -- ~96%
+    # of predictions cleared the old 80% agreement bar regardless of
+    # forecast quality (see models/confidence_eval.py's August verdict),
+    # which is exactly what made direction_agreement read as false
+    # certainty. Structural diversity (per-member tree depth, feature
+    # fraction, and training-window recency) doesn't itself prove a
+    # statistically significant filter, but it does make disagreement mean
+    # something instead of pinning near 1.0 for almost every pick. ts is
+    # passed so the recency-window members actually get a different window,
+    # not the full-history fallback.
+    ensemble = EnsembleForecastModel(n_models=n_ensemble_models, diversity="structural")
+    ensemble.fit(train_df[feature_cols], train_df["target"], ts=train_df["ts"])
 
     latest = load_latest_features(feature_set_id, symbols)
     # _attach_reasoning needs the unscaled values for its human-readable

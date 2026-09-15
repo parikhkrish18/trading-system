@@ -5,6 +5,12 @@ const fmt = {
   pct: (v, d = 2) => (v === null || v === undefined || Number.isNaN(v) ? "—" : `${(Number(v) * 100).toFixed(d)}%`),
   money: (v) => (v === null || v === undefined || Number.isNaN(v) ? "—" : `$${Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`),
   time: (v) => (v ? new Date(v).toLocaleString() : "—"),
+  // |predicted move| / ensemble spread (models/forecast/ensemble.py) --
+  // informational, not a pass/fail bar (see monitoring/reasoning.py's
+  // phase_forecast). models/screener.py caps the "every member predicted
+  // the identical number" case at 999 rather than +inf (JSON has no
+  // infinity) -- read that as "very high", not a literal reading.
+  signalToNoise: (v) => (v === null || v === undefined || Number.isNaN(v) ? "—" : Number(v) >= 999 ? "very high" : Number(v).toFixed(2)),
 };
 
 // Headlines, sources and LLM-generated sentiment reasons are all external
@@ -593,7 +599,7 @@ async function loadTradeLog(offset = 0) {
           <td><span class="side-badge ${r.direction}">${escapeHTML(r.direction)}</span></td>
           <td>${fmt.pct(r.forecast)}</td>
           <td>${escapeHTML(r.regime ?? "—")}</td>
-          <td>${fmt.pct(r.direction_agreement, 0)}</td>
+          <td>${fmt.signalToNoise(r.signal_to_noise)}</td>
           <td class="${outcomeClass}">${outcome}</td>
           <td>${fmt.pct(r.realized_return, 2)}</td>
         </tr>`;
@@ -1104,6 +1110,16 @@ function tickerPriceSummaryHTML(latestPrice) {
     </div>`;
 }
 
+// Phase 3 ("Forecast & Confidence" -- monitoring/reasoning.py::phase_forecast)
+// carries signal_to_noise alongside its prose; not its own top-level field
+// on the decision, so it's pulled out of the already-fetched reasoning
+// array here instead of a second request.
+function signalToNoiseFromReasoning(reasoning) {
+  if (!Array.isArray(reasoning)) return null;
+  const phase3 = reasoning.find((p) => p && p.phase === 3);
+  return phase3 && typeof phase3.signal_to_noise === "number" ? phase3.signal_to_noise : null;
+}
+
 // Reuses reasoningPhasesHTML (see the Positions section above) so a
 // decision's reasoning reads identically here as it does on a held
 // position's card -- same phase cards, same legacy-format fallback.
@@ -1119,13 +1135,14 @@ function tickerDecisionsHTML(decisions, tickerKey) {
         .filter(Boolean)
         .join(" · ");
       const toggleId = `${tickerKey}-${idx}`;
+      const signalToNoise = signalToNoiseFromReasoning(d.reasoning);
       return `
         <div class="phase-card">
           <div class="position-grid-stats">
             <div><div class="label">Decided</div>${fmt.time(d.ts)}</div>
             <div><div class="label">Direction</div>${direction}</div>
             <div><div class="label">Forecast</div>${fmt.pct(d.forecast, 2)}</div>
-            <div><div class="label">Ensemble agreement</div>${fmt.pct(d.direction_agreement, 0)}</div>
+            <div><div class="label">Signal-to-noise</div>${fmt.signalToNoise(signalToNoise)}</div>
             <div><div class="label">Target size</div>${fmt.pct(Math.abs(target || 0), 1)}</div>
             <div><div class="label">Regime</div>${d.regime || "—"}</div>
           </div>

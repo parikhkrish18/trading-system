@@ -368,8 +368,8 @@ def test_the_screener_sizes_against_the_spread_of_what_it_predicts(monkeypatch):
     monkeypatch.setattr(scr, "load_training_frame", lambda *a, **k: train_df)
 
     class _NoopEnsemble:
-        def __init__(self, n_models=5): ...
-        def fit(self, X, y): ...
+        def __init__(self, n_models=5, diversity="seed"): ...
+        def fit(self, X, y, ts=None): ...
 
     monkeypatch.setattr(scr, "EnsembleForecastModel", _NoopEnsemble)
     monkeypatch.setattr(scr, "load_latest_features", lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3]}))
@@ -422,8 +422,8 @@ def test_the_ensemble_is_fitted_on_target_not_on_the_raw_return(monkeypatch):
     fitted = {}
 
     class _CapturingEnsemble:
-        def __init__(self, n_models=5): ...
-        def fit(self, X, y):
+        def __init__(self, n_models=5, diversity="seed"): ...
+        def fit(self, X, y, ts=None):
             fitted["y"] = list(y)
 
     monkeypatch.setattr(scr, "EnsembleForecastModel", _CapturingEnsemble)

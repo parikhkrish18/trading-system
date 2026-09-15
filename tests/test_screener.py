@@ -8,6 +8,7 @@ from config.settings import settings
 from execution.exit_levels import exit_levels_for
 from models.regime.trend_chop_classifier import TREND
 from models.screener import (
+    _SIGNAL_TO_NOISE_CAP,
     ScreenResult,
     TradeCandidate,
     _apply_llm_advice_to_scored,
@@ -38,11 +39,17 @@ class _FakeEnsemble:
         self._contributions = contributions
 
     def predict(self, X):
+        mean = np.asarray(self.mean_prediction, dtype=float)
+        std = np.asarray(self.std_prediction, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            snr = np.abs(mean) / std
+        snr = np.where(std == 0, np.inf, snr)
         return pd.DataFrame(
             {
                 "mean_prediction": self.mean_prediction,
                 "std_prediction": self.std_prediction,
                 "direction_agreement": self.direction_agreement,
+                "signal_to_noise": snr,
             },
             index=X.index,
         )
@@ -90,9 +97,33 @@ def test_score_universe_empty_input_returns_empty_with_columns():
     result = score_universe(ensemble, pd.DataFrame(), feature_cols=["f1"])
     assert result.empty
     assert list(result.columns) == [
-        "symbol", "predicted_return", "direction_agreement", "conviction_score",
+        "symbol", "predicted_return", "direction_agreement", "signal_to_noise", "conviction_score",
         "donchian_breakout_20", "trend_pullback_score", "confident",
     ]
+
+
+def test_score_universe_caps_signal_to_noise_at_a_json_safe_sentinel():
+    """
+    +inf (every ensemble member predicted the identical number) has no JSON
+    representation -- score_universe caps it before it can reach the
+    dashboard API or Claude's payload.
+    """
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], std_prediction=[0.0])
+
+    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02)
+
+    assert result["signal_to_noise"].iloc[0] == pytest.approx(_SIGNAL_TO_NOISE_CAP)
+    assert math.isfinite(result["signal_to_noise"].iloc[0])
+
+
+def test_score_universe_signal_to_noise_passes_through_uncapped_values():
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], std_prediction=[0.02])
+
+    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02)
+
+    assert result["signal_to_noise"].iloc[0] == pytest.approx(2.5)  # 0.05 / 0.02
 
 
 def test_score_universe_without_a_breakout_column_falls_back_to_cost_hurdle_only():
@@ -287,6 +318,36 @@ def test_select_trades_sizes_via_target_position_size_and_respects_top_k():
     assert len(candidates) == 2
     assert [c.symbol for c in candidates] == ["AAPL", "TSLA"]  # highest conviction first
     assert all(c.side == "long" for c in candidates)
+
+
+def test_select_trades_carries_signal_to_noise_onto_the_candidate():
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    )
+    scored["signal_to_noise"] = [2.5]
+    corr = pd.DataFrame({"AAPL": [1.0]}, index=["AAPL"])
+
+    candidates = select_trades(
+        scored, regime=TREND, forecast_scale=0.05, max_position_pct=0.25,
+        max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr, top_k=1,
+    )
+
+    assert candidates[0].signal_to_noise == pytest.approx(2.5)
+
+
+def test_select_trades_signal_to_noise_is_none_when_the_column_is_absent():
+    """The common case in these tests' own fixtures -- must not KeyError."""
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.05, "direction_agreement": 1.0, "confident": True}]
+    )
+    corr = pd.DataFrame({"AAPL": [1.0]}, index=["AAPL"])
+
+    candidates = select_trades(
+        scored, regime=TREND, forecast_scale=0.05, max_position_pct=0.25,
+        max_short_position_pct=0.15, max_correlated_exposure_pct=0.50, correlation_matrix=corr, top_k=1,
+    )
+
+    assert candidates[0].signal_to_noise is None
 
 
 def test_select_trades_picks_short_side_for_negative_forecast():
@@ -635,6 +696,17 @@ def test_select_concentrated_trades_splits_by_relative_conviction():
     assert by_symbol["TSLA"].target_position_pct == pytest.approx(1 / 3, rel=1e-6)
     # fully deployed
     assert sum(abs(c.target_position_pct) for c in candidates) == pytest.approx(1.0)
+
+
+def test_select_concentrated_trades_carries_signal_to_noise_onto_the_candidate():
+    scored = _scored_df(
+        [{"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True}]
+    )
+    scored["signal_to_noise"] = [3.1]
+
+    candidates = select_concentrated_trades(scored, max_leg_pct=0.70, min_leg_floor_fraction=0.6)
+
+    assert candidates[0].signal_to_noise == pytest.approx(3.1)
 
 
 def test_select_concentrated_trades_clamps_dominant_leg_at_bound():
@@ -1067,8 +1139,8 @@ def _run_screen_harness(monkeypatch, mode, *, full_deployment=False, diversified
     monkeypatch.setattr(scr, "load_training_frame", lambda *a, **k: train_df)
 
     class _NoopEnsemble:
-        def __init__(self, n_models=5): ...
-        def fit(self, X, y): ...
+        def __init__(self, n_models=5, diversity="seed"): ...
+        def fit(self, X, y, ts=None): ...
 
     monkeypatch.setattr(scr, "EnsembleForecastModel", _NoopEnsemble)
     monkeypatch.setattr(scr, "load_latest_features", lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3]}))
@@ -1264,6 +1336,25 @@ def test_build_llm_candidate_pool_includes_donchian_levels_and_solidified_quant_
     assert row["quant_take_profit_pct"] == pytest.approx(0.12)
 
 
+def test_build_llm_candidate_pool_includes_signal_to_noise(monkeypatch):
+    import models.screener as scr
+
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
+    monkeypatch.setattr(scr, "_explain_features", lambda *a, **k: {})
+    monkeypatch.setattr(scr, "_load_recent_headlines", lambda *a, **k: {})
+
+    pool_df = pd.DataFrame(
+        {"symbol": ["A"], "predicted_return": [0.05], "conviction_score": [0.05], "signal_to_noise": [2.5]}
+    )
+    payload = scr._build_llm_candidate_pool(
+        pool_df, ensemble=None, latest_features=pd.DataFrame(), raw_features=pd.DataFrame(),
+        feature_cols=[], vol_by_symbol={"A": 0.01}, latest_close_by_symbol={"A": 100.0},
+        macro_sector_sentiment_by_symbol={}, horizon_days=5,
+    )
+
+    assert payload[0]["signal_to_noise"] == pytest.approx(2.5)
+
+
 def test_run_screen_concentrated_mode_passes_position_count_and_split_settings(monkeypatch):
     scr, calls = _run_screen_harness(monkeypatch, "concentrated")
     monkeypatch.setattr(scr.settings, "max_concentrated_position_pct", 0.70)
@@ -1452,8 +1543,8 @@ def test_run_screen_diversified_skips_screening_on_nan_forecast_scale(monkeypatc
     monkeypatch.setattr(scr, "load_training_frame", lambda *a, **k: train_df)
 
     class _NoopEnsemble:
-        def __init__(self, n_models=5): ...
-        def fit(self, X, y): ...
+        def __init__(self, n_models=5, diversity="seed"): ...
+        def fit(self, X, y, ts=None): ...
 
     monkeypatch.setattr(scr, "EnsembleForecastModel", _NoopEnsemble)
     monkeypatch.setattr(scr, "load_latest_features", lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3]}))

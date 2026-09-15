@@ -518,6 +518,36 @@ def test_closed_trades_still_open_position_is_not_a_trade(monkeypatch, client):
 
 
 # --------------------------------------------------------------------------
+# _signal_to_noise_from_reasoning: Phase 3's signal_to_noise, pulled out of
+# stored reasoning JSON rather than its own decisions column
+# --------------------------------------------------------------------------
+
+
+def test_signal_to_noise_from_reasoning_reads_a_parsed_list():
+    reasoning = [{"phase": 3, "signal_to_noise": 1.8}]
+    assert server._signal_to_noise_from_reasoning(reasoning) == pytest.approx(1.8)
+
+
+def test_signal_to_noise_from_reasoning_parses_a_json_string():
+    reasoning = '[{"phase": 3, "signal_to_noise": 1.8}]'
+    assert server._signal_to_noise_from_reasoning(reasoning) == pytest.approx(1.8)
+
+
+def test_signal_to_noise_from_reasoning_finds_phase_3_among_other_phases():
+    reasoning = [{"phase": 2, "signal_to_noise": 99.0}, {"phase": 3, "signal_to_noise": 1.8}, {"phase": 4}]
+    assert server._signal_to_noise_from_reasoning(reasoning) == pytest.approx(1.8)
+
+
+def test_signal_to_noise_from_reasoning_is_none_when_phase_3_has_no_value():
+    assert server._signal_to_noise_from_reasoning([{"phase": 3, "signal_to_noise": None}]) is None
+
+
+@pytest.mark.parametrize("bad", [None, "", "not json", "{}", [], [{"phase": 2}], 42, {"phase": 3}])
+def test_signal_to_noise_from_reasoning_is_none_for_unusable_input(bad):
+    assert server._signal_to_noise_from_reasoning(bad) is None
+
+
+# --------------------------------------------------------------------------
 # Trade log: raw, one-row-per-executed-decision study data
 # --------------------------------------------------------------------------
 
@@ -550,6 +580,39 @@ def test_trade_log_endpoint_returns_graded_rows_with_direction(monkeypatch, clie
     assert row["direction"] == "long"
     assert row["hit"] is True
     assert "reasoning" not in row  # kept out of the list view -- see /api/trades/log/{id}
+
+
+def test_trade_log_endpoint_extracts_signal_to_noise_from_reasoning(monkeypatch, client):
+    """
+    signal_to_noise isn't its own decisions column -- it lives inside the
+    stored reasoning JSON (Phase 3) and has to be pulled out before
+    reasoning itself gets dropped from the list view.
+    """
+    monkeypatch.setattr(server.settings, "target_horizon_days", 1)
+    reasoning_json = [
+        {"phase": 2, "title": "x", "summary": "s", "lines": []},
+        {"phase": 3, "title": "y", "summary": "s", "lines": [], "signal_to_noise": 2.75},
+    ]
+    decisions = pd.DataFrame(
+        [
+            {
+                "id": 1, "symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "feature_set_id": "v4",
+                "model_version": "v1", "forecast": 0.5, "regime": "trending", "target_position": 0.3,
+                "executed_position": 0.3, "mode": "paper", "reasoning": reasoning_json, "direction_agreement": 0.9,
+                "approval_status": "auto", "take_profit_pct": 0.1, "stop_loss_pct": 0.05,
+            }
+        ]
+    )
+    prices = pd.DataFrame(
+        {"symbol": ["AAPL", "AAPL"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]), "close": [100.0, 105.0]}
+    )
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/log")
+    row = resp.json()["rows"][0]
+    assert row["signal_to_noise"] == pytest.approx(2.75)
 
 
 def test_trade_log_endpoint_includes_a_close_as_its_own_row(monkeypatch, client):

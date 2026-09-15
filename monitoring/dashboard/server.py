@@ -758,6 +758,33 @@ _TRADE_LOG_COLUMNS = (
 )
 
 
+def _signal_to_noise_from_reasoning(reasoning) -> float | None:
+    """
+    Pulls Phase 3's signal_to_noise out of a decision's stored reasoning —
+    direction_agreement stays a real column (still computed, still
+    genuinely evidence about the ensemble) but is no longer the dashboard's
+    headline "confidence" figure now that signal_to_noise exists: the
+    seed-only ensemble that made direction_agreement read as false
+    certainty is why it was pulled from the reasoning prose in the first
+    place (see monitoring/reasoning.py::phase_forecast). reasoning may come
+    back from the DB already parsed (a list) or still a JSON string,
+    depending on the driver path that read it — same ambiguity the
+    decision-detail endpoint below already handles.
+    """
+    if isinstance(reasoning, str):
+        try:
+            reasoning = json.loads(reasoning)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(reasoning, list):
+        return None
+    for phase in reasoning:
+        if isinstance(phase, dict) and phase.get("phase") == 3:
+            value = phase.get("signal_to_noise")
+            return float(value) if isinstance(value, (int, float)) else None
+    return None
+
+
 @app.get("/api/trades/log")
 def get_trade_log(limit: int = 50, offset: int = 0) -> dict:
     """
@@ -781,6 +808,9 @@ def get_trade_log(limit: int = 50, offset: int = 0) -> dict:
     prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
     graded = grade_outcomes(trades, prices, horizon_bars=settings.target_horizon_days)
     graded["direction"] = graded["target_position"].apply(trade_direction)
+    # Extracted before the drop below -- signal_to_noise lives inside the
+    # reasoning JSON, not its own column (see _signal_to_noise_from_reasoning).
+    graded["signal_to_noise"] = graded["reasoning"].apply(_signal_to_noise_from_reasoning)
     graded = graded.drop(columns=["reasoning"]).sort_values("ts", ascending=False)
 
     page = graded.iloc[offset : offset + limit]
