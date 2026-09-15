@@ -123,7 +123,17 @@ class EnsembleForecastModel:
           std_prediction     — spread across members (higher = less agreement)
           direction_agreement — fraction of members agreeing with the
                                  majority sign, in [0.5, 1.0]. 1.0 means every
-                                 member predicts the same direction.
+                                 member predicts the same direction. Recorded
+                                 as evidence, not used to gate or rank trades
+                                 (see models/screener.py's score_universe) —
+                                 near-clone seed-diversity members made this
+                                 read ~1.0 almost everywhere regardless of
+                                 actual signal quality.
+          signal_to_noise     — |mean_prediction| / std_prediction: how big
+                                 the predicted move is relative to how much
+                                 the members actually disagree on its size,
+                                 not just its sign. +inf when every member
+                                 predicts the identical number (std 0).
         """
         return summarize_members(self.predict_members(X))
 
@@ -154,11 +164,25 @@ def summarize_members(members: pd.DataFrame) -> pd.DataFrame:
     positive_frac = (signs > 0).mean(axis=1)
     agreement = np.maximum(positive_frac, 1 - positive_frac)
 
+    mean_prediction = preds.mean(axis=1)
+    std_prediction = preds.std(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        signal_to_noise = np.abs(mean_prediction) / std_prediction
+    # NaN (0/0 -- every member predicted exactly 0.0) treated the same as
+    # the +inf a merely-tiny-but-nonzero std already produces: identical
+    # members is maximal confidence by this measure either way. Real
+    # "identical" floats rarely have an EXACTLY 0.0 std (float64 rounding
+    # in the mean/subtract/square chain), so this can't be caught with an
+    # equality check on std_prediction -- matches models/confidence_eval.py's
+    # own add_summary_columns, which hits the same issue.
+    signal_to_noise = np.where(np.isnan(signal_to_noise), np.inf, signal_to_noise)
+
     return pd.DataFrame(
         {
-            "mean_prediction": preds.mean(axis=1),
-            "std_prediction": preds.std(axis=1),
+            "mean_prediction": mean_prediction,
+            "std_prediction": std_prediction,
             "direction_agreement": agreement,
+            "signal_to_noise": signal_to_noise,
         },
         index=members.index,
     )

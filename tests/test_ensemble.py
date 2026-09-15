@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from models.forecast.ensemble import EnsembleForecastModel, recent_window_mask
+from models.forecast.ensemble import EnsembleForecastModel, recent_window_mask, summarize_members
 
 
 def _synthetic_data(n=200, seed=0):
@@ -32,7 +32,7 @@ def test_ensemble_predict_returns_expected_columns_and_index():
 
     result = ensemble.predict(X)
 
-    assert list(result.columns) == ["mean_prediction", "std_prediction", "direction_agreement"]
+    assert list(result.columns) == ["mean_prediction", "std_prediction", "direction_agreement", "signal_to_noise"]
     assert list(result.index) == list(X.index)
     assert len(result) == len(X)
 
@@ -176,3 +176,41 @@ def test_ensemble_predict_contributions_before_fit_raises():
     ensemble = EnsembleForecastModel()
     with pytest.raises(RuntimeError, match="not trained"):
         ensemble.predict_contributions(pd.DataFrame({"f1": [1.0]}))
+
+
+# --------------------------------------------------------------------------
+# summarize_members: signal_to_noise
+# --------------------------------------------------------------------------
+
+
+def test_signal_to_noise_is_mean_over_std():
+    members = pd.DataFrame({"member_0": [0.10, 0.10], "member_1": [0.06, 0.02]})
+    result = summarize_members(members)
+    # row 0: mean=0.08, std=0.02 -> 4.0; row 1: mean=0.06, std=0.04 -> 1.5
+    assert result["signal_to_noise"].iloc[0] == pytest.approx(4.0)
+    assert result["signal_to_noise"].iloc[1] == pytest.approx(1.5)
+
+
+def test_signal_to_noise_is_very_high_when_members_are_unanimous_and_identical():
+    """
+    Float64 rounding in the mean/subtract/square chain means "identical"
+    values rarely give an EXACTLY 0.0 std, so this lands as a very large
+    finite ratio rather than literal inf -- still reads as maximal
+    confidence by this measure either way.
+    """
+    members = pd.DataFrame({"member_0": [0.05, 0.05], "member_1": [0.05, 0.05], "member_2": [0.05, 0.05]})
+    result = summarize_members(members)
+    assert (result["signal_to_noise"] > 1e10).all()
+
+
+def test_signal_to_noise_is_infinite_when_every_member_predicts_exactly_zero():
+    """The genuine 0/0 case (mean AND std both exactly 0.0) -- NaN treated the same as the tiny-std case above: maximal confidence."""
+    members = pd.DataFrame({"member_0": [0.0, 0.0], "member_1": [0.0, 0.0]})
+    result = summarize_members(members)
+    assert np.isinf(result["signal_to_noise"]).all()
+
+
+def test_signal_to_noise_is_higher_for_tighter_agreement_at_the_same_mean():
+    tight = summarize_members(pd.DataFrame({"member_0": [0.09], "member_1": [0.11]}))
+    loose = summarize_members(pd.DataFrame({"member_0": [0.01], "member_1": [0.19]}))
+    assert tight["signal_to_noise"].iloc[0] > loose["signal_to_noise"].iloc[0]

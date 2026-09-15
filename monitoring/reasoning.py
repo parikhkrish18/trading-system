@@ -21,6 +21,8 @@ meant for the dashboard). Pure formatting only — no DB/API calls here.
 """
 from __future__ import annotations
 
+import math
+
 from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 
@@ -407,17 +409,23 @@ def phase_signals(regime: str | None, top_features: list[dict]) -> dict:
     }
 
 
-def phase_forecast(predicted_return: float, conviction_score: float) -> dict:
+def phase_forecast(predicted_return: float, conviction_score: float, signal_to_noise: float | None = None) -> dict:
     """
     Phase 3. What the ensemble predicted, and how big that is next to what
     trading it costs.
 
-    Model agreement used to be the headline here — "100% of the 5 models
-    agree" — and it was removed because it was measured to mean nothing.
-    The members are near-clones, so almost every prediction scored near
-    100%, and rows it called confident were no more accurate than the rest.
-    Printing it next to a trade proposal invited exactly the confidence it
-    could not support.
+    Model agreement ("100% of the 5 models agree") used to be the headline
+    here, and was removed because it was measured to mean nothing — the
+    original members were near-clones, so almost every prediction scored
+    near 100%, and rows it called confident were no more accurate than the
+    rest. `signal_to_noise` (|predicted move| / spread across a
+    STRUCTURALLY diverse ensemble — models/forecast/ensemble.py) is a
+    genuinely different measure: it can vary a lot pick to pick instead of
+    pinning near a constant, though it hasn't been shown to predict being
+    right either (models/confidence_eval.py) — described as what it is,
+    not oversold as a confidence score. None when the ensemble members
+    were unanimous with zero spread, or for reasoning built outside a live
+    ensemble prediction (e.g. demo/test data).
     """
     pct = f"{predicted_return:+.2%}"
     side = "rise" if predicted_return >= 0 else "fall"
@@ -431,11 +439,23 @@ def phase_forecast(predicted_return: float, conviction_score: float) -> dict:
         f"Conviction score (the size of the predicted move): {conviction_score:.4f} — the higher this is, the "
         "more capital this pick gets relative to the others selected this cycle.",
     ]
+    # Not finite (NaN/inf) treated the same as missing -- a raw NaN would
+    # break JSON serialization once this dict is written to the decisions
+    # table's reasoning column (json.dumps encodes it as a non-standard
+    # `NaN` token; Postgres JSONB rejects it outright).
+    has_snr = signal_to_noise is not None and math.isfinite(signal_to_noise)
+    if has_snr:
+        lines.append(
+            f"Signal-to-noise (predicted move relative to how much the ensemble's members disagree on its "
+            f"size): {signal_to_noise:.2f}. Higher means the members are more aligned on both direction and "
+            "magnitude, not just direction — informational, not a pass/fail bar."
+        )
     return {
         "phase": 3,
         "title": "Forecast & Confidence",
         "summary": f"{pct} forecast, {margin:+.2%} clear of costs.",
         "lines": lines,
+        "signal_to_noise": signal_to_noise if has_snr else None,
     }
 
 
