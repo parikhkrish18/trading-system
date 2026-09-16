@@ -13,8 +13,11 @@ import argparse
 import datetime as dt
 import logging
 
+from data.ingest.fundamentals import ingest_fundamentals
+from data.ingest.macro_calendar import refresh_macro_calendar
 from data.ingest.prices import ingest_prices
 from data.ingest.universe import resolve_symbols
+from features.build_features import build_and_store
 from monitoring.alerts import alert_pipeline_failure, configure_file_logging
 
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +51,13 @@ def main() -> None:
     parser.add_argument("--symbols", default=None)
     parser.add_argument("--universe", action="store_true", help="Use the active S&P 500 universe instead of --symbols.")
     parser.add_argument("--source", default="alpaca", choices=["alpaca", "yfinance"])
+    parser.add_argument(
+        "--feature-set-id", default=None,
+        help=(
+            "Rebuild features under this id after ingest (same id scripts/run_weekly_cycle.py "
+            "uses, e.g. 'v4'). Omit to skip the daily feature rebuild."
+        ),
+    )
     args = parser.parse_args()
     configure_file_logging()  # logs survive the console closing
     symbols = resolve_symbols(args.symbols, args.universe)
@@ -62,10 +72,17 @@ def main() -> None:
         args.source,
     )
 
-    # Add fundamentals/news/macro-calendar jobs here as those vendor
-    # integrations get wired up (data/ingest/fundamentals.py, news.py,
-    # macro_calendar.py) — each should get its own run_job(...) call so
-    # failures stay isolated per source.
+    # Fundamentals/macro-calendar/feature-rebuild run daily too (not just in
+    # scripts/run_weekly_cycle.py's Monday pass), so the ticker lookup's
+    # financial figures and event countdowns (days_to_next_cpi etc., which
+    # are computed relative to *this* run's date) don't go stale mid-week.
+    # News/sentiment stay weekly-only here: the separate news-stream service
+    # already pulls/scores headlines continuously, so re-pulling them daily
+    # from Finnhub would just be redundant load against its rate limit.
+    run_job("fundamentals_ingest", ingest_fundamentals, symbols)
+    run_job("macro_calendar_refresh", refresh_macro_calendar)
+    if args.feature_set_id:
+        run_job("build_features", build_and_store, symbols, args.feature_set_id)
 
 
 if __name__ == "__main__":

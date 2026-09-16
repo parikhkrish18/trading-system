@@ -245,17 +245,30 @@ def _fundamentals_narrative(label: str) :
         if value is None:
             return f"{label} data was unavailable."
         base = f"Latest reported {label.lower()} is {value:,.2f}"
-        prior_value = (context or {}).get("prior_value")
+        ctx = context or {}
+        prior_value = ctx.get("prior_value")
         if prior_value is None:
             # No earlier filing to compare against (e.g. a recent IPO) —
             # say so rather than let a bare, incomparable level read as if
             # it meant something on its own.
-            return f"{base}, with no prior filing on record to compare it to — this reading alone carries limited signal."
-        pct_change = (context or {}).get("pct_change")
-        if pct_change is None:  # prior filing was exactly zero — % change is undefined
-            return f"{base}, versus {prior_value:,.2f} in the prior filing."
-        direction = "up" if pct_change >= 0 else "down"
-        return f"{base}, {direction} {abs(pct_change):.1%} from the prior filing ({prior_value:,.2f})."
+            sentence = f"{base}, with no prior filing on record to compare it to — this reading alone carries limited signal."
+        else:
+            pct_change = ctx.get("pct_change")
+            if pct_change is None:  # prior filing was exactly zero — % change is undefined
+                sentence = f"{base}, versus {prior_value:,.2f} in the prior filing."
+            else:
+                direction = "up" if pct_change >= 0 else "down"
+                sentence = f"{base}, {direction} {abs(pct_change):.1%} from the prior filing ({prior_value:,.2f})."
+        if ctx.get("is_fresh") is False:
+            # Financial statements are typically priced in the day of, or
+            # the day after, their release (features.build_features's
+            # _FUNDAMENTALS_FRESH_MAX_DAYS) — past that window this is no
+            # longer a near-term catalyst, just longer-run context.
+            sentence += (
+                " This filing is more than a day old, so the market has likely already priced it "
+                "in — read it as long-term speculation support, not a fresh catalyst."
+            )
+        return sentence
 
     return fn
 
