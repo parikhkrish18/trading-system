@@ -219,7 +219,16 @@ def build_fundamentals_features(prices: pd.DataFrame, fundamentals: pd.DataFrame
     return pd.concat(frames, ignore_index=True)
 
 
-def fundamentals_prior_context(fundamentals: pd.DataFrame) -> dict[tuple[str, str], dict]:
+# A financial statement is typically priced into the stock the day it's
+# filed, or the day after at the latest -- past that window it's stale as a
+# near-term catalyst and only worth reading as longer-term context. Matches
+# the wording the caller's narrative uses ("long term speculation support").
+_FUNDAMENTALS_FRESH_MAX_DAYS = 1
+
+
+def fundamentals_prior_context(
+    fundamentals: pd.DataFrame, as_of: pd.Timestamp | None = None
+) -> dict[tuple[str, str], dict]:
     """
     For each (symbol, metric) in `fundamentals`, the two most recently filed
     values -- so a narrative can say a reported number moved, not just state
@@ -227,6 +236,13 @@ def fundamentals_prior_context(fundamentals: pd.DataFrame) -> dict[tuple[str, st
     carries no directional information on its own; what a model — or a
     human — can actually read something into is whether it grew or shrank
     from the filing before it.
+
+    Also carries `days_since_filed`/`is_fresh` for the latest filing, so a
+    narrative can stop treating a filing as a fresh catalyst once the market
+    has had time to price it in (see _FUNDAMENTALS_FRESH_MAX_DAYS).
+
+    `as_of`: defaults to now (UTC) -- injectable for tests/backtests so
+    freshness is judged against a fixed date rather than wall-clock time.
 
     Keyed by the same feature name build_fundamentals_features assigns the
     latest value (fund_<metric>_latest), so a caller already holding that
@@ -238,14 +254,25 @@ def fundamentals_prior_context(fundamentals: pd.DataFrame) -> dict[tuple[str, st
     """
     if fundamentals.empty:
         return {}
+    as_of = pd.Timestamp.now(tz="UTC") if as_of is None else as_of
     context: dict[tuple[str, str], dict] = {}
     for (symbol, metric), group in fundamentals.groupby(["symbol", "metric"]):
         rows = group.sort_values("ts").tail(2)
+        latest_ts = rows["ts"].iloc[-1]
+        days_since_filed = (as_of - latest_ts).total_seconds() / 86400
+        is_fresh = days_since_filed <= _FUNDAMENTALS_FRESH_MAX_DAYS
         if len(rows) < 2:
+            context[(symbol, f"fund_{metric}_latest")] = {
+                "prior_value": None, "pct_change": None,
+                "days_since_filed": days_since_filed, "is_fresh": is_fresh,
+            }
             continue
         prior_value, latest_value = (float(v) for v in rows["value"])
         pct_change = None if prior_value == 0 else (latest_value - prior_value) / abs(prior_value)
-        context[(symbol, f"fund_{metric}_latest")] = {"prior_value": prior_value, "pct_change": pct_change}
+        context[(symbol, f"fund_{metric}_latest")] = {
+            "prior_value": prior_value, "pct_change": pct_change,
+            "days_since_filed": days_since_filed, "is_fresh": is_fresh,
+        }
     return context
 
 

@@ -97,6 +97,22 @@ def test_explain_feature_fundamentals_narrative_with_context_reports_a_decline()
     assert "down 50.0%" in line
 
 
+def test_explain_feature_fundamentals_narrative_stale_filing_reads_as_speculation_support():
+    line = reasoning.explain_feature(
+        "fund_net_income_latest", 150.0, contribution=0.01,
+        context={"prior_value": 100.0, "pct_change": 0.5, "days_since_filed": 9.0, "is_fresh": False},
+    )
+    assert "long-term speculation support" in line
+
+
+def test_explain_feature_fundamentals_narrative_fresh_filing_has_no_speculation_caveat():
+    line = reasoning.explain_feature(
+        "fund_net_income_latest", 150.0, contribution=0.01,
+        context={"prior_value": 100.0, "pct_change": 0.5, "days_since_filed": 1.0, "is_fresh": True},
+    )
+    assert "long-term speculation support" not in line
+
+
 def test_explain_feature_sentiment_narrative_reflects_polarity():
     negative = reasoning.explain_feature("sentiment_mean_3d", -0.5, contribution=-0.01)
     assert "clearly negative" in negative

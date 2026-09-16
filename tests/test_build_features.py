@@ -147,9 +147,12 @@ def test_fundamentals_prior_context_reports_change_from_the_previous_filing():
         }
     )
 
-    context = fundamentals_prior_context(fundamentals)
+    context = fundamentals_prior_context(fundamentals, as_of=pd.Timestamp("2026-08-02", tz="UTC"))
 
-    assert context[("AAPL", "fund_net_income_latest")] == {"prior_value": 100.0, "pct_change": pytest.approx(0.5)}
+    assert context[("AAPL", "fund_net_income_latest")] == {
+        "prior_value": 100.0, "pct_change": pytest.approx(0.5),
+        "days_since_filed": pytest.approx(1.0), "is_fresh": True,
+    }
 
 
 def test_fundamentals_prior_context_handles_a_decline():
@@ -162,7 +165,7 @@ def test_fundamentals_prior_context_handles_a_decline():
         }
     )
 
-    context = fundamentals_prior_context(fundamentals)
+    context = fundamentals_prior_context(fundamentals, as_of=pd.Timestamp("2026-08-02", tz="UTC"))
 
     assert context[("AAPL", "fund_net_income_latest")]["pct_change"] == pytest.approx(-0.4)
 
@@ -178,18 +181,41 @@ def test_fundamentals_prior_context_zero_prior_value_has_no_pct_change():
         }
     )
 
-    context = fundamentals_prior_context(fundamentals)
+    context = fundamentals_prior_context(fundamentals, as_of=pd.Timestamp("2026-08-02", tz="UTC"))
 
-    assert context[("AAPL", "fund_net_income_latest")] == {"prior_value": 0.0, "pct_change": None}
+    assert context[("AAPL", "fund_net_income_latest")]["prior_value"] == 0.0
+    assert context[("AAPL", "fund_net_income_latest")]["pct_change"] is None
 
 
-def test_fundamentals_prior_context_no_prior_filing_is_omitted():
-    """Only one filing on record (e.g. a recent IPO) -- nothing to compare it to, so no entry at all."""
+def test_fundamentals_prior_context_no_prior_filing_has_no_comparison_but_keeps_freshness():
+    """Only one filing on record (e.g. a recent IPO) -- nothing to compare it to, but still freshness-tagged."""
     fundamentals = pd.DataFrame(
         {"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-08-01"], utc=True), "metric": ["net_income"], "value": [60.0]}
     )
 
-    assert fundamentals_prior_context(fundamentals) == {}
+    context = fundamentals_prior_context(fundamentals, as_of=pd.Timestamp("2026-08-02", tz="UTC"))
+
+    assert context[("AAPL", "fund_net_income_latest")] == {
+        "prior_value": None, "pct_change": None,
+        "days_since_filed": pytest.approx(1.0), "is_fresh": True,
+    }
+
+
+def test_fundamentals_prior_context_stale_filing_is_not_fresh():
+    """A filing older than 1 day is no longer a fresh catalyst -- it's priced in by now."""
+    fundamentals = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "ts": pd.to_datetime(["2026-05-01", "2026-08-01"], utc=True),
+            "metric": ["net_income", "net_income"],
+            "value": [100.0, 150.0],
+        }
+    )
+
+    context = fundamentals_prior_context(fundamentals, as_of=pd.Timestamp("2026-08-10", tz="UTC"))
+
+    assert context[("AAPL", "fund_net_income_latest")]["is_fresh"] is False
+    assert context[("AAPL", "fund_net_income_latest")]["days_since_filed"] == pytest.approx(9.0)
 
 
 def test_fundamentals_prior_context_keeps_metrics_and_symbols_independent():
@@ -204,8 +230,11 @@ def test_fundamentals_prior_context_keeps_metrics_and_symbols_independent():
 
     context = fundamentals_prior_context(fundamentals)
 
-    assert set(context) == {("AAPL", "fund_net_income_latest"), ("MSFT", "fund_net_income_latest")}
+    assert set(context) == {
+        ("AAPL", "fund_net_income_latest"), ("AAPL", "fund_eps_actual_latest"), ("MSFT", "fund_net_income_latest"),
+    }
     assert context[("MSFT", "fund_net_income_latest")]["prior_value"] == 200.0
+    assert context[("AAPL", "fund_eps_actual_latest")]["prior_value"] is None  # only one eps_actual filing on record
 
 
 def test_fundamentals_prior_context_empty_input():
