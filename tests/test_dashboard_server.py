@@ -447,23 +447,29 @@ def test_drift_grades_at_the_configured_horizon_not_the_next_day(monkeypatch, cl
     assert body["weekly"][0]["hit_rate"] == pytest.approx(1.0)
 
 
+def _fill(symbol, side, qty, price, filled_at):
+    return {"symbol": symbol, "side": side, "qty": qty, "price": price, "filled_at": filled_at, "order_id": "x"}
+
+
+class _FilledOrdersBroker:
+    def __init__(self, fills):
+        self._fills = fills
+
+    def get_filled_orders(self):
+        return self._fills
+
+
 def test_closed_trades_reconstructs_a_round_trip(monkeypatch, client):
-    decisions = pd.DataFrame(
-        [
-            {"symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "target_position": 0.5, "executed_position": 10.0, "mode": "paper"},
-            {"symbol": "AAPL", "ts": pd.Timestamp("2026-07-08T00:00:00Z"), "target_position": 0.0, "executed_position": 0.0, "mode": "paper"},
-        ]
-    )
-    prices = pd.DataFrame(
-        {
-            "symbol": ["AAPL", "AAPL"],
-            "ts": pd.to_datetime(["2026-07-01T00:00:00Z", "2026-07-08T00:00:00Z"]),
-            "close": [100.0, 110.0],
-        }
-    )
-    calls = iter([decisions, prices])
-    monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+    """
+    Regression test: entry/exit must come from Alpaca's own fill price/qty,
+    not an approximation -- a market order can fill well off the prior
+    day's daily close this used to read instead.
+    """
+    fills = [
+        _fill("AAPL", "buy", 10.0, 100.0, "2026-07-01T00:00:00Z"),
+        _fill("AAPL", "sell", 10.0, 110.0, "2026-07-08T00:00:00Z"),
+    ]
+    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
 
     resp = client.get("/api/trades/closed")
     assert resp.status_code == 200
@@ -473,22 +479,17 @@ def test_closed_trades_reconstructs_a_round_trip(monkeypatch, client):
     assert trade["symbol"] == "AAPL"
     assert trade["side"] == "long"
     assert trade["shares"] == 10.0
+    assert trade["entry_price"] == pytest.approx(100.0)
+    assert trade["exit_price"] == pytest.approx(110.0)
     assert trade["realized_pnl"] == pytest.approx(100.0)  # (110-100) * 10 shares
 
 
 def test_closed_trades_computes_short_pnl_correctly(monkeypatch, client):
-    decisions = pd.DataFrame(
-        [
-            {"symbol": "IBM", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "target_position": -0.5, "executed_position": -10.0, "mode": "paper"},
-            {"symbol": "IBM", "ts": pd.Timestamp("2026-07-08T00:00:00Z"), "target_position": 0.0, "executed_position": 0.0, "mode": "paper"},
-        ]
-    )
-    prices = pd.DataFrame(
-        {"symbol": ["IBM", "IBM"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z", "2026-07-08T00:00:00Z"]), "close": [100.0, 90.0]}
-    )
-    calls = iter([decisions, prices])
-    monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+    fills = [
+        _fill("IBM", "sell", 10.0, 100.0, "2026-07-01T00:00:00Z"),  # short open
+        _fill("IBM", "buy", 10.0, 90.0, "2026-07-08T00:00:00Z"),  # short cover
+    ]
+    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
 
     resp = client.get("/api/trades/closed")
     trade = resp.json()[0]
@@ -496,24 +497,71 @@ def test_closed_trades_computes_short_pnl_correctly(monkeypatch, client):
     assert trade["realized_pnl"] == pytest.approx(100.0)  # price dropped $10, short profits
 
 
-def test_closed_trades_no_decisions_returns_empty(monkeypatch, client):
-    monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
+def test_closed_trades_no_fills_returns_empty(monkeypatch, client):
+    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker([]))
 
     resp = client.get("/api/trades/closed")
     assert resp.json() == []
 
 
 def test_closed_trades_still_open_position_is_not_a_trade(monkeypatch, client):
-    decisions = pd.DataFrame(
-        [{"symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "target_position": 0.5, "executed_position": 10.0, "mode": "paper"}]
-    )
-    prices = pd.DataFrame({"symbol": ["AAPL"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z"]), "close": [100.0]})
-    calls = iter([decisions, prices])
-    monkeypatch.setattr(server, "get_engine", lambda: None)
-    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+    fills = [_fill("AAPL", "buy", 10.0, 100.0, "2026-07-01T00:00:00Z")]
+    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
 
     resp = client.get("/api/trades/closed")
+    assert resp.json() == []
+
+
+def test_closed_trades_resize_blends_into_a_weighted_average(monkeypatch, client):
+    """Adding to a position mid-episode must blend into the weighted entry, not just use the first fill's price."""
+    fills = [
+        _fill("AAPL", "buy", 10.0, 100.0, "2026-07-01T00:00:00Z"),
+        _fill("AAPL", "buy", 10.0, 120.0, "2026-07-02T00:00:00Z"),  # resize: weighted entry now 110.0
+        _fill("AAPL", "sell", 20.0, 130.0, "2026-07-08T00:00:00Z"),
+    ]
+    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
+
+    resp = client.get("/api/trades/closed")
+    body = resp.json()
+    assert len(body) == 1
+    trade = body[0]
+    assert trade["shares"] == 20.0
+    assert trade["entry_price"] == pytest.approx(110.0)
+    assert trade["realized_pnl"] == pytest.approx((130.0 - 110.0) * 20.0)
+
+
+def test_closed_trades_flip_through_flat_closes_one_episode_and_opens_another(monkeypatch, client):
+    """A single sell that closes a long AND opens a short must end one episode and start a fresh one, not merge them."""
+    fills = [
+        _fill("AAPL", "buy", 10.0, 100.0, "2026-07-01T00:00:00Z"),  # long 10
+        _fill("AAPL", "sell", 25.0, 110.0, "2026-07-08T00:00:00Z"),  # closes the long, opens a short of 15
+        _fill("AAPL", "buy", 15.0, 105.0, "2026-07-15T00:00:00Z"),  # covers the short
+    ]
+    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
+
+    resp = client.get("/api/trades/closed")
+    body = sorted(resp.json(), key=lambda t: t["entry_ts"])
+    assert len(body) == 2
+    long_leg, short_leg = body
+    assert long_leg["side"] == "long"
+    assert long_leg["shares"] == 10.0
+    assert long_leg["realized_pnl"] == pytest.approx((110.0 - 100.0) * 10.0)
+    assert short_leg["side"] == "short"
+    assert short_leg["shares"] == -15.0
+    assert short_leg["entry_price"] == pytest.approx(110.0)
+    assert short_leg["realized_pnl"] == pytest.approx((110.0 - 105.0) * 15.0)
+
+
+def test_closed_trades_broker_without_fill_history_returns_empty(monkeypatch, client):
+    """IBKR (or any broker lacking get_filled_orders) degrades to an empty list rather than a 500."""
+
+    class _NoFillHistoryBroker:
+        pass
+
+    monkeypatch.setattr(server, "get_broker", lambda: _NoFillHistoryBroker())
+
+    resp = client.get("/api/trades/closed")
+    assert resp.status_code == 200
     assert resp.json() == []
 
 

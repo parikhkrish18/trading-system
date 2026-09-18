@@ -147,6 +147,44 @@ class AlpacaBroker:
     def get_portfolio_value(self) -> float:
         return float(self.client.get_account().equity)
 
+    def get_filled_orders(self, symbols: list[str] | None = None, limit: int = 500) -> list[dict]:
+        """
+        Actually-filled order history straight from Alpaca -- ground truth
+        for money math (fill price, fill qty, fill time). Used by
+        monitoring/dashboard/server.py's Closed Trades panel to reconstruct
+        realized round-trip trades from what the broker actually did,
+        rather than approximating entry/exit off this system's own intended
+        sizing (decisions.executed_position) or the daily prices table's
+        nearest close to a decision's timestamp -- both can, and did,
+        diverge from what actually filled (a market order can fill well off
+        the prior day's close, and executed_position is itself an estimate
+        computed before the fill, not a read-back of it).
+
+        Only CLOSED orders (Alpaca's terminal status, covering filled,
+        canceled, rejected, and expired) with a nonzero filled_qty --
+        CLOSED alone would also catch a canceled/rejected order that never
+        actually moved a share.
+        """
+        request = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=symbols, limit=limit, direction="asc")
+        orders = self.client.get_orders(filter=request)
+        fills: list[dict] = []
+        for order in orders:
+            filled_qty = float(order.filled_qty or 0)
+            if filled_qty <= 0 or order.filled_avg_price is None or order.filled_at is None:
+                continue
+            side = order.side.value if hasattr(order.side, "value") else str(order.side)
+            fills.append(
+                {
+                    "symbol": order.symbol,
+                    "side": side,  # "buy" | "sell"
+                    "qty": filled_qty,
+                    "price": float(order.filled_avg_price),
+                    "filled_at": order.filled_at,
+                    "order_id": str(order.id),
+                }
+            )
+        return fills
+
     def is_shortable(self, symbol: str) -> bool:
         """
         Whether Alpaca will currently let this symbol be sold short — checks

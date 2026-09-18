@@ -679,74 +679,122 @@ def get_true_report_card(limit: int = 365) -> dict:
     }
 
 
-def _price_at_or_before(sym_prices: pd.DataFrame, ts) -> float | None:
-    """Nearest known close at or before `ts`; falls back to the earliest known close if none exists."""
-    before = sym_prices[sym_prices["ts"] <= ts]
-    if not before.empty:
-        return float(before.iloc[-1]["close"])
-    if not sym_prices.empty:
-        return float(sym_prices.iloc[0]["close"])
-    return None
+def _reconstruct_symbol_episodes(fills: pd.DataFrame) -> list[dict]:
+    """
+    Walks one symbol's Alpaca fills (columns: side, qty, price, filled_at),
+    already sorted chronologically, tracking a running signed position and
+    volume-weighted entry/exit price. An episode runs flat -> nonzero ->
+    flat: same-direction fills within it (a resize) blend into the weighted
+    entry average, opposite-direction fills blend into the weighted exit
+    average, rather than only ever reading the first or the last fill in
+    isolation. A single fill that flips the position straight through flat
+    (closes the old side and opens the new one at once) closes out the old
+    episode and starts a fresh one from that same fill's price.
+    """
+    episodes: list[dict] = []
+    position_qty = 0.0
+    entry_notional = entry_qty = exit_notional = exit_qty = 0.0
+    entry_ts = None
+    side: str | None = None
+
+    def _open(ts, price: float, qty: float) -> None:
+        nonlocal position_qty, entry_notional, entry_qty, exit_notional, exit_qty, entry_ts, side
+        position_qty, entry_ts = qty, ts
+        entry_notional, entry_qty = price * abs(qty), abs(qty)
+        exit_notional = exit_qty = 0.0
+        side = "long" if qty > 0 else "short"
+
+    for _, fill in fills.iterrows():
+        signed_qty = fill["qty"] if fill["side"] == "buy" else -fill["qty"]
+        price, ts = float(fill["price"]), fill["filled_at"]
+
+        if position_qty == 0:
+            _open(ts, price, signed_qty)
+            continue
+
+        if (position_qty > 0) == (signed_qty > 0):
+            entry_notional += price * abs(signed_qty)
+            entry_qty += abs(signed_qty)
+            position_qty += signed_qty
+            continue
+
+        closing_qty = min(abs(signed_qty), abs(position_qty))
+        exit_notional += price * closing_qty
+        exit_qty += closing_qty
+        leftover_qty = abs(signed_qty) - closing_qty
+        position_qty += signed_qty
+
+        if position_qty == 0 or leftover_qty > 0:
+            entry_price = entry_notional / entry_qty
+            exit_price = exit_notional / exit_qty
+            pnl = (exit_price - entry_price) * exit_qty * (1 if side == "long" else -1)
+            episodes.append(
+                {
+                    "side": side,
+                    "entry_ts": entry_ts,
+                    "exit_ts": ts,
+                    "shares": exit_qty if side == "long" else -exit_qty,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "realized_pnl": pnl,
+                    "realized_pnl_pct": (exit_price / entry_price - 1) * (1 if side == "long" else -1),
+                }
+            )
+            if leftover_qty > 0:
+                _open(ts, price, leftover_qty if signed_qty > 0 else -leftover_qty)
+            else:
+                position_qty = 0.0
+                entry_ts = None
+                side = None
+
+    return episodes
 
 
 @app.get("/api/trades/closed")
 def get_closed_trades(limit: int = 100) -> list[dict]:
     """
-    Reconstructs realized round-trip trades from the decisions log: an
-    episode starts at the first decision that opens a nonzero position for a
-    symbol and ends at the next decision that flattens it (executed_position
-    == 0), using nearest-known prices at each end for entry/exit. This is an
-    approximation, not a broker-verified fill record -- if a position was
-    resized mid-episode (e.g. re-picked at a different weight the following
-    week), the original entry size/price is used for the whole episode
-    rather than tracking each resize individually.
+    Reconstructs realized round-trip trades from Alpaca's own filled-order
+    history (execution/broker_alpaca.py::get_filled_orders) -- broker fills
+    are the ground truth for money math. Previously approximated entry/exit
+    off the daily prices table's nearest close to a decision's timestamp,
+    with share counts from this system's own intended sizing
+    (decisions.executed_position) rather than what actually filled; both
+    can, and did, diverge from Alpaca's own fill record (a market order can
+    fill well off the prior day's close, and executed_position is an
+    estimate computed before the fill, not a read-back of it).
     """
-    engine = get_engine()
-    decisions = pd.read_sql(
-        text("SELECT symbol, ts, target_position, executed_position, mode FROM decisions WHERE mode = 'paper' ORDER BY symbol, ts"),
-        engine,
-    )
-    if decisions.empty:
+    broker = get_broker()
+    if not hasattr(broker, "get_filled_orders"):
+        logger.warning("%s has no get_filled_orders — closed trades unavailable.", type(broker).__name__)
+        return []
+    try:
+        fills = broker.get_filled_orders()
+    except Exception:
+        logger.exception("Could not fetch Alpaca fill history — closed trades unavailable.")
+        return []
+    if not fills:
         return []
 
-    symbols = decisions["symbol"].unique().tolist()
-    symbol_list = symbol_in_clause(symbols)
-    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
+    fills_df = pd.DataFrame(fills)
+    fills_df["filled_at"] = pd.to_datetime(fills_df["filled_at"], utc=True)
+    fills_df = fills_df.sort_values(["symbol", "filled_at"])
 
     trades: list[dict] = []
-    for symbol, group in decisions.groupby("symbol"):
-        group = group.sort_values("ts").reset_index(drop=True)
-        sym_prices = prices[prices["symbol"] == symbol].sort_values("ts")
-        entry = None
-        for _, row in group.iterrows():
-            executed = row["executed_position"]
-            if executed is None or pd.isna(executed):
-                continue
-            if entry is None:
-                if executed != 0:
-                    entry = row
-                continue
-            if executed == 0:
-                entry_price = _price_at_or_before(sym_prices, entry["ts"])
-                exit_price = _price_at_or_before(sym_prices, row["ts"])
-                shares = entry["executed_position"]
-                if entry_price is not None and exit_price is not None and shares:
-                    pnl = (exit_price - entry_price) * shares
-                    trades.append(
-                        {
-                            "symbol": symbol,
-                            "side": "long" if shares > 0 else "short",
-                            "entry_ts": entry["ts"].isoformat(),
-                            "exit_ts": row["ts"].isoformat(),
-                            "shares": float(shares),
-                            "entry_price": entry_price,
-                            "exit_price": exit_price,
-                            "realized_pnl": float(pnl),
-                            "realized_pnl_pct": float((exit_price / entry_price - 1) * (1 if shares > 0 else -1)),
-                        }
-                    )
-                entry = None
-            # else: still open (possibly resized) -- keep the original entry, see docstring.
+    for symbol, group in fills_df.groupby("symbol"):
+        trades.extend(
+            {
+                "symbol": symbol,
+                "side": episode["side"],
+                "entry_ts": episode["entry_ts"].isoformat(),
+                "exit_ts": episode["exit_ts"].isoformat(),
+                "shares": float(episode["shares"]),
+                "entry_price": episode["entry_price"],
+                "exit_price": episode["exit_price"],
+                "realized_pnl": float(episode["realized_pnl"]),
+                "realized_pnl_pct": float(episode["realized_pnl_pct"]),
+            }
+            for episode in _reconstruct_symbol_episodes(group)
+        )
 
     trades.sort(key=lambda t: t["exit_ts"], reverse=True)
     return trades[:limit]
