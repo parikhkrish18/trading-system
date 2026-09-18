@@ -97,6 +97,27 @@ class AlpacaBroker:
             "source": "alpaca",
         }
 
+    def get_latest_quote(self, symbol: str) -> dict:
+        """
+        Real-time bid/ask straight from Alpaca's market data feed — backs
+        the Ticker Lookup panel's "live" price, as distinct from the
+        `prices` table's daily bar (written once a day by
+        scripts/run_daily_ingest.py, always at least one full session
+        stale). Same data_client/request shape as
+        _extended_hours_limit_price above, just exposed for display instead
+        of order pricing.
+        """
+        quote = self.data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))[symbol]
+        bid, ask = quote.bid_price or None, quote.ask_price or None
+        mid = (bid + ask) / 2 if bid and ask else (bid or ask)
+        return {
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "ts": quote.timestamp.isoformat() if quote.timestamp else None,
+            "source": "alpaca",
+        }
+
     def get_positions(self) -> dict[str, float]:
         positions = self.client.get_all_positions()
         return {p.symbol: float(p.qty) for p in positions}
