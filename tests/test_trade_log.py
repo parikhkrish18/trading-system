@@ -71,7 +71,9 @@ def test_attach_actual_outcomes_folds_the_close_into_the_entry_row():
             {"id": 2, "symbol": "TROW", "ts": pd.Timestamp("2026-09-16T21:08:21Z"), "executed_position": 0.0},
         ]
     )
-    episodes = [{"symbol": "TROW", "entry_ts": pd.Timestamp("2026-09-14T22:51:40Z"), "realized_pnl_pct": 0.0153}]
+    episodes = [
+        {"symbol": "TROW", "entry_id": 1, "close_id": 2, "entry_ts": pd.Timestamp("2026-09-14T22:51:40Z"), "realized_pnl_pct": 0.0153}
+    ]
 
     result = attach_actual_outcomes(trades, episodes, open_symbols=set())
 
@@ -152,6 +154,33 @@ def test_attach_actual_outcomes_no_matching_episode_still_marks_closed_with_no_r
     row = result.iloc[0]
     assert row["actual_outcome"] == "closed"
     assert pd.isna(row["actual_realized_return"])
+
+
+def test_attach_actual_outcomes_matches_by_entry_id_not_position_in_a_list():
+    """
+    Two round trips for the same symbol: episodes must match their own
+    entry decision exactly (by entry_id), not by guessing "next episode in
+    the list" -- an out-of-order episodes list must still land correctly.
+    """
+    trades = pd.DataFrame(
+        [
+            {"id": 1, "symbol": "AAPL", "ts": pd.Timestamp("2026-01-01T00:00:00Z"), "executed_position": 10.0},
+            {"id": 2, "symbol": "AAPL", "ts": pd.Timestamp("2026-01-02T00:00:00Z"), "executed_position": 0.0},
+            {"id": 3, "symbol": "AAPL", "ts": pd.Timestamp("2026-02-01T00:00:00Z"), "executed_position": -5.0},
+            {"id": 4, "symbol": "AAPL", "ts": pd.Timestamp("2026-02-02T00:00:00Z"), "executed_position": 0.0},
+        ]
+    )
+    # Deliberately out of order, and keyed to the SECOND round trip's entry.
+    episodes = [
+        {"symbol": "AAPL", "entry_id": 3, "close_id": 4, "entry_ts": pd.Timestamp("2026-02-01T00:00:00Z"), "realized_pnl_pct": -0.02},
+        {"symbol": "AAPL", "entry_id": 1, "close_id": 2, "entry_ts": pd.Timestamp("2026-01-01T00:00:00Z"), "realized_pnl_pct": 0.10},
+    ]
+
+    result = attach_actual_outcomes(trades, episodes, open_symbols=set())
+
+    by_id = result.set_index("id")
+    assert by_id.loc[1, "actual_realized_return"] == pytest.approx(0.10)
+    assert by_id.loc[3, "actual_realized_return"] == pytest.approx(-0.02)
 
 
 def test_attach_actual_outcomes_empty_input():

@@ -751,16 +751,84 @@ def _reconstruct_symbol_episodes(fills: pd.DataFrame) -> list[dict]:
     return episodes
 
 
+# A decision's ts is when the algo LOGGED the decision, not necessarily the
+# instant the order filled -- a market order can fill a few seconds/minutes
+# later, and (per execution/full_book_rebalance.py's own settlement-wait
+# comments) a broker read taken right after submission can lag further
+# still. Generous on purpose: wide enough to always catch the real fill,
+# narrow enough to never reach into an unrelated round trip on the same
+# symbol from a different week.
+_FILL_MATCH_WINDOW = pd.Timedelta(hours=6)
+
+
+def _decision_episode_boundaries(engine) -> list[dict]:
+    """
+    The algo's OWN record of which round trips happened and roughly when:
+    walks the decisions table per symbol, same flat -> nonzero (entry) -> 0
+    (close) pairing monitoring.trade_log.real_trade_rows/attach_actual_outcomes
+    use, and returns one {symbol, entry_id, close_id, entry_ts, close_ts}
+    per completed round trip. This identifies WHICH trades exist and WHEN,
+    in date+ticker terms -- _load_closed_episodes below finalizes the
+    actual price/qty/pnl from Alpaca's own fills, never from this table's
+    own executed_position estimate.
+    """
+    decisions = pd.read_sql(
+        text("SELECT id, symbol, ts, executed_position FROM decisions WHERE mode IN ('paper', 'live') ORDER BY symbol, ts"),
+        engine,
+    )
+    if decisions.empty:
+        return []
+
+    boundaries: list[dict] = []
+    for symbol, group in decisions.groupby("symbol"):
+        entry = None
+        for _, row in group.sort_values("ts").iterrows():
+            executed = row["executed_position"]
+            if pd.isna(executed):
+                continue
+            if entry is None:
+                if executed != 0:
+                    entry = row
+                continue
+            if executed == 0:
+                boundaries.append(
+                    {
+                        "symbol": symbol,
+                        "entry_id": int(entry["id"]),
+                        "close_id": int(row["id"]),
+                        "entry_ts": entry["ts"],
+                        "close_ts": row["ts"],
+                    }
+                )
+                entry = None
+            # else: a resize mid-episode -- keep the original entry, unchanged.
+    return boundaries
+
+
 def _load_closed_episodes() -> list[dict]:
     """
-    Every realized round-trip, reconstructed from Alpaca's own filled-order
-    history (execution/broker_alpaca.py::get_filled_orders) -- broker fills
-    are the ground truth for money math. Shared by /api/trades/closed and
-    /api/trades/log (monitoring.trade_log.attach_actual_outcomes), so both
-    panels agree on what actually happened rather than each approximating
-    it separately. entry_ts/exit_ts here are real pd.Timestamps, not yet
-    stringified -- callers that need JSON-safe values do that themselves
-    (see get_closed_trades below).
+    Every realized round-trip: WHICH trades happened and roughly when comes
+    from the decisions table (_decision_episode_boundaries, the algo's own
+    record) -- the actual price/qty/pnl is then FINALIZED from Alpaca's own
+    filled-order history (execution/broker_alpaca.py::get_filled_orders),
+    scoped to a tight window (_FILL_MATCH_WINDOW) around each boundary's own
+    entry/close timestamps.
+
+    Deliberately NOT a blind, unscoped walk across this account's entire
+    order history matched by chronological sequence alone: Alpaca's full
+    order history can carry fills from an unrelated period (an old test
+    run, a corrected mistake) that happen to share a symbol -- pairing
+    "whatever came next" for that symbol, with no reference to what the
+    algo itself actually did and when, risked blending a real round trip's
+    exit with a stale, unrelated order's price. Anchoring to the decisions
+    table's own (symbol, date) first and only then asking Alpaca to
+    confirm/finalize within that window rules that out.
+
+    Every returned episode carries entry_id/close_id (the decisions.id of
+    the trade that opened/closed it) -- internal, stripped before this data
+    reaches JSON (see get_closed_trades), but is what lets
+    monitoring.trade_log.attach_actual_outcomes match a Trade Log row to
+    its episode exactly, rather than guessing by position in a list.
 
     Returns [] (never raises) for a broker that can't even be constructed
     (e.g. BROKER=ibkr with no TWS/IB Gateway reachable), one without fill
@@ -768,6 +836,11 @@ def _load_closed_episodes() -> list[dict]:
     panel going blank beats the whole endpoint 500ing over data nothing
     else here depends on.
     """
+    engine = get_engine()
+    boundaries = _decision_episode_boundaries(engine)
+    if not boundaries:
+        return []
+
     try:
         broker = get_broker()
     except Exception:
@@ -786,11 +859,36 @@ def _load_closed_episodes() -> list[dict]:
 
     fills_df = pd.DataFrame(fills)
     fills_df["filled_at"] = pd.to_datetime(fills_df["filled_at"], utc=True)
-    fills_df = fills_df.sort_values(["symbol", "filled_at"])
 
     episodes: list[dict] = []
-    for symbol, group in fills_df.groupby("symbol"):
-        episodes.extend({"symbol": symbol, **episode} for episode in _reconstruct_symbol_episodes(group))
+    for boundary in boundaries:
+        window = fills_df[
+            (fills_df["symbol"] == boundary["symbol"])
+            & (fills_df["filled_at"] >= boundary["entry_ts"] - _FILL_MATCH_WINDOW)
+            & (fills_df["filled_at"] <= boundary["close_ts"] + _FILL_MATCH_WINDOW)
+        ].sort_values("filled_at")
+        if window.empty:
+            logger.warning(
+                "No Alpaca fills found for %s within %s of decisions #%d/#%d — skipping, cannot verify.",
+                boundary["symbol"], _FILL_MATCH_WINDOW, boundary["entry_id"], boundary["close_id"],
+            )
+            continue
+
+        matched = _reconstruct_symbol_episodes(window)
+        # The window is bounded on both ends by this specific round trip's
+        # own decision timestamps, so it normally holds exactly one
+        # complete episode -- but ALL of them are kept, not just the
+        # closest match, in case the window happens to catch a genuine
+        # flip-through-flat (one Alpaca fill closing the old side and
+        # opening a new one -- see _reconstruct_symbol_episodes) that this
+        # system's own decisions log as a single resize rather than a
+        # separate close+reopen: dropping either leg would silently lose a
+        # real, realized round trip rather than just misattribute it.
+        episodes.extend(
+            {"symbol": boundary["symbol"], "entry_id": boundary["entry_id"], "close_id": boundary["close_id"], **ep}
+            for ep in matched
+        )
+
     return episodes
 
 
@@ -798,14 +896,18 @@ def _load_closed_episodes() -> list[dict]:
 def get_closed_trades(limit: int = 100) -> list[dict]:
     """
     Realized round-trip trades for display -- see _load_closed_episodes for
-    what "realized" means here (Alpaca's own fills, not an approximation).
+    what "realized" means here (the algo's decisions identify the trade,
+    Alpaca's own fills finalize the actual price/qty/pnl).
     """
     trades = [
         {
-            **episode,
+            "symbol": episode["symbol"],
+            "side": episode["side"],
             "entry_ts": episode["entry_ts"].isoformat(),
             "exit_ts": episode["exit_ts"].isoformat(),
             "shares": float(episode["shares"]),
+            "entry_price": episode["entry_price"],
+            "exit_price": episode["exit_price"],
             "realized_pnl": float(episode["realized_pnl"]),
             "realized_pnl_pct": float(episode["realized_pnl_pct"]),
         }

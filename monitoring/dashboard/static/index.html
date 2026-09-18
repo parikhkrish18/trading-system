@@ -240,6 +240,21 @@
                   <td>Measures recent buying vs. selling momentum on a <strong>0–100 scale</strong>. Roughly <strong>&gt;70 = overbought/strong upward momentum</strong>, <strong>&lt;30 = oversold/strong downward momentum</strong>, <strong>~50 = balanced</strong>.</td>
                 </tr>
                 <tr>
+                  <td><code>donchian_pct_20</code> — 20-day Donchian channel position</td>
+                  <td>(Price − 20-day low) / (20-day high − 20-day low), using the trailing 20-day high/low including today</td>
+                  <td><strong>1 = sitting at its 20-day high</strong> (top of its recent trading range). <strong>0 = sitting at its 20-day low</strong> (bottom of its range). <strong>0.5 = middle of the range.</strong> High values suggest recent strength near resistance; low values suggest recent weakness near support.</td>
+                </tr>
+                <tr>
+                  <td><code>donchian_breakout_20</code> — 20-day breakout signal</td>
+                  <td>+1 if today's close clears the <strong>prior</strong> 20-day high (today's own high/low excluded), −1 if it breaks below the <strong>prior</strong> 20-day low, 0 otherwise</td>
+                  <td><strong>+1:</strong> a genuine fresh 20-day high today — a bullish breakout. <strong>−1:</strong> a genuine fresh 20-day low today — a bearish breakdown. <strong>0:</strong> no breakout today; price is still inside its recent range.</td>
+                </tr>
+                <tr>
+                  <td><code>mom_pullback_20_5</code> — trend pullback score</td>
+                  <td>20-day trend return ÷ its volatility-scaled expected move, kept only when the last 5 days moved <strong>against</strong> that trend; 0 otherwise</td>
+                  <td><strong>Positive:</strong> a real uptrend that's pulling back right now — the classic "buy the dip" setup. <strong>Negative:</strong> a real downtrend that's bouncing right now — "sell the bounce". <strong>0:</strong> no such setup — either no clear trend, or the recent move is running with the trend rather than against it.</td>
+                </tr>
+                <tr>
                   <td><code>Regime</code> — market trend/chop regime</td>
                   <td>Calculate ADX-14 for SPY. If ADX ≥ 25, label market Trending; otherwise label Choppy.</td>
                   <td>Gives every stock market context. <strong>Trending:</strong> momentum-type signals may be more reliable. <strong>Choppy:</strong> breakouts may fail more often and mean-reversion behavior may matter more.</td>
