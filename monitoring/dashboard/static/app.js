@@ -1060,6 +1060,57 @@ const FEATURE_INFO = {
 };
 const FEATURE_GROUP_ORDER = ["Price & Trend", "Volatility", "Mean Reversion", "News Sentiment", "Macro & Sector", "Event Risk", "Other"];
 
+// How often each Ticker Lookup section's numbers actually change, not how
+// often the panel happens to re-render -- ties directly to which cron
+// writes each value (see the module docstrings this maps to):
+//   live   -- computed fresh on every lookup request (Alpaca's own quote
+//             feed; days-to-event arithmetic against today), never read
+//             back from something a batch job wrote earlier.
+//   daily  -- written once a day by daily-price-ingest (price bars,
+//             build_features' quant/sentiment/macro features, fundamentals
+//             ingest checks) -- fresh as of the last weekday close, not
+//             the current moment.
+//   weekly -- written by weekly-cycle-v2's Monday refresh (universe
+//             membership, model retrain, the model's own trade decisions)
+//             -- decisions can also land on the hourly contradiction-
+//             monitor's reactivation pass, so that section's badge notes
+//             both rather than overclaiming a strict weekly-only cadence.
+// Every group in FEATURE_GROUP_ORDER except "Event Risk" comes straight
+// out of build_features' daily run; Event Risk is upgraded to "live" here
+// because the server now recomputes its days-to-event countdown against
+// today at request time (see server.py::_ticker_live_event_risk) instead
+// of serving back whatever build_features last wrote.
+const FEATURE_GROUP_CADENCE = {
+  "Price & Trend": "daily",
+  Volatility: "daily",
+  "Mean Reversion": "daily",
+  "News Sentiment": "daily",
+  "Macro & Sector": "daily",
+  "Event Risk": "live",
+  Other: "daily",
+};
+
+const CADENCE_LABEL = { live: "Live", daily: "Daily", weekly: "Weekly" };
+
+function cadenceBadgeHTML(tier, note) {
+  if (!tier) return "";
+  const label = CADENCE_LABEL[tier] || tier;
+  return `<span class="cadence-badge cadence-${tier}" title="${escapeHTML(note || "")}">${escapeHTML(label)}</span>`;
+}
+
+function cadenceLegendHTML() {
+  return `
+    <div class="cadence-legend">
+      <span>Update cadence:</span>
+      ${cadenceBadgeHTML("live", "Computed fresh on every lookup -- never stale off a batch run.")}
+      <span>refreshes on every lookup</span>
+      ${cadenceBadgeHTML("daily", "Written once a day by the daily price/feature/fundamentals ingest.")}
+      <span>refreshes once a day (after the prior session's close)</span>
+      ${cadenceBadgeHTML("weekly", "Written by the Monday weekly cycle (universe, model retrain, trade decisions).")}
+      <span>refreshes on the Monday weekly cycle (+ hourly reactivation checks for decisions)</span>
+    </div>`;
+}
+
 // good -> green (var(--green)), bad -> red (var(--red)), neutral -> blue
 // (var(--accent)) -- see the .pl-pos/.pl-neg/.pl-neutral rules in style.css.
 function signalClass(signal) {
@@ -1075,14 +1126,21 @@ function signalClass(signal) {
 // order, sorted after every known feature.
 const _FEATURE_ORDER_INDEX = new Map(Object.keys(FEATURE_INFO).map((name, i) => [name, i]));
 
-function featureGroupsHTML(features) {
+function featureGroupsHTML(features, liveEventRisk) {
   const byGroup = {};
   for (const f of features || []) {
     if (f.feature_name.startsWith("fund_")) continue; // shown in the Fundamentals table instead
     const info = FEATURE_INFO[f.feature_name] || { label: f.feature_name, group: "Other", fmt: (v) => fmt.num(v, 4), signal: alwaysNeutral };
-    const cls = signalClass(info.signal(f.value));
+    // Event Risk's 3 features get their value swapped for the server's
+    // live-computed countdown (days-to-event arithmetic against today,
+    // not whatever build_features last wrote) whenever it's available --
+    // see server.py::_ticker_live_event_risk. Falls back to the stored
+    // feature value only if that live figure is missing.
+    const live = liveEventRisk && Object.prototype.hasOwnProperty.call(liveEventRisk, f.feature_name);
+    const value = live ? liveEventRisk[f.feature_name] : f.value;
+    const cls = signalClass(info.signal(value));
     const order = _FEATURE_ORDER_INDEX.has(f.feature_name) ? _FEATURE_ORDER_INDEX.get(f.feature_name) : Infinity;
-    (byGroup[info.group] ??= []).push({ order, label: info.label, valueHTML: `<span class="${cls}">${info.fmt(f.value)}</span>` });
+    (byGroup[info.group] ??= []).push({ order, label: info.label, valueHTML: `<span class="${cls}">${info.fmt(value)}</span>` });
   }
   for (const list of Object.values(byGroup)) {
     list.sort((a, b) => a.order - b.order);
@@ -1095,7 +1153,7 @@ function featureGroupsHTML(features) {
     .map(
       (g) => `
       <div class="feature-group">
-        <h4>${escapeHTML(g)}</h4>
+        <h4>${escapeHTML(g)}${cadenceBadgeHTML(FEATURE_GROUP_CADENCE[g])}</h4>
         <div class="position-grid-stats">
           ${byGroup[g].map((f) => `<div><div class="label">${escapeHTML(f.label)}</div>${f.valueHTML}</div>`).join("")}
         </div>
@@ -1148,6 +1206,26 @@ function tickerPriceSummaryHTML(latestPrice) {
       <div><div class="label">Low</div>${fmt.money(latestPrice.low)}</div>
       <div><div class="label">Volume</div>${fmt.num(latestPrice.volume, 0)}</div>
       <div><div class="label">As of</div>${fmt.time(latestPrice.ts)}</div>
+    </div>`;
+}
+
+// The daily bar above is always at least one session stale (written once
+// by the daily ingest, after the prior close); this is Alpaca's own quote
+// feed, fetched fresh on every lookup -- genuinely live, not a nicer
+// label on the same stale number. Missing entirely (null) reads as
+// unavailable rather than an error: no Alpaca credentials configured, an
+// IBKR deployment (no live-quote support there yet), or a feed hiccup all
+// degrade to this same quiet fallback -- see server.py::_ticker_live_quote.
+function liveQuoteHTML(liveQuote) {
+  if (!liveQuote || (liveQuote.mid == null && liveQuote.bid == null && liveQuote.ask == null)) {
+    return '<div class="empty-state">Live quote unavailable right now (no live market-data feed configured, or the feed had nothing to report).</div>';
+  }
+  return `
+    <div class="summary-row">
+      <div><div class="label">Mid</div>${fmt.money(liveQuote.mid)}</div>
+      <div><div class="label">Bid</div>${fmt.money(liveQuote.bid)}</div>
+      <div><div class="label">Ask</div>${fmt.money(liveQuote.ask)}</div>
+      <div><div class="label">Quoted at</div>${fmt.time(liveQuote.ts)}</div>
     </div>`;
 }
 
@@ -1218,26 +1296,31 @@ function tickerLookupResultHTML(data) {
     return `<div class="empty-state">No data collected for ${escapeHTML(data.symbol)} yet — check the symbol, or it may not be in the tracked universe.</div>`;
   }
   return `
+    ${cadenceLegendHTML()}
     <section>
-      <h3>${escapeHTML(data.symbol)} — latest price</h3>
+      <h3>${escapeHTML(data.symbol)} — last close${cadenceBadgeHTML("daily", "The daily bar -- written once a day by the daily price ingest, after the prior session's close.")}</h3>
       ${tickerPriceSummaryHTML(data.latest_price)}
+    </section>
+    <section>
+      <h3>${escapeHTML(data.symbol)} — live quote${cadenceBadgeHTML("live", "Alpaca's own quote feed, fetched fresh on every lookup.")}</h3>
+      ${liveQuoteHTML(data.live_quote)}
     </section>
     <section>
       <h3>Market &amp; model features
         <span class="muted">${data.feature_set_id ? `(feature set ${escapeHTML(data.feature_set_id)})` : ""}</span>
       </h3>
-      ${featureGroupsHTML(data.features)}
+      ${featureGroupsHTML(data.features, data.live_event_risk)}
     </section>
     <section>
-      <h3>Fundamentals</h3>
+      <h3>Fundamentals${cadenceBadgeHTML("daily", "Checked every day by the daily ingest; the underlying filings themselves only change quarterly.")}</h3>
       ${fundamentalsTableHTML(data.fundamentals)}
     </section>
     <section>
-      <h3>Recent news <span class="muted">(${(data.news || []).length})</span></h3>
+      <h3>Recent news <span class="muted">(${(data.news || []).length})</span>${cadenceBadgeHTML("live", "The news stream ingests continuously; sentiment scoring can lag up to ~1 hour.")}</h3>
       <div class="news-feed-list">${newsFeedHTML(data.news)}</div>
     </section>
     <section>
-      <h3>Model decisions &amp; reasoning <span class="muted">(most recent ${(data.decisions || []).length})</span></h3>
+      <h3>Model decisions &amp; reasoning <span class="muted">(most recent ${(data.decisions || []).length})</span>${cadenceBadgeHTML("weekly", "Made on the Monday weekly cycle; the hourly contradiction monitor can also trigger a reactivation decision in between.")}</h3>
       ${tickerDecisionsHTML(data.decisions, data.symbol)}
     </section>`;
 }

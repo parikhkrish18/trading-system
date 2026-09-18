@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 
 import pandas as pd
@@ -1148,8 +1149,15 @@ def test_ticker_lookup_assembles_every_section(monkeypatch, client):
             }
         ]
     )
-    calls = iter([latest_price, feature_set_row, raw_features, fundamentals, news, decisions])
+    macro_calendar = pd.DataFrame(
+        [
+            {"ts": pd.Timestamp("2026-09-20T00:00:00Z"), "category": "FOMC"},
+            {"ts": pd.Timestamp("2026-09-25T00:00:00Z"), "category": "CPI"},
+        ]
+    )
+    calls = iter([latest_price, feature_set_row, raw_features, fundamentals, news, decisions, macro_calendar])
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+    monkeypatch.setattr(server, "get_broker", lambda: (_ for _ in ()).throw(RuntimeError("no broker in tests")))
 
     resp = client.get("/api/ticker/AAPL")
     assert resp.status_code == 200
@@ -1157,8 +1165,15 @@ def test_ticker_lookup_assembles_every_section(monkeypatch, client):
 
     assert body["symbol"] == "AAPL"
     assert body["latest_price"]["close"] == 100.0
+    # get_broker() failing (no credentials in the test environment) degrades
+    # the live quote to None rather than a 500 -- see _ticker_live_quote.
+    assert body["live_quote"] is None
     assert body["feature_set_id"] == "v4"
     assert {f["feature_name"] for f in body["features"]} == {"mom_ret_5d", "meanrev_rsi_14", "fund_eps_actual_latest"}
+    # Live-computed against "now" in the test's own clock, not asserted
+    # exactly -- just that the categories with an upcoming date resolved,
+    # and JOBS (absent from macro_calendar here) did not.
+    assert set(body["live_event_risk"]) == {"days_to_next_fomc", "days_to_next_cpi"}
     # Only the latest-filed value per metric survives.
     assert len(body["fundamentals"]) == 1
     assert body["fundamentals"][0]["value"] == 1.2
@@ -1169,8 +1184,9 @@ def test_ticker_lookup_assembles_every_section(monkeypatch, client):
 
 def test_ticker_lookup_lowercases_symbol_is_normalized_to_upper(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server, "get_broker", lambda: (_ for _ in ()).throw(RuntimeError("no broker in tests")))
     empty = pd.DataFrame()
-    calls = iter([empty, empty, empty, empty, empty])
+    calls = iter([empty, empty, empty, empty, empty, empty])
     captured_symbols = []
 
     def fake_read_sql(query, engine, params=None):
@@ -1196,9 +1212,12 @@ def test_ticker_lookup_rejects_a_symbol_that_does_not_look_like_a_ticker(monkeyp
 def test_ticker_lookup_with_nothing_in_the_db_returns_empty_shape_not_an_error(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
     empty = pd.DataFrame()
-    # No feature_set_row -> raw_features is never queried, so only 5 calls.
-    calls = iter([empty, empty, empty, empty, empty])
+    # No feature_set_row -> raw_features is never queried, so only 6 calls
+    # (latest_price, feature_set_row, fundamentals_raw, news, decisions,
+    # macro_calendar for the live event-risk countdown).
+    calls = iter([empty, empty, empty, empty, empty, empty])
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+    monkeypatch.setattr(server, "get_broker", lambda: (_ for _ in ()).throw(RuntimeError("no broker in tests")))
 
     resp = client.get("/api/ticker/ZZZZ")
     assert resp.status_code == 200
@@ -1206,8 +1225,10 @@ def test_ticker_lookup_with_nothing_in_the_db_returns_empty_shape_not_an_error(m
     assert body == {
         "symbol": "ZZZZ",
         "latest_price": None,
+        "live_quote": None,
         "feature_set_id": None,
         "features": [],
+        "live_event_risk": {},
         "fundamentals": [],
         "news": [],
         "decisions": [],
@@ -1216,6 +1237,7 @@ def test_ticker_lookup_with_nothing_in_the_db_returns_empty_shape_not_an_error(m
 
 def test_ticker_lookup_hides_news_a_vendor_mistagged(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server, "get_broker", lambda: (_ for _ in ()).throw(RuntimeError("no broker in tests")))
     empty = pd.DataFrame()
     news = pd.DataFrame(
         [
@@ -1224,14 +1246,65 @@ def test_ticker_lookup_hides_news_a_vendor_mistagged(monkeypatch, client):
         ]
     )
     # Call order: latest_price, feature_set_row (empty -> raw_features skipped),
-    # fundamentals_raw, news, decisions.
-    calls = iter([empty, empty, empty, news, empty])
+    # fundamentals_raw, news, decisions, macro_calendar.
+    calls = iter([empty, empty, empty, news, empty, empty])
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
     resp = client.get("/api/ticker/AAPL")
     body = resp.json()
     assert len(body["news"]) == 1
     assert body["news"][0]["headline"] == "real AAPL story"
+
+
+def test_ticker_live_event_risk_counts_days_against_now_not_the_last_feature_run(monkeypatch):
+    # An event ~2.5 days out reads as a live countdown, not whatever value
+    # build_features last stored for it -- the whole point of computing
+    # this fresh instead of reading it back from the features table. Built
+    # relative to the real clock (rather than freezing datetime.now, which
+    # is process-global and would bleed into unrelated code) with a
+    # tolerance loose enough to absorb this test's own runtime.
+    now = dt.datetime.now(tz=dt.UTC)
+    calendar = pd.DataFrame(
+        [
+            {"ts": pd.Timestamp(now + dt.timedelta(days=2.5)), "category": "FOMC"},
+            {"ts": pd.Timestamp(now + dt.timedelta(days=12)), "category": "JOBS"},
+        ]
+    )
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: calendar)
+
+    result = server._ticker_live_event_risk(engine=None)
+
+    assert result["days_to_next_fomc"] == pytest.approx(2.5, abs=0.01)
+    assert result["days_to_next_jobs"] == pytest.approx(12.0, abs=0.01)
+    assert "days_to_next_cpi" not in result  # no CPI row in the calendar
+
+
+def test_ticker_live_event_risk_returns_empty_dict_with_no_upcoming_events(monkeypatch):
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
+    assert server._ticker_live_event_risk(engine=None) == {}
+
+
+def test_ticker_live_quote_degrades_to_none_without_crashing(monkeypatch):
+    # No broker configured / reachable (the common case in a sandbox, and
+    # for anyone running BROKER=ibkr) -- the live-quote card degrades to
+    # unavailable rather than taking the whole ticker lookup down.
+    monkeypatch.setattr(server, "get_broker", lambda: (_ for _ in ()).throw(RuntimeError("unreachable")))
+    assert server._ticker_live_quote("AAPL") is None
+
+
+def test_ticker_live_quote_uses_the_broker_when_it_supports_one(monkeypatch):
+    class _FakeBroker:
+        def get_latest_quote(self, symbol):
+            return {"bid": 99.0, "ask": 99.2, "mid": 99.1, "ts": "2026-09-18T00:00:00Z", "source": "alpaca"}
+
+    monkeypatch.setattr(server, "get_broker", lambda: _FakeBroker())
+    assert server._ticker_live_quote("AAPL") == {"bid": 99.0, "ask": 99.2, "mid": 99.1, "ts": "2026-09-18T00:00:00Z", "source": "alpaca"}
+
+
+def test_ticker_live_quote_none_when_broker_has_no_quote_support(monkeypatch):
+    # e.g. IBKRBroker, which has no get_latest_quote yet.
+    monkeypatch.setattr(server, "get_broker", lambda: object())
+    assert server._ticker_live_quote("AAPL") is None
 
 
 def test_regime_history_returns_empty_with_insufficient_data(monkeypatch, client):

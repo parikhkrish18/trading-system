@@ -1221,15 +1221,84 @@ def get_ticker_lookup(symbol: str) -> dict:
         if isinstance(r.get("reasoning"), str):
             r["reasoning"] = json.loads(r["reasoning"])
 
+    # Genuinely real-time, computed fresh on every request rather than read
+    # back from a batch job's last run -- see _ticker_live_quote /
+    # _ticker_live_event_risk for what each actually is and isn't.
+    live_quote = _ticker_live_quote(symbol)
+    live_event_risk = _ticker_live_event_risk(engine)
+
     return {
         "symbol": symbol,
         "latest_price": _clean_records(latest_price)[0] if not latest_price.empty else None,
+        "live_quote": live_quote,
         "feature_set_id": feature_set_id,
         "features": features,
+        "live_event_risk": live_event_risk,
         "fundamentals": fundamentals,
         "news": news_records,
         "decisions": decision_records,
     }
+
+
+def _ticker_live_quote(symbol: str) -> dict | None:
+    """
+    Real-time bid/ask for the Ticker Lookup panel's "live" price, on top of
+    the `prices` table's daily bar (always at least one session stale --
+    see scripts/run_daily_ingest.py). Alpaca-only for now (only
+    AlpacaBroker implements get_latest_quote -- IBKRBroker has no
+    equivalent yet); best-effort so a data-feed hiccup or IBKR deployment
+    degrades this one card, not the whole lookup.
+    """
+    try:
+        broker = get_broker()
+    except Exception:
+        return None
+    get_quote = getattr(broker, "get_latest_quote", None)
+    if get_quote is None:
+        return None
+    try:
+        return get_quote(symbol)
+    except Exception:
+        logger.warning("Could not fetch a live quote for %s.", symbol, exc_info=True)
+        return None
+
+
+# Mirrors features/build_features.py's _MACRO_CATEGORIES -- kept as its own
+# list rather than importing that module's private constant, since this is
+# a display concern (which categories to show a live countdown for), not a
+# feature-engineering one.
+_TICKER_EVENT_CATEGORIES = ["FOMC", "CPI", "JOBS"]
+
+
+def _ticker_live_event_risk(engine) -> dict[str, float]:
+    """
+    days_to_next_{fomc,cpi,jobs}, computed against *today* rather than
+    read back from the `features` table's stored value -- that value is
+    only as fresh as the last build_features run (once a day at most), so
+    on the morning before that run it's already reading a day stale. The
+    underlying event date in `macro_calendar` doesn't need that same daily
+    recompute to be current: "days until a known future date" is pure
+    arithmetic against today, so it's genuinely live regardless of when
+    build_features last ran.
+    """
+    now = dt.datetime.now(tz=dt.UTC)
+    calendar = pd.read_sql(
+        text("SELECT ts, category FROM macro_calendar WHERE ts >= :now ORDER BY ts"),
+        engine,
+        params={"now": now},
+    )
+    if calendar.empty:
+        return {}
+    result = {}
+    for category in _TICKER_EVENT_CATEGORIES:
+        upcoming = calendar.loc[calendar["category"] == category, "ts"]
+        if upcoming.empty:
+            continue
+        next_ts = upcoming.iloc[0]
+        if next_ts.tzinfo is None:
+            next_ts = next_ts.tz_localize("UTC")
+        result[f"days_to_next_{category.lower()}"] = (next_ts - now).total_seconds() / 86400
+    return result
 
 
 @app.get("/api/news/ingestion_status")
