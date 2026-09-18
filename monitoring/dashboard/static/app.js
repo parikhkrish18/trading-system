@@ -1066,13 +1066,26 @@ function signalClass(signal) {
   return signal === "good" ? "pl-pos" : signal === "bad" ? "pl-neg" : "pl-neutral";
 }
 
+// Within a group, features display in FEATURE_INFO's own definition order
+// (e.g. donchian_pct_20/donchian_breakout_20/mom_pullback_20_5 sit at the
+// end of "Price & Trend", right after adx_14, matching where they're
+// defined) -- NOT the order the API happens to return them in, which is
+// just alphabetical by feature_name and was never a deliberate ordering.
+// Anything not in FEATURE_INFO (the "Other" fallback) keeps the API's own
+// order, sorted after every known feature.
+const _FEATURE_ORDER_INDEX = new Map(Object.keys(FEATURE_INFO).map((name, i) => [name, i]));
+
 function featureGroupsHTML(features) {
   const byGroup = {};
   for (const f of features || []) {
     if (f.feature_name.startsWith("fund_")) continue; // shown in the Fundamentals table instead
     const info = FEATURE_INFO[f.feature_name] || { label: f.feature_name, group: "Other", fmt: (v) => fmt.num(v, 4), signal: alwaysNeutral };
     const cls = signalClass(info.signal(f.value));
-    (byGroup[info.group] ??= []).push({ label: info.label, valueHTML: `<span class="${cls}">${info.fmt(f.value)}</span>` });
+    const order = _FEATURE_ORDER_INDEX.has(f.feature_name) ? _FEATURE_ORDER_INDEX.get(f.feature_name) : Infinity;
+    (byGroup[info.group] ??= []).push({ order, label: info.label, valueHTML: `<span class="${cls}">${info.fmt(f.value)}</span>` });
+  }
+  for (const list of Object.values(byGroup)) {
+    list.sort((a, b) => a.order - b.order);
   }
   const groups = FEATURE_GROUP_ORDER.filter((g) => byGroup[g] && byGroup[g].length);
   if (groups.length === 0) {
