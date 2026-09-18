@@ -1132,6 +1132,11 @@ def get_positions_news(limit_per_symbol: int = 8) -> dict[str, list[dict]]:
     return result
 
 
+# See its one use in get_ticker_lookup below for why this is wider than a
+# single reporting quarter.
+_FUNDAMENTALS_STALE_AFTER = pd.Timedelta(days=400)
+
+
 @app.get("/api/ticker/{symbol}")
 def get_ticker_lookup(symbol: str) -> dict:
     """
@@ -1188,7 +1193,23 @@ def get_ticker_lookup(symbol: str) -> dict:
         f"WHERE symbol IN ({symbol_list}) ORDER BY ts DESC",
         engine,
     )
+    # The single newest row overall, kept BEFORE the staleness filter below
+    # so a symbol whose only fundamentals on file are years old (e.g. a name
+    # onboarded before this system's fundamentals source moved to Finnhub --
+    # see data/ingest/fundamentals.py's module docstring) still tells the
+    # operator when that stale data is from, rather than just going quiet.
+    fundamentals_latest_ts = _clean_records(fundamentals_raw.iloc[[0]])[0]["ts"] if not fundamentals_raw.empty else None
     if not fundamentals_raw.empty:
+        # A quarterly filer's newest 10-Q/10-K on file is routinely 100+
+        # days old even when everything's working (10-Qs can post up to
+        # ~45 days after quarter-end, 10-Ks up to ~90) -- _FUNDAMENTALS_STALE_AFTER
+        # is deliberately far wider than one quarter so that lag never
+        # hides a genuinely current figure. It exists to catch the other
+        # case: a metric whose newest row on file is literally years old,
+        # which "most recent per metric" would otherwise render with a
+        # confident green/red read as if it were today's number.
+        cutoff = dt.datetime.now(tz=dt.UTC) - _FUNDAMENTALS_STALE_AFTER
+        fundamentals_raw = fundamentals_raw[fundamentals_raw["ts"] >= cutoff]
         # Latest filed value per metric -- same "most recent as of now" read
         # build_fundamentals_features uses, just without the as-of price-date join.
         fundamentals_raw = fundamentals_raw.sort_values("ts", ascending=False).drop_duplicates("metric")
@@ -1235,6 +1256,7 @@ def get_ticker_lookup(symbol: str) -> dict:
         "features": features,
         "live_event_risk": live_event_risk,
         "fundamentals": fundamentals,
+        "fundamentals_latest_ts": fundamentals_latest_ts,
         "news": news_records,
         "decisions": decision_records,
     }

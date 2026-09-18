@@ -1174,9 +1174,17 @@ const _FUNDAMENTALS_SIGNAL = {
   net_income: signBySign(),
 };
 
-function fundamentalsTableHTML(fundamentals) {
+// fundamentalsLatestTs is the newest filing on file for this symbol
+// REGARDLESS of the server's staleness cutoff (server.py::_FUNDAMENTALS_STALE_AFTER)
+// -- distinguishes "nothing was ever collected" from "something was
+// collected, it's just too old to show as a current figure" (e.g. a
+// decade-old row left over from before this system's fundamentals source
+// moved to Finnhub) rather than collapsing both into the same silence.
+function fundamentalsTableHTML(fundamentals, fundamentalsLatestTs) {
   if (!fundamentals || fundamentals.length === 0) {
-    return '<div class="empty-state">No fundamentals collected for this symbol yet.</div>';
+    return fundamentalsLatestTs
+      ? `<div class="empty-state">No fundamentals filed recently enough to show -- the newest on file for this symbol is from ${fmt.time(fundamentalsLatestTs)}, too old to treat as current.</div>`
+      : '<div class="empty-state">No fundamentals collected for this symbol yet.</div>';
   }
   const rows = fundamentals
     .map((f) => {
@@ -1313,7 +1321,7 @@ function tickerLookupResultHTML(data) {
     </section>
     <section>
       <h3>Fundamentals${cadenceBadgeHTML("daily", "Checked every day by the daily ingest; the underlying filings themselves only change quarterly.")}</h3>
-      ${fundamentalsTableHTML(data.fundamentals)}
+      ${fundamentalsTableHTML(data.fundamentals, data.fundamentals_latest_ts)}
     </section>
     <section>
       <h3>Recent news <span class="muted">(${(data.news || []).length})</span>${cadenceBadgeHTML("live", "The news stream ingests continuously; sentiment scoring can lag up to ~1 hour.")}</h3>

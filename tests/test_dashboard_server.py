@@ -1182,6 +1182,61 @@ def test_ticker_lookup_assembles_every_section(monkeypatch, client):
     assert body["decisions"][0]["reasoning"][0]["title"] == "x"  # decoded from the JSONB string
 
 
+def test_ticker_lookup_hides_a_fundamentals_metric_whose_only_filing_is_years_stale(monkeypatch, client):
+    """
+    A metric whose newest row on file is years old (e.g. a name onboarded
+    back when this system's fundamentals source was Polygon -- see
+    data/ingest/fundamentals.py) must not render as if it were today's
+    figure. total_assets here has nothing newer than a 2012 filing and
+    is dropped entirely; eps_actual has a filing within the last year and
+    survives.
+    """
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    empty = pd.DataFrame()
+    fundamentals = pd.DataFrame(
+        [
+            {"ts": pd.Timestamp("2026-08-01T00:00:00Z"), "metric": "eps_actual", "value": 1.2},
+            {"ts": pd.Timestamp("2012-10-30T05:30:00Z"), "metric": "total_assets", "value": 694143000.0},
+        ]
+    ).sort_values("ts", ascending=False)
+    # Call order: latest_price, feature_set_row (empty -> raw_features
+    # skipped), fundamentals_raw, news, decisions, macro_calendar.
+    calls = iter([empty, empty, fundamentals, empty, empty, empty])
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+    monkeypatch.setattr(server, "get_broker", lambda: (_ for _ in ()).throw(RuntimeError("no broker in tests")))
+
+    resp = client.get("/api/ticker/FDS")
+    body = resp.json()
+
+    assert [f["metric"] for f in body["fundamentals"]] == ["eps_actual"]
+    # The overall newest row on file (across every metric, before the
+    # per-metric staleness filter) is the recent eps_actual one here.
+    assert body["fundamentals_latest_ts"] == "2026-08-01T00:00:00.000Z"
+
+
+def test_ticker_lookup_fundamentals_message_distinguishes_stale_from_never_collected(monkeypatch, client):
+    """
+    Every metric on file is years stale (nothing survives the filter) --
+    fundamentals_latest_ts still reports that 2012 date, so the panel can
+    say "the newest on file is from 2012" instead of the same silent
+    "nothing collected" message a symbol with truly zero history gets.
+    """
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    empty = pd.DataFrame()
+    fundamentals = pd.DataFrame(
+        [{"ts": pd.Timestamp("2012-10-30T05:30:00Z"), "metric": "total_assets", "value": 694143000.0}]
+    )
+    calls = iter([empty, empty, fundamentals, empty, empty, empty])
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+    monkeypatch.setattr(server, "get_broker", lambda: (_ for _ in ()).throw(RuntimeError("no broker in tests")))
+
+    resp = client.get("/api/ticker/FDS")
+    body = resp.json()
+
+    assert body["fundamentals"] == []
+    assert body["fundamentals_latest_ts"] == "2012-10-30T05:30:00.000Z"
+
+
 def test_ticker_lookup_lowercases_symbol_is_normalized_to_upper(monkeypatch, client):
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server, "get_broker", lambda: (_ for _ in ()).throw(RuntimeError("no broker in tests")))
@@ -1230,6 +1285,7 @@ def test_ticker_lookup_with_nothing_in_the_db_returns_empty_shape_not_an_error(m
         "features": [],
         "live_event_risk": {},
         "fundamentals": [],
+        "fundamentals_latest_ts": None,
         "news": [],
         "decisions": [],
     }
