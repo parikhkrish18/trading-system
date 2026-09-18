@@ -148,6 +148,8 @@ def score_universe(
     feature_cols: list[str],
     min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
     raw_features: pd.DataFrame | None = None,
+    atr_pct_by_symbol: dict[str, float] | None = None,
+    horizon_days: int | None = None,
 ) -> pd.DataFrame:
     """
     latest_features: one row per symbol (see load_latest_features), with a
@@ -156,16 +158,25 @@ def score_universe(
     Returns: symbol, predicted_return, direction_agreement, conviction_score,
     donchian_breakout_20, trend_pullback_score, confident.
 
-    Two bars decide "confident": the predicted move must be bigger than
-    what the round trip costs (a prediction smaller than the cost of acting
-    on it is a guaranteed loser even when its direction is right), AND —
-    when donchian_breakout_20 is present in the data — price must actually
-    be breaking a real 20-day high/low in the SAME direction as the
-    prediction: a bullish call needs a fresh 20-day high, a bearish one a
-    fresh 20-day low. A feature set built before this feature existed (no
-    donchian_breakout_20 column at all) falls back to the cost hurdle alone,
-    same as before this existed — this is a stricter bar layered on top,
-    not a replacement that could silently break an older feature set.
+    Three bars decide "confident":
+
+    1. The predicted move must be bigger than what the round trip costs (a
+       prediction smaller than the cost of acting on it is a guaranteed
+       loser even when its direction is right) -- min_abs_return.
+    2. When this stock's own ATR is available (atr_pct_by_symbol), the
+       predicted move must also clear settings.screener_min_return_atr_fraction
+       of the same 2x-horizon-scaled-ATR floor execution/exit_levels.py sizes
+       its take-profit off -- otherwise a forecast can be so small relative
+       to that stock's own volatility that the take-profit it gets sized
+       with (2x-4x ATR) has no realistic path from where the model actually
+       thinks it's going. Missing ATR for a symbol falls back to bar 1 alone.
+    3. When donchian_breakout_20 is present in the data, price must actually
+       be breaking a real 20-day high/low in the SAME direction as the
+       prediction: a bullish call needs a fresh 20-day high, a bearish one a
+       fresh 20-day low. A feature set built before this feature existed (no
+       donchian_breakout_20 column at all) falls back to bars 1-2 alone —
+       each of these is a stricter bar layered on top, never a replacement
+       that could silently break an older feature set.
 
     `raw_features`: donchian_breakout_20 is read from here when given,
     falling back to latest_features otherwise. In TARGET_MODE=relative,
@@ -240,10 +251,30 @@ def score_universe(
     # most capital was partly decided by a number that means nothing.
     result["conviction_score"] = result["predicted_return"].abs()
 
+    # Bar 2: this stock's own ATR-relative floor, when its ATR is known.
+    # Half (by default) of the same 2x-horizon-scaled-ATR minimum
+    # execution/exit_levels.py sizes its take-profit floor off of -- a
+    # forecast has to at least be in the neighborhood of that floor for the
+    # take-profit it will be sized with to have a realistic path, without
+    # requiring the forecast to equal the floor outright (the take-profit
+    # is meant to be a ceiling the trade can run past its point forecast to
+    # reach). Symbols with no measurable ATR fall back to min_abs_return
+    # alone, same as before this bar existed.
+    atr_pct_series = result["symbol"].map(atr_pct_by_symbol or {})
+    has_atr = atr_pct_series.notna() & (atr_pct_series > 0)
+    horizon = horizon_days if horizon_days is not None else settings.target_horizon_days
+    atr_floor = (
+        settings.exit_take_profit_min_atr_mult
+        * settings.screener_min_return_atr_fraction
+        * atr_pct_series
+        * np.sqrt(max(horizon, 1))
+    )
+    effective_min_return = np.where(has_atr, np.maximum(min_abs_return, atr_floor), min_abs_return)
+
     breakout_aligned = (
         np.sign(result["predicted_return"]) == result["donchian_breakout_20"] if has_breakout_signal else True
     )
-    result["confident"] = (result["predicted_return"].abs() >= min_abs_return) & breakout_aligned
+    result["confident"] = (result["predicted_return"].abs() >= effective_min_return) & breakout_aligned
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
 
@@ -1335,11 +1366,11 @@ def run_screen_with_scores(
     raw_latest = latest if settings.target_mode == "absolute" else load_latest_features(
         feature_set_id, symbols, target_mode="absolute"
     )
-    scored = score_universe(ensemble, latest, feature_cols, min_abs_return, raw_features=raw_latest)
 
     # This stock's own 14-day Average True Range (vol_atr_14, a QUANT_FEATURES
     # entry — see features/build_features.py) as a fraction of price, for
-    # take-profit sizing (execution/exit_levels.py targets a multiple of
+    # both the selection floor just below (score_universe's ATR-relative bar)
+    # and take-profit sizing (execution/exit_levels.py targets a multiple of
     # this, 2x-4x by default, for the weekly swing horizon this system
     # targets). raw_latest carries vol_atr_14 in absolute price units
     # (dollars), never cross-sectionally z-scored, same reasoning as every
@@ -1355,6 +1386,11 @@ def run_screen_with_scores(
             atr_val = row.get("vol_atr_14") if "vol_atr_14" in raw_latest.columns else None
             if pd.notna(atr_val) and symbol in price_by_symbol:
                 atr_pct_by_symbol[symbol] = float(atr_val) / price_by_symbol[symbol]
+
+    scored = score_universe(
+        ensemble, latest, feature_cols, min_abs_return, raw_features=raw_latest,
+        atr_pct_by_symbol=atr_pct_by_symbol, horizon_days=target_horizon_days,
+    )
 
     # Solidifies the ATR/sigma-derived bounds above against this stock's own
     # recent trading range (settings.donchian_exit_window) -- take-profit

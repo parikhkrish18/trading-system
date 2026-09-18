@@ -17,6 +17,7 @@ import pandas as pd
 
 from config.settings import settings
 from data.ingest.universe import load_active_universe
+from execution import hold_rules
 from execution.approval_gate import ProposedTrade, request_approval, send_followup
 from execution.client_fanout import replicate_to_clients
 from execution.exit_levels import ExitLevels
@@ -120,6 +121,20 @@ def rebalance_after_exit(
     """Re-optimize the whole master book after confirmed capital is freed."""
     excluded = set(excluded_symbols)
     current_positions = {s: q for s, q in broker.get_positions().items() if q != 0}
+
+    # Best-effort, same fallback-to-empty pattern execution/trading_loop.py
+    # uses for the identical reads: a state read failing must never block a
+    # rebalance, only cost it the carried-forward levels/miss counts below.
+    try:
+        prior_levels = hold_rules.load_exit_levels(engine)
+    except Exception:
+        logger.warning("Could not load per-position exit levels — kept positions may lose their recorded levels.")
+        prior_levels = {}
+    try:
+        prior_missed = hold_rules.load_missed_cycles(engine)
+    except Exception:
+        logger.warning("Could not load hold-state miss counters — kept positions restart their counter at 0.")
+        prior_missed = {}
 
     # The close order may be queued or partially filled. Never size a fresh
     # book against capital that has not actually been released, and never
@@ -260,12 +275,15 @@ def rebalance_after_exit(
     )
 
     changed: list[str] = []
+    closed_ok: set[str] = set()
+    opened_ok: set[str] = set()
     for symbol in approved_close_symbols:
         try:
             broker.submit_target_position(symbol, 0.0)
         except Exception:
             logger.exception("Failed to close %s during the full-book rebalance.", symbol)
             continue
+        closed_ok.add(symbol)
         changed.append(f"{symbol} → 0%")
         if log_displaced_close is not None:
             log_displaced_close(symbol, status_by_symbol.get(symbol) or "approved")
@@ -282,6 +300,7 @@ def rebalance_after_exit(
         except Exception:
             logger.exception("Failed to retarget %s during the full-book rebalance.", candidate.symbol)
             continue
+        opened_ok.add(candidate.symbol)
 
         # target_shares, not a live re-query: broker.get_positions() read
         # right after submission can still show the pre-fill (unsettled)
@@ -303,6 +322,27 @@ def rebalance_after_exit(
             replicate_to_clients(target_pct_by_symbol, prices, engine)
         except Exception:
             logger.exception("Client fan-out failed during full-book rebalance; master targets are unaffected.")
+
+    # Persist exit levels and miss counters for the book as it now stands --
+    # same intended (not re-queried) state used above, for the same
+    # unsettled-read reason. Without this, a candidate opened here (e.g. the
+    # hourly contradiction monitor's mid-week reactivation) never gets its
+    # ATR/Donchian-derived take-profit/stop-loss recorded anywhere: the
+    # dashboard shows it as unrecorded, and hold_rules.evaluate_holds /
+    # execution/contradiction_monitor.py's own stop/target check falls back
+    # to the generic global thresholds instead of this position's own levels.
+    final_open_symbols = (set(current_positions) - closed_ok) | opened_ok
+    levels_by_symbol = {
+        **prior_levels,
+        **{c.symbol: c.exit_levels for c in approved_candidates if c.exit_levels},
+    }
+    missed_by_symbol = {s: (0 if s in opened_ok else prior_missed.get(s, 0)) for s in final_open_symbols}
+    try:
+        hold_rules.store_missed_cycles(
+            engine, missed_by_symbol, {s: lv for s, lv in levels_by_symbol.items() if s in final_open_symbols}
+        )
+    except Exception:
+        logger.exception("Could not persist hold state after the full-book rebalance.")
 
     if changed:
         message = "♻️ Full-book rebalance after exit: " + ", ".join(changed)

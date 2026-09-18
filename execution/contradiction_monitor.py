@@ -395,6 +395,11 @@ def _log_rejected_reactivation(candidate, mode: str, approval_status: str) -> No
         "reasoning": json.dumps(full_reasoning),
         "direction_agreement": candidate.direction_agreement,
         "approval_status": approval_status,
+        # The levels this pick was PROPOSED with -- same audit-trail
+        # convention as execution/trading_loop.py::_log_decisions. Never
+        # approved, so nothing to enforce; recorded purely for the record.
+        "take_profit_pct": candidate.exit_levels.take_profit_pct if candidate.exit_levels else None,
+        "stop_loss_pct": candidate.exit_levels.stop_loss_pct if candidate.exit_levels else None,
     }
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
@@ -429,6 +434,11 @@ def _log_reactivation(
         "reasoning": json.dumps(full_reasoning),
         "direction_agreement": candidate.direction_agreement,
         "approval_status": approval_status,
+        # Audit-trail copy beside the enforced copy -- enforcement itself
+        # reads position_hold_state (execution/full_book_rebalance.py
+        # persists it there for this same candidate), not this column.
+        "take_profit_pct": candidate.exit_levels.take_profit_pct if candidate.exit_levels else None,
+        "stop_loss_pct": candidate.exit_levels.stop_loss_pct if candidate.exit_levels else None,
     }
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 

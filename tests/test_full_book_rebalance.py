@@ -6,6 +6,7 @@ import pytest
 from config.settings import settings
 from execution import full_book_rebalance as fbr
 from execution.approval_gate import ApprovalOutcome, number_proposals
+from execution.exit_levels import ExitLevels
 from models.screener import TradeCandidate
 
 
@@ -33,6 +34,19 @@ def _approve_all(proposals, *, context, **kwargs):
     return ApprovalOutcome(
         list(ordered), [], status="auto", statuses={p.index: "auto" for p in ordered}
     )
+
+
+def _approve_all_but_reject_closing(reject_symbols):
+    """Approves every open proposal, but rejects the close proposal for the given symbols (kept as-is)."""
+
+    def _fn(proposals, *, context, **kwargs):
+        ordered = number_proposals(list(proposals))
+        approved = [p for p in ordered if not (p.action == "close" and p.symbol in reject_symbols)]
+        rejected = [p for p in ordered if p.action == "close" and p.symbol in reject_symbols]
+        statuses = {p.index: ("rejected" if p in rejected else "auto") for p in ordered}
+        return ApprovalOutcome(approved, rejected, status="auto", statuses=statuses)
+
+    return _fn
 
 
 def _candidate(symbol, conviction):
@@ -296,3 +310,102 @@ def test_reactivation_pool_fast_path_is_skipped_in_diversified_mode(monkeypatch)
     fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
 
     assert any(symbol == "A" for symbol, _ in broker.targets)
+
+
+# ---------- hold-state persistence (exit levels / miss counters) ----------
+
+
+def test_reactivation_persists_the_new_positions_exit_levels(monkeypatch):
+    """
+    Regression test: a position opened via this path (the hourly
+    contradiction monitor's mid-week reactivation, for example) previously
+    never got its ATR/Donchian-derived take-profit/stop-loss recorded
+    anywhere -- the dashboard read "No take-profit/stop-loss recorded" and
+    execution/hold_rules.py's own stop/target check fell back to the
+    generic global thresholds instead of this position's own levels.
+    """
+    monkeypatch.setattr(settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(settings, "max_concentrated_position_pct", 0.70)
+    broker = _Broker({})
+
+    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 1.0)
+    monkeypatch.setattr(fbr, "load_active_universe", lambda: ["A"])
+    levels = ExitLevels(take_profit_pct=0.09, stop_loss_pct=0.045)
+    candidate = _candidate("A", 0.5)
+    candidate.exit_levels = levels
+    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: [candidate])
+    monkeypatch.setattr(fbr, "_latest_prices", lambda *a, **k: {"A": 100.0})
+    monkeypatch.setattr(fbr.hold_rules, "load_exit_levels", lambda engine: {})
+    monkeypatch.setattr(fbr.hold_rules, "load_missed_cycles", lambda engine: {})
+    stored = {}
+
+    def fake_store(engine, counts, levels_by_symbol=None):
+        stored["counts"] = dict(counts)
+        stored["levels"] = dict(levels_by_symbol or {})
+
+    monkeypatch.setattr(fbr.hold_rules, "store_missed_cycles", fake_store)
+
+    fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
+
+    assert stored["counts"] == {"A": 0}
+    assert stored["levels"]["A"] == levels
+
+
+def test_kept_position_carries_forward_its_prior_exit_levels_and_miss_count(monkeypatch):
+    """A position this rebalance doesn't touch must not lose its previously recorded levels/miss counter."""
+    monkeypatch.setattr(settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(settings, "max_concentrated_position_pct", 0.70)
+    monkeypatch.setattr(settings, "max_concentrated_positions", 3)
+    broker = _Broker({"OTHER": 100.0})
+
+    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 0.5)
+    monkeypatch.setattr(fbr, "load_active_universe", lambda: ["OTHER", "NEW"])
+    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: [_candidate("NEW", 0.5)])
+    monkeypatch.setattr(fbr, "_latest_prices", lambda *a, **k: {"OTHER": 100.0, "NEW": 100.0})
+    other_levels = ExitLevels(take_profit_pct=0.06, stop_loss_pct=0.03)
+    monkeypatch.setattr(fbr.hold_rules, "load_exit_levels", lambda engine: {"OTHER": other_levels})
+    monkeypatch.setattr(fbr.hold_rules, "load_missed_cycles", lambda engine: {"OTHER": 2})
+    stored = {}
+
+    def fake_store(engine, counts, levels_by_symbol=None):
+        stored["counts"] = dict(counts)
+        stored["levels"] = dict(levels_by_symbol or {})
+
+    monkeypatch.setattr(fbr.hold_rules, "store_missed_cycles", fake_store)
+
+    # OTHER isn't in the fresh candidate list, so it's proposed for closure
+    # (displacement) by default -- reject that close to simulate it being
+    # kept, same as a human declining a displacement they disagree with.
+    fbr.rebalance_after_exit(
+        broker, engine=object(), excluded_symbols=set(),
+        request_fn=_approve_all_but_reject_closing({"OTHER"}),
+    )
+
+    assert stored["levels"].get("OTHER") == other_levels
+    assert stored["counts"].get("OTHER") == 2
+
+
+def test_closed_position_is_dropped_from_hold_state(monkeypatch):
+    monkeypatch.setattr(settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(settings, "max_concentrated_position_pct", 0.70)
+    broker = _Broker({"DROP": 100.0})
+
+    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 0.5)
+    monkeypatch.setattr(fbr, "load_active_universe", lambda: ["DROP", "NEW"])
+    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: [_candidate("NEW", 0.5)])
+    monkeypatch.setattr(fbr, "_latest_prices", lambda *a, **k: {"DROP": 100.0, "NEW": 100.0})
+    drop_levels = ExitLevels(take_profit_pct=0.06, stop_loss_pct=0.03)
+    monkeypatch.setattr(fbr.hold_rules, "load_exit_levels", lambda engine: {"DROP": drop_levels})
+    monkeypatch.setattr(fbr.hold_rules, "load_missed_cycles", lambda engine: {"DROP": 1})
+    stored = {}
+
+    def fake_store(engine, counts, levels_by_symbol=None):
+        stored["counts"] = dict(counts)
+        stored["levels"] = dict(levels_by_symbol or {})
+
+    monkeypatch.setattr(fbr.hold_rules, "store_missed_cycles", fake_store)
+
+    fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
+
+    assert "DROP" not in stored["counts"]
+    assert "DROP" not in stored["levels"]
