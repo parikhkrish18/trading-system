@@ -75,6 +75,66 @@ def test_score_universe_confidence_is_only_the_cost_hurdle():
     assert not by_symbol.loc["MMM", "confident"]  # |return| 0.01 < 0.02
 
 
+def test_score_universe_atr_relative_floor_rejects_a_move_too_small_for_its_own_target():
+    """
+    A forecast can clear the cost hurdle yet still be far too small for the
+    take-profit it would be sized with (execution/exit_levels.py's own 2x
+    horizon-scaled-ATR floor) to have a realistic path -- this stock's own
+    ATR should raise its bar above the flat cost hurdle.
+    """
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])  # 1% move, clears the cost hurdle alone
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        atr_pct_by_symbol={"AAPL": 0.02}, horizon_days=5,
+    )
+
+    floor = settings.exit_take_profit_min_atr_mult * settings.screener_min_return_atr_fraction * 0.02 * math.sqrt(5)
+    assert floor > 0.01  # sanity: the ATR floor is indeed above this forecast
+    assert not result.set_index("symbol").loc["AAPL", "confident"]
+
+
+def test_score_universe_atr_relative_floor_accepts_a_move_that_clears_it():
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])  # 5% move
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        atr_pct_by_symbol={"AAPL": 0.02}, horizon_days=5,
+    )
+
+    floor = settings.exit_take_profit_min_atr_mult * settings.screener_min_return_atr_fraction * 0.02 * math.sqrt(5)
+    assert floor < 0.05
+    assert result.set_index("symbol").loc["AAPL", "confident"]
+
+
+def test_score_universe_atr_relative_floor_never_undercuts_the_cost_hurdle():
+    """A tiny ATR must not LOWER the bar below the round-trip cost floor."""
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.001], direction_agreement=[1.0])  # 0.1% move
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], min_abs_return=0.02,  # 2% cost hurdle, well above any tiny ATR floor
+        atr_pct_by_symbol={"AAPL": 0.0001}, horizon_days=5,
+    )
+
+    assert not result.set_index("symbol").loc["AAPL", "confident"]
+
+
+def test_score_universe_missing_atr_falls_back_to_the_cost_hurdle_alone():
+    """No ATR on record for this symbol (new listing, a data gap) -- bar 1 alone decides, same as before this bar existed."""
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        atr_pct_by_symbol={}, horizon_days=5,
+    )
+
+    assert result.set_index("symbol").loc["AAPL", "confident"]  # 1% clears the 0.02% cost hurdle, no ATR bar to also clear
+
+
 def test_conviction_score_is_the_size_of_the_move_alone():
     """
     Ranking used to be agreement x |move|, which mixed a noise term into

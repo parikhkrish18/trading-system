@@ -267,6 +267,18 @@ class Settings(BaseSettings):
     # target the stock has no history of reaching).
     exit_take_profit_min_atr_mult: float = Field(default=2.0, alias="EXIT_TAKE_PROFIT_MIN_ATR_MULT")
     exit_take_profit_max_atr_mult: float = Field(default=4.0, alias="EXIT_TAKE_PROFIT_MAX_ATR_MULT")
+    # models/screener.py's selection floor used to be JUST the round-trip
+    # cost floor (~0.02%) -- a predicted move barely bigger than trading
+    # costs could still get picked and sized for a take-profit at
+    # exit_take_profit_min_atr_mult x horizon-scaled ATR (2x by default),
+    # a target with no realistic path from a forecast that small. This
+    # requires the forecast to already be at least this FRACTION of that
+    # same 2x-ATR floor -- half of it by default, not the whole thing:
+    # take-profit is meant to be a ceiling the trade can run past its point
+    # forecast to reach, not a restatement of it. Still only applies when
+    # this stock's own ATR is available; the cost floor alone is the bar
+    # otherwise, same as before this existed.
+    screener_min_return_atr_fraction: float = Field(default=0.5, alias="SCREENER_MIN_RETURN_ATR_FRACTION")
     # Both take-profit AND stop-loss are additionally tightened toward the
     # nearest real Donchian support/resistance level within this many
     # trading days of history, when one sits closer than the ATR/sigma
