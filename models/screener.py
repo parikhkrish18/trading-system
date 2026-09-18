@@ -14,7 +14,7 @@ to the `decisions` table (mode="paper", executed_position left null).
 Wiring the output to execution/broker.py is a separate step.
 
 In concentrated mode, when ANTHROPIC_API_KEY is set, the pool that clears
-the gates above (score_universe's cost hurdle + Donchian gate,
+the gates above (score_universe's cost/ATR-floor hurdle,
 apply_macro_sector_block's hard block) gets a second pass: Claude Sonnet 5
 (models/llm_advisor.py) reasons over that pool's forecasts, top feature
 drivers, sector sentiment, and recent news, and returns its own confidence
@@ -1437,6 +1437,16 @@ def run_screen_with_scores(
         ensemble, latest, feature_cols, min_abs_return, raw_features=raw_latest,
         atr_pct_by_symbol=atr_pct_by_symbol, horizon_days=target_horizon_days,
     )
+    # Diagnostic, not a decision: a quiet cycle with a thin or empty
+    # shortlist otherwise gives no way to tell "the cost/ATR-floor bar
+    # itself found almost nothing today" from "it found plenty and a
+    # downstream filter (macro/sector block, ALLOW_SHORTS, correlation
+    # caps, the top-K/concentrated-slot cut) ate them" without reading the
+    # code -- this makes that visible from the logs alone on every run.
+    logger.info(
+        "score_universe: %d/%d symbol(s) cleared the cost/ATR-floor bar (before any downstream filter).",
+        int(scored["confident"].sum()) if not scored.empty else 0, len(scored),
+    )
 
     # Solidifies the ATR/sigma-derived bounds above against this stock's own
     # recent trading range across several timeframes at once (see
@@ -1465,7 +1475,14 @@ def run_screen_with_scores(
             macro_mkt_sentiment = float(mkt_values.iloc[0]) if not mkt_values.empty else None
         if "macro_sector_sentiment" in raw_latest.columns:
             macro_sector_sentiment_by_symbol = raw_latest.set_index("symbol")["macro_sector_sentiment"].to_dict()
+        before = int(scored["confident"].sum())
         scored = apply_macro_sector_block(scored, macro_mkt_sentiment, macro_sector_sentiment_by_symbol)
+        blocked = before - int(scored["confident"].sum())
+        if blocked:
+            logger.info(
+                "apply_macro_sector_block: %d candidate(s) blocked for fighting an aligned market+sector backdrop "
+                "(market=%s).", blocked, macro_mkt_sentiment,
+            )
 
     # Computed once, up front, so it can inform BOTH which candidates get
     # picked (the long/short ranking preference below, when configured) and
@@ -1503,8 +1520,8 @@ def run_screen_with_scores(
         )
 
         # Advisory Claude pass (models/llm_advisor.py): only ever consulted
-        # on the pool that already cleared score_universe's cost hurdle +
-        # Donchian gate, apply_macro_sector_block's hard block, and the
+        # on the pool that already cleared score_universe's cost/ATR-floor
+        # hurdle, apply_macro_sector_block's hard block, and the
         # same allow_shorts/shortability filtering select_concentrated_trades
         # applies below -- it can rank and pick among these, never around
         # them. Any failure (unset key, API error, unparseable response)
@@ -1690,6 +1707,10 @@ def run_screen_with_scores(
         candidates, vol_by_symbol, llm_exit_hints, atr_pct_by_symbol=atr_pct_by_symbol,
         support_distance_by_symbol=support_distance_by_symbol,
         resistance_distance_by_symbol=resistance_distance_by_symbol,
+    )
+    logger.info(
+        "run_screen: %d final candidate(s) (%s mode) from %d symbol(s) that cleared the cost/ATR-floor bar.",
+        len(candidates), settings.strategy_mode, int(scored["confident"].sum()) if not scored.empty else 0,
     )
     return ScreenResult(
         candidates=candidates,
