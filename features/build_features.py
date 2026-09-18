@@ -47,9 +47,11 @@ QUANT_FEATURES = {
     "meanrev_bollinger_pctb": lambda df: bollinger_pct_b(df["close"]),
     "meanrev_rsi_14": lambda df: rsi(df["close"], 14),
     # Where price sits in its own 20-day range (support/resistance), and
-    # whether today actually broke out of it -- see models/screener.py's
-    # score_universe for how the breakout flag also gates live "confident"
-    # trades, not just feeding the forecast model.
+    # whether today actually broke out of it -- see
+    # models/screener.py::_solidified_channel_distances for how the
+    # underlying support/resistance levels (across several timeframes, not
+    # just this 20-day one) solidify trade exits, not just feeding the
+    # forecast model.
     "donchian_pct_20": lambda df: donchian_pct(df["high"], df["low"], df["close"], 20),
     "donchian_breakout_20": lambda df: donchian_breakout(df["high"], df["low"], df["close"], 20),
     # Uptrend-with-a-pullback / downtrend-with-a-bounce continuation setup —
