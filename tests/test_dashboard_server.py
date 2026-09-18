@@ -451,6 +451,10 @@ def _fill(symbol, side, qty, price, filled_at):
     return {"symbol": symbol, "side": side, "qty": qty, "price": price, "filled_at": filled_at, "order_id": "x"}
 
 
+def _decision(id_, symbol, ts, executed_position, mode="paper"):
+    return {"id": id_, "symbol": symbol, "ts": pd.Timestamp(ts), "executed_position": executed_position, "mode": mode}
+
+
 class _FilledOrdersBroker:
     def __init__(self, fills):
         self._fills = fills
@@ -459,17 +463,141 @@ class _FilledOrdersBroker:
         return self._fills
 
 
+def _mock_closed_trades_sources(monkeypatch, decisions_rows, fills):
+    """
+    _load_closed_episodes reads decisions (WHICH round trips happened, per
+    monitoring.dashboard.server._decision_episode_boundaries) before ever
+    calling the broker (which FINALIZES the actual price/qty within a
+    window around each boundary) -- both need mocking for /api/trades/closed.
+    """
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(decisions_rows))
+    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
+
+
+# ---------- _reconstruct_symbol_episodes: pure fill-level reconstruction ----------
+# (unit-level, independent of the decision-boundary anchoring the endpoint
+# layers on top -- see the /api/trades/closed tests below for that.)
+
+
+def test_reconstruct_symbol_episodes_resize_blends_into_a_weighted_average():
+    """Adding to a position mid-episode must blend into the weighted entry, not just use the first fill's price."""
+    fills = pd.DataFrame(
+        [
+            _fill("AAPL", "buy", 10.0, 100.0, pd.Timestamp("2026-07-01T00:00:00Z")),
+            _fill("AAPL", "buy", 10.0, 120.0, pd.Timestamp("2026-07-02T00:00:00Z")),  # weighted entry now 110.0
+            _fill("AAPL", "sell", 20.0, 130.0, pd.Timestamp("2026-07-08T00:00:00Z")),
+        ]
+    )
+    episodes = server._reconstruct_symbol_episodes(fills)
+    assert len(episodes) == 1
+    ep = episodes[0]
+    assert ep["shares"] == 20.0
+    assert ep["entry_price"] == pytest.approx(110.0)
+    assert ep["realized_pnl"] == pytest.approx((130.0 - 110.0) * 20.0)
+
+
+def test_reconstruct_symbol_episodes_flip_through_flat_closes_one_and_opens_another():
+    """A single sell that closes a long AND opens a short must end one episode and start a fresh one, not merge them."""
+    fills = pd.DataFrame(
+        [
+            _fill("AAPL", "buy", 10.0, 100.0, pd.Timestamp("2026-07-01T00:00:00Z")),  # long 10
+            _fill("AAPL", "sell", 25.0, 110.0, pd.Timestamp("2026-07-08T00:00:00Z")),  # closes the long, opens a short of 15
+            _fill("AAPL", "buy", 15.0, 105.0, pd.Timestamp("2026-07-15T00:00:00Z")),  # covers the short
+        ]
+    )
+    episodes = sorted(server._reconstruct_symbol_episodes(fills), key=lambda e: e["entry_ts"])
+    assert len(episodes) == 2
+    long_leg, short_leg = episodes
+    assert long_leg["side"] == "long"
+    assert long_leg["shares"] == 10.0
+    assert long_leg["realized_pnl"] == pytest.approx((110.0 - 100.0) * 10.0)
+    assert short_leg["side"] == "short"
+    assert short_leg["shares"] == -15.0
+    assert short_leg["entry_price"] == pytest.approx(110.0)
+    assert short_leg["realized_pnl"] == pytest.approx((110.0 - 105.0) * 15.0)
+
+
+# ---------- _decision_episode_boundaries: which round trips happened, per the algo's own decisions ----------
+
+
+def test_decision_episode_boundaries_pairs_entry_and_close(monkeypatch):
+    decisions = [
+        _decision(1, "AAPL", "2026-07-01T00:00:00Z", 10.0),
+        _decision(2, "AAPL", "2026-07-08T00:00:00Z", 0.0),
+    ]
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(decisions))
+
+    boundaries = server._decision_episode_boundaries(engine=None)
+
+    assert len(boundaries) == 1
+    assert boundaries[0]["symbol"] == "AAPL"
+    assert boundaries[0]["entry_id"] == 1
+    assert boundaries[0]["close_id"] == 2
+
+
+def test_decision_episode_boundaries_keeps_a_resize_under_the_original_entry(monkeypatch):
+    decisions = [
+        _decision(1, "AAPL", "2026-07-01T00:00:00Z", 10.0),
+        _decision(2, "AAPL", "2026-07-02T00:00:00Z", 20.0),  # resize -- not a new boundary
+        _decision(3, "AAPL", "2026-07-08T00:00:00Z", 0.0),
+    ]
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(decisions))
+
+    boundaries = server._decision_episode_boundaries(engine=None)
+
+    assert len(boundaries) == 1
+    assert boundaries[0]["entry_id"] == 1
+    assert boundaries[0]["close_id"] == 3
+
+
+def test_decision_episode_boundaries_keeps_symbols_independent(monkeypatch):
+    decisions = [
+        _decision(1, "AAPL", "2026-07-01T00:00:00Z", 10.0),
+        _decision(2, "AAPL", "2026-07-08T00:00:00Z", 0.0),
+        _decision(3, "MSFT", "2026-07-01T00:00:00Z", -5.0),
+        _decision(4, "MSFT", "2026-07-05T00:00:00Z", 0.0),
+    ]
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(decisions))
+
+    boundaries = server._decision_episode_boundaries(engine=None)
+
+    assert {(b["symbol"], b["entry_id"], b["close_id"]) for b in boundaries} == {
+        ("AAPL", 1, 2),
+        ("MSFT", 3, 4),
+    }
+
+
+def test_decision_episode_boundaries_still_open_position_has_no_boundary(monkeypatch):
+    decisions = [_decision(1, "AAPL", "2026-07-01T00:00:00Z", 10.0)]
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(decisions))
+
+    assert server._decision_episode_boundaries(engine=None) == []
+
+
+def test_decision_episode_boundaries_no_decisions_returns_empty(monkeypatch):
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame())
+    assert server._decision_episode_boundaries(engine=None) == []
+
+
+# ---------- /api/trades/closed: decision-anchored, Alpaca-finalized ----------
+
+
 def test_closed_trades_reconstructs_a_round_trip(monkeypatch, client):
     """
     Regression test: entry/exit must come from Alpaca's own fill price/qty,
     not an approximation -- a market order can fill well off the prior
     day's daily close this used to read instead.
     """
+    decisions = [
+        _decision(1, "AAPL", "2026-07-01T00:00:00Z", 10.0),
+        _decision(2, "AAPL", "2026-07-08T00:00:00Z", 0.0),
+    ]
     fills = [
         _fill("AAPL", "buy", 10.0, 100.0, "2026-07-01T00:00:00Z"),
         _fill("AAPL", "sell", 10.0, 110.0, "2026-07-08T00:00:00Z"),
     ]
-    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
+    _mock_closed_trades_sources(monkeypatch, decisions, fills)
 
     resp = client.get("/api/trades/closed")
     assert resp.status_code == 200
@@ -485,11 +613,15 @@ def test_closed_trades_reconstructs_a_round_trip(monkeypatch, client):
 
 
 def test_closed_trades_computes_short_pnl_correctly(monkeypatch, client):
+    decisions = [
+        _decision(1, "IBM", "2026-07-01T00:00:00Z", -10.0),
+        _decision(2, "IBM", "2026-07-08T00:00:00Z", 0.0),
+    ]
     fills = [
         _fill("IBM", "sell", 10.0, 100.0, "2026-07-01T00:00:00Z"),  # short open
         _fill("IBM", "buy", 10.0, 90.0, "2026-07-08T00:00:00Z"),  # short cover
     ]
-    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
+    _mock_closed_trades_sources(monkeypatch, decisions, fills)
 
     resp = client.get("/api/trades/closed")
     trade = resp.json()[0]
@@ -497,59 +629,63 @@ def test_closed_trades_computes_short_pnl_correctly(monkeypatch, client):
     assert trade["realized_pnl"] == pytest.approx(100.0)  # price dropped $10, short profits
 
 
-def test_closed_trades_no_fills_returns_empty(monkeypatch, client):
-    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker([]))
+def test_closed_trades_no_decisions_returns_empty(monkeypatch, client):
+    """No round trip in the algo's own record at all -- nothing to ask Alpaca to verify."""
+    _mock_closed_trades_sources(monkeypatch, decisions_rows=[], fills=[])
+
+    resp = client.get("/api/trades/closed")
+    assert resp.json() == []
+
+
+def test_closed_trades_no_matching_fills_are_skipped_not_fabricated(monkeypatch, client):
+    """A decision-round-trip the algo logged, but nothing from Alpaca confirms it -- do not invent numbers."""
+    decisions = [
+        _decision(1, "AAPL", "2026-07-01T00:00:00Z", 10.0),
+        _decision(2, "AAPL", "2026-07-08T00:00:00Z", 0.0),
+    ]
+    _mock_closed_trades_sources(monkeypatch, decisions, fills=[])
 
     resp = client.get("/api/trades/closed")
     assert resp.json() == []
 
 
 def test_closed_trades_still_open_position_is_not_a_trade(monkeypatch, client):
+    decisions = [_decision(1, "AAPL", "2026-07-01T00:00:00Z", 10.0)]  # no close decision yet
     fills = [_fill("AAPL", "buy", 10.0, 100.0, "2026-07-01T00:00:00Z")]
-    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
+    _mock_closed_trades_sources(monkeypatch, decisions, fills)
 
     resp = client.get("/api/trades/closed")
     assert resp.json() == []
 
 
-def test_closed_trades_resize_blends_into_a_weighted_average(monkeypatch, client):
-    """Adding to a position mid-episode must blend into the weighted entry, not just use the first fill's price."""
-    fills = [
-        _fill("AAPL", "buy", 10.0, 100.0, "2026-07-01T00:00:00Z"),
-        _fill("AAPL", "buy", 10.0, 120.0, "2026-07-02T00:00:00Z"),  # resize: weighted entry now 110.0
-        _fill("AAPL", "sell", 20.0, 130.0, "2026-07-08T00:00:00Z"),
+def test_closed_trades_ignores_a_stale_unrelated_fill_outside_the_match_window(monkeypatch, client):
+    """
+    Regression test: a blind, unscoped walk across Alpaca's entire order
+    history risked pairing a real round trip's exit against a stale,
+    unrelated fill for the same symbol from a completely different period
+    (a prior test run, a corrected mistake) just because it came next
+    chronologically. Anchoring to the decisions table's own timestamps and
+    only matching fills within _FILL_MATCH_WINDOW rules that out.
+    """
+    decisions = [
+        _decision(1, "WDC", "2026-07-31T20:34:16Z", -46.0),
+        _decision(2, "WDC", "2026-08-08T00:17:54Z", 0.0),
     ]
-    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
+    fills = [
+        # A stale, unrelated fill months earlier at an implausible price --
+        # must never be pulled into this round trip's reconstruction.
+        _fill("WDC", "sell", 46.0, 551.20, "2026-01-01T00:00:00Z"),
+        _fill("WDC", "sell", 46.0, 60.10, "2026-07-31T20:34:17Z"),
+        _fill("WDC", "buy", 46.0, 55.30, "2026-08-08T00:17:55Z"),
+    ]
+    _mock_closed_trades_sources(monkeypatch, decisions, fills)
 
     resp = client.get("/api/trades/closed")
     body = resp.json()
     assert len(body) == 1
     trade = body[0]
-    assert trade["shares"] == 20.0
-    assert trade["entry_price"] == pytest.approx(110.0)
-    assert trade["realized_pnl"] == pytest.approx((130.0 - 110.0) * 20.0)
-
-
-def test_closed_trades_flip_through_flat_closes_one_episode_and_opens_another(monkeypatch, client):
-    """A single sell that closes a long AND opens a short must end one episode and start a fresh one, not merge them."""
-    fills = [
-        _fill("AAPL", "buy", 10.0, 100.0, "2026-07-01T00:00:00Z"),  # long 10
-        _fill("AAPL", "sell", 25.0, 110.0, "2026-07-08T00:00:00Z"),  # closes the long, opens a short of 15
-        _fill("AAPL", "buy", 15.0, 105.0, "2026-07-15T00:00:00Z"),  # covers the short
-    ]
-    monkeypatch.setattr(server, "get_broker", lambda: _FilledOrdersBroker(fills))
-
-    resp = client.get("/api/trades/closed")
-    body = sorted(resp.json(), key=lambda t: t["entry_ts"])
-    assert len(body) == 2
-    long_leg, short_leg = body
-    assert long_leg["side"] == "long"
-    assert long_leg["shares"] == 10.0
-    assert long_leg["realized_pnl"] == pytest.approx((110.0 - 100.0) * 10.0)
-    assert short_leg["side"] == "short"
-    assert short_leg["shares"] == -15.0
-    assert short_leg["entry_price"] == pytest.approx(110.0)
-    assert short_leg["realized_pnl"] == pytest.approx((110.0 - 105.0) * 15.0)
+    assert trade["entry_price"] == pytest.approx(60.10)
+    assert trade["exit_price"] == pytest.approx(55.30)
 
 
 def test_closed_trades_broker_without_fill_history_returns_empty(monkeypatch, client):
@@ -558,6 +694,12 @@ def test_closed_trades_broker_without_fill_history_returns_empty(monkeypatch, cl
     class _NoFillHistoryBroker:
         pass
 
+    decisions = [
+        _decision(1, "AAPL", "2026-07-01T00:00:00Z", 10.0),
+        _decision(2, "AAPL", "2026-07-08T00:00:00Z", 0.0),
+    ]
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: pd.DataFrame(decisions))
     monkeypatch.setattr(server, "get_broker", lambda: _NoFillHistoryBroker())
 
     resp = client.get("/api/trades/closed")
@@ -615,7 +757,7 @@ def test_trade_log_endpoint_returns_graded_rows_with_direction(monkeypatch, clie
     prices = pd.DataFrame(
         {"symbol": ["AAPL", "AAPL"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]), "close": [100.0, 105.0]}
     )
-    calls = iter([decisions, prices])
+    calls = iter([decisions, prices, decisions])
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
@@ -654,7 +796,7 @@ def test_trade_log_endpoint_extracts_signal_to_noise_from_reasoning(monkeypatch,
     prices = pd.DataFrame(
         {"symbol": ["AAPL", "AAPL"], "ts": pd.to_datetime(["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]), "close": [100.0, 105.0]}
     )
-    calls = iter([decisions, prices])
+    calls = iter([decisions, prices, decisions])
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
@@ -675,7 +817,7 @@ def test_trade_log_endpoint_includes_a_close_as_its_own_row(monkeypatch, client)
         ]
     )
     prices = pd.DataFrame(columns=["symbol", "ts", "close"])
-    calls = iter([decisions, prices])
+    calls = iter([decisions, prices, decisions])
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
@@ -711,7 +853,11 @@ def test_trade_log_endpoint_consolidates_a_linked_open_and_close_into_one_row(mo
         ]
     )
     prices = pd.DataFrame(columns=["symbol", "ts", "close"])
-    calls = iter([decisions, prices])
+    # Read three times: the trade-log listing's own decisions query, prices
+    # for grade_outcomes, then _decision_episode_boundaries' own decisions
+    # query (inside _load_closed_episodes) -- the same underlying table,
+    # queried again for a different shape/order, same as production.
+    calls = iter([decisions, prices, decisions])
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
@@ -751,7 +897,7 @@ def test_trade_log_endpoint_paginates(monkeypatch, client):
     ]
     decisions = pd.DataFrame(rows)
     prices = pd.DataFrame(columns=["symbol", "ts", "close"])
-    calls = iter([decisions, prices])
+    calls = iter([decisions, prices, decisions])
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 

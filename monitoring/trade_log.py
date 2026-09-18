@@ -77,13 +77,13 @@ def attach_actual_outcomes(trades: pd.DataFrame, episodes: list[dict], open_symb
     decision to mature at all, a completely different question from
     whether the position itself has actually closed).
 
-    `episodes`: closed round-trips reconstructed from Alpaca's own fill
-    history (monitoring.dashboard.server._load_closed_episodes) -- symbol,
-    entry_ts, exit_ts, realized_pnl_pct. Matched to a (entry decision,
-    close decision) pair per symbol in ts order: both this system's
-    decisions and Alpaca's fills are chronological for the same symbol, so
-    a straightforward FIFO pairing per symbol is enough for this system's
-    normal operation (one clean open, one clean close per round trip).
+    `episodes`: closed round-trips, each carrying the decisions.id of the
+    entry/close decision that produced it (entry_id/close_id) alongside
+    the Alpaca-finalized realized_pnl_pct (see
+    monitoring.dashboard.server._load_closed_episodes -- decisions
+    identify WHICH trades happened, Alpaca's own fills finalize the actual
+    numbers). Matched here by entry_id, exactly, not by guessing position
+    in a per-symbol list.
 
     `open_symbols`: symbols with a nonzero broker position right now -- an
     entry decision with no closing decision (yet) reads "open" when its
@@ -98,18 +98,13 @@ def attach_actual_outcomes(trades: pd.DataFrame, episodes: list[dict], open_symb
     if trades.empty:
         return trades.assign(actual_outcome=pd.Series(dtype="object"), actual_realized_return=pd.Series(dtype="float64"))
 
-    episodes_by_symbol: dict[str, list[dict]] = {}
-    for ep in episodes:
-        episodes_by_symbol.setdefault(ep["symbol"], []).append(ep)
-    for eps in episodes_by_symbol.values():
-        eps.sort(key=lambda e: e["entry_ts"])
+    episode_by_entry_id = {ep["entry_id"]: ep for ep in episodes if "entry_id" in ep}
 
     drop_ids: set = set()
     outcome_by_id: dict = {}
     realized_by_id: dict = {}
 
     for symbol, group in trades.groupby("symbol", sort=False):
-        remaining = list(episodes_by_symbol.get(symbol, []))
         entry_id = None
         for _, row in group.sort_values("ts").iterrows():
             executed = row["executed_position"]
@@ -122,12 +117,10 @@ def attach_actual_outcomes(trades: pd.DataFrame, episodes: list[dict], open_symb
                     outcome_by_id[row_id] = "open" if symbol in open_symbols else "pending"
                 continue
             if executed == 0:
-                if remaining:
-                    ep = remaining.pop(0)
-                    outcome_by_id[entry_id] = "closed"
+                ep = episode_by_entry_id.get(entry_id)
+                outcome_by_id[entry_id] = "closed"
+                if ep is not None:
                     realized_by_id[entry_id] = ep["realized_pnl_pct"]
-                else:
-                    outcome_by_id[entry_id] = "closed"
                 drop_ids.add(row_id)
                 entry_id = None
             else:
