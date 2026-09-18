@@ -1028,6 +1028,18 @@ const FEATURE_INFO = {
   mom_ret_5d: { label: "5-day return", group: "Price & Trend", fmt: (v) => fmt.pct(v, 2), signal: signBySign() },
   mom_ret_20d: { label: "20-day return", group: "Price & Trend", fmt: (v) => fmt.pct(v, 2), signal: signBySign() },
   adx_14: { label: "Trend strength (ADX-14)", group: "Price & Trend", fmt: (v) => fmt.num(v, 1), signal: alwaysNeutral },
+  // Where in its own 20-day range price is sitting -- genuinely ambiguous
+  // on its own (near the high could mean strength or overhead resistance),
+  // same reasoning the fundamentals section below uses to stay neutral on
+  // a level the glossary itself says can't support a bullish/bearish read
+  // alone -- so this stays neutral rather than asserting one.
+  donchian_pct_20: { label: "20-day range position", group: "Price & Trend", fmt: (v) => fmt.num(v, 2), signal: alwaysNeutral },
+  // Unlike the range position above, this IS a directional event: a
+  // genuine fresh 20-day high/low today, so it gets the same sign-based
+  // green/red read as everywhere else a +1/-1/0 already means bullish/
+  // bearish/neither (see signBySign()).
+  donchian_breakout_20: { label: "20-day breakout", group: "Price & Trend", fmt: (v) => fmt.num(v, 0), signal: signBySign() },
+  mom_pullback_20_5: { label: "Trend pullback score", group: "Price & Trend", fmt: (v) => fmt.num(v, 2), signal: signBySign() },
   vol_realized_20d: { label: "Realized volatility (20d, annualized)", group: "Volatility", fmt: (v) => fmt.pct(v, 1), signal: alwaysNeutral },
   vol_atr_14: { label: "Average daily range (ATR-14)", group: "Volatility", fmt: (v) => fmt.money(v), signal: alwaysNeutral },
   vol_of_vol: { label: "Vol-of-vol (10d ÷ 60d)", group: "Volatility", fmt: (v) => fmt.num(v, 2), signal: alwaysNeutral },
