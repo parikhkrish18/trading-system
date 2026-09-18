@@ -8,6 +8,7 @@ from config.settings import settings
 from execution.exit_levels import exit_levels_for
 from models.regime.trend_chop_classifier import TREND
 from models.screener import (
+    _DONCHIAN_SOLIDIFICATION_WINDOWS,
     _SIGNAL_TO_NOISE_CAP,
     ScreenResult,
     TradeCandidate,
@@ -15,6 +16,7 @@ from models.screener import (
     _attach_reasoning,
     _bounded_conviction_weights,
     _channel_distances,
+    _solidified_channel_distances,
     apply_macro_sector_block,
     apply_short_preference,
     apply_trend_pullback_boost,
@@ -187,11 +189,7 @@ def test_score_universe_signal_to_noise_passes_through_uncapped_values():
 
 
 def test_score_universe_without_a_breakout_column_falls_back_to_cost_hurdle_only():
-    """
-    A feature set built before donchian_breakout_20 existed has no such
-    column at all -- must behave exactly as before, not treat "column
-    missing" as "no breakout, always fail the bar".
-    """
+    """A feature set built before donchian_breakout_20 existed has no such column at all."""
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
 
@@ -200,40 +198,47 @@ def test_score_universe_without_a_breakout_column_falls_back_to_cost_hurdle_only
     assert result.set_index("symbol").loc["AAPL", "confident"]
 
 
-def test_score_universe_requires_the_breakout_to_agree_with_the_prediction():
-    latest = pd.DataFrame({"symbol": ["AAPL", "MSFT"], "f1": [0.1, 0.2]})
-    ensemble = _FakeEnsemble(mean_prediction=[0.05, 0.05], direction_agreement=[1.0, 1.0])
-    # AAPL predicted UP and actually broke out to a new high (+1) -- aligned.
-    # MSFT predicted UP but broke DOWN to a new low (-1) -- not aligned.
-    raw = pd.DataFrame({"symbol": ["AAPL", "MSFT"], "donchian_breakout_20": [1.0, -1.0]})
+def test_score_universe_breakout_no_longer_gates_confidence():
+    """
+    donchian_breakout_20 is still computed and returned, but it no longer
+    decides `confident` -- see score_universe's own docstring for why the
+    earlier hard AND-gate (a bullish call required an actual fresh 20-day
+    high the same day) was removed: that coincidence is rare enough that
+    it could zero out the entire universe's candidate pool. A predicted
+    move that clears the cost/ATR bar is confident whether today's
+    breakout agrees, disagrees, or didn't happen at all.
+    """
+    latest = pd.DataFrame({"symbol": ["AAPL", "MSFT", "GOOG"], "f1": [0.1, 0.2, 0.3]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05, 0.05, 0.05], direction_agreement=[1.0, 1.0, 1.0])
+    # AAPL: breakout agrees (+1, predicted up). MSFT: breakout disagrees
+    # (-1, predicted up). GOOG: no breakout at all today (0). All three
+    # clear the cost hurdle and must all be confident.
+    raw = pd.DataFrame({"symbol": ["AAPL", "MSFT", "GOOG"], "donchian_breakout_20": [1.0, -1.0, 0.0]})
 
     result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02, raw_features=raw)
 
     by_symbol = result.set_index("symbol")
     assert by_symbol.loc["AAPL", "confident"]
-    assert not by_symbol.loc["MSFT", "confident"]
-
-
-def test_score_universe_no_breakout_at_all_todays_is_not_confident():
-    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
-    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
-    raw = pd.DataFrame({"symbol": ["AAPL"], "donchian_breakout_20": [0.0]})
-
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02, raw_features=raw)
-
-    assert not result.set_index("symbol").loc["AAPL", "confident"]
+    assert by_symbol.loc["MSFT", "confident"]
+    assert by_symbol.loc["GOOG", "confident"]
+    # Still read from raw_features (unaffected by this change) -- see
+    # test_score_universe_reads_the_raw_breakout_not_the_zscored_one's
+    # replacement below for the z-scoring case.
+    assert by_symbol.loc["AAPL", "donchian_breakout_20"] == 1.0
+    assert by_symbol.loc["MSFT", "donchian_breakout_20"] == -1.0
 
 
 def test_score_universe_reads_the_raw_breakout_not_the_zscored_one():
     """
     In relative mode `latest_features` is cross-sectionally z-scored (see
-    load_latest_features) -- a stock with NO real breakout could still
-    z-score positive on a day most of the universe broke out. raw_features
-    (run_screen_with_scores' unscaled raw_latest) must be what actually
-    decides this, not whatever ends up in latest_features.
+    load_latest_features) -- donchian_breakout_20 must still come from
+    raw_features (run_screen_with_scores' unscaled raw_latest), the actual
+    un-relativized signal, not whatever ends up in latest_features. This
+    no longer affects `confident` (see the test above), but the returned
+    donchian_breakout_20 column is still real, reusable evidence (e.g. for
+    the LLM advisory payload) and must not silently be the wrong number.
     """
-    # latest_features' own donchian_breakout_20 column (already z-scored,
-    # would misleadingly read as "aligned" if it were consulted) --
+    # latest_features' own donchian_breakout_20 column (already z-scored) --
     # deliberately the OPPOSITE of the true raw signal below.
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1], "donchian_breakout_20": [1.0]})
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
@@ -241,8 +246,7 @@ def test_score_universe_reads_the_raw_breakout_not_the_zscored_one():
 
     result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02, raw_features=raw)
 
-    # predicted +0.05 (up) vs raw breakout -1 (down) -- must NOT be confident.
-    assert not result.set_index("symbol").loc["AAPL", "confident"]
+    assert result.set_index("symbol").loc["AAPL", "donchian_breakout_20"] == -1.0
 
 
 class TestApplyMacroSectorBlock:
@@ -1321,6 +1325,77 @@ def test_channel_distances_with_no_channel_data_is_none_none():
 
 def test_channel_distances_with_no_price_is_none_none():
     assert _channel_distances(None, (90.0, 120.0)) == (None, None)
+
+
+# --------------------------------------------------------------------------
+# _solidified_channel_distances: the largest in-play window wins per side
+# --------------------------------------------------------------------------
+
+
+def test_solidified_channel_distances_prefers_the_largest_window_in_play(monkeypatch):
+    """
+    Both the 200-day and 20-day windows have a usable, in-play resistance
+    -- the 200-day one must win despite the 20-day call coming later and
+    being individually closer, since a wider, longer-tested level is
+    treated as more solid.
+    """
+    import models.screener as scr
+
+    # 200/100/50-day resistance all far overhead (120); the 20-day
+    # resistance is much closer (105) -- the 200-day evidence must still
+    # win despite being checked before the individually-closer 20-day one.
+    monkeypatch.setattr(
+        scr, "donchian_channel_levels",
+        lambda syms, window=None: {"AAPL": {200: (80.0, 120.0), 100: (80.0, 120.0), 50: (80.0, 120.0), 20: (95.0, 105.0)}[window]},
+    )
+
+    support, resistance = _solidified_channel_distances(["AAPL"], {"AAPL": 100.0})
+
+    assert resistance["AAPL"] == pytest.approx(0.20)  # (120-100)/100, the 200-day level
+    assert support["AAPL"] == pytest.approx(0.20)  # (100-80)/100, the 200-day level
+
+
+def test_solidified_channel_distances_falls_through_when_the_larger_window_has_no_data(monkeypatch):
+    """A symbol too new for the 200/100/50-day windows still resolves against the 20-day one."""
+    import models.screener as scr
+
+    def fake_levels(symbols, window=None):
+        return {"NEWCO": (95.0, 105.0)} if window == 20 else {}
+
+    monkeypatch.setattr(scr, "donchian_channel_levels", fake_levels)
+
+    support, resistance = _solidified_channel_distances(["NEWCO"], {"NEWCO": 100.0})
+
+    assert support["NEWCO"] == pytest.approx(0.05)
+    assert resistance["NEWCO"] == pytest.approx(0.05)
+
+
+def test_solidified_channel_distances_resolves_each_side_to_a_different_window(monkeypatch):
+    """
+    Price has already cleared the 200-day resistance (no room left there)
+    but is still under its 200-day support's ceiling -- resistance must
+    fall through to a smaller window while support stays anchored to the
+    200-day one, since the two sides are genuinely independent evidence.
+    """
+    import models.screener as scr
+
+    def fake_levels(symbols, window=None):
+        if window == 200:
+            return {"AAPL": (80.0, 100.0)}  # price (110) already past this resistance
+        if window == 20:
+            return {"AAPL": (95.0, 115.0)}
+        return {}
+
+    monkeypatch.setattr(scr, "donchian_channel_levels", fake_levels)
+
+    support, resistance = _solidified_channel_distances(["AAPL"], {"AAPL": 110.0})
+
+    assert support["AAPL"] == pytest.approx((110.0 - 80.0) / 110.0)  # 200-day support
+    assert resistance["AAPL"] == pytest.approx((115.0 - 110.0) / 110.0)  # falls through to 20-day
+
+
+def test_solidified_channel_distances_windows_checked_largest_first():
+    assert _DONCHIAN_SOLIDIFICATION_WINDOWS == (200, 100, 50, 20)
 
 
 def test_run_screen_computes_atr_pct_from_vol_atr_14_and_close(monkeypatch):

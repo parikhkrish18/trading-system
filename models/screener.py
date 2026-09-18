@@ -158,7 +158,7 @@ def score_universe(
     Returns: symbol, predicted_return, direction_agreement, conviction_score,
     donchian_breakout_20, trend_pullback_score, confident.
 
-    Three bars decide "confident":
+    Two bars decide "confident":
 
     1. The predicted move must be bigger than what the round trip costs (a
        prediction smaller than the cost of acting on it is a guaranteed
@@ -170,13 +170,19 @@ def score_universe(
        to that stock's own volatility that the take-profit it gets sized
        with (2x-4x ATR) has no realistic path from where the model actually
        thinks it's going. Missing ATR for a symbol falls back to bar 1 alone.
-    3. When donchian_breakout_20 is present in the data, price must actually
-       be breaking a real 20-day high/low in the SAME direction as the
-       prediction: a bullish call needs a fresh 20-day high, a bearish one a
-       fresh 20-day low. A feature set built before this feature existed (no
-       donchian_breakout_20 column at all) falls back to bars 1-2 alone —
-       each of these is a stricter bar layered on top, never a replacement
-       that could silently break an older feature set.
+
+    donchian_breakout_20 is computed and returned (still read from
+    `raw_features` when given, see below) but no longer gates `confident` --
+    it was tried as a hard AND-gate (a bullish call required an actual fresh
+    20-day high the same day, a bearish one a fresh 20-day low), and that
+    coincidence is rare enough on any given day that it could zero out the
+    entire universe's candidate pool -- not what a confidence bar should
+    ever do over one narrow price-action condition. Donchian's real job in
+    this system is on the exit side instead: solidifying take-profit/
+    stop-loss toward genuine support/resistance (see
+    execution/exit_levels.py and _solidified_channel_distances below) -- a
+    reliable anchor for WHERE to get out, never a hard rule for WHETHER to
+    get in at all.
 
     `raw_features`: donchian_breakout_20 is read from here when given,
     falling back to latest_features otherwise. In TARGET_MODE=relative,
@@ -189,15 +195,13 @@ def score_universe(
     to `latest_features` by symbol, not row position, since the two may come
     from separate load_latest_features calls.
 
-    There used to be a second bar here — at least 80% of the ensemble
-    agreeing on direction — and it was measured to carry no information.
-    The members are near-clones, so ~96% of predictions passed it, accuracy
-    on the rows it called "confident" matched accuracy overall, and making
-    the members structurally diverse did not change that. A filter that
-    admits almost everything and predicts nothing is not a safeguard; it is
-    a number that makes a system look more careful than it is. The
-    Donchian bar above replaces it with an actual price-action condition
-    instead of a model-internal number that didn't predict being right.
+    There used to be a bar here checking at least 80% of the ensemble
+    agreeing on direction, and it was measured to carry no information. The
+    members are near-clones, so ~96% of predictions passed it, accuracy on
+    the rows it called "confident" matched accuracy overall, and making the
+    members structurally diverse did not change that. A filter that admits
+    almost everything and predicts nothing is not a safeguard; it is a
+    number that makes a system look more careful than it is.
 
     direction_agreement is still computed and recorded, because it is
     evidence about the ensemble worth keeping. It plays no part in
@@ -271,10 +275,7 @@ def score_universe(
     )
     effective_min_return = np.where(has_atr, np.maximum(min_abs_return, atr_floor), min_abs_return)
 
-    breakout_aligned = (
-        np.sign(result["predicted_return"]) == result["donchian_breakout_20"] if has_breakout_signal else True
-    )
-    result["confident"] = (result["predicted_return"].abs() >= effective_min_return) & breakout_aligned
+    result["confident"] = result["predicted_return"].abs() >= effective_min_return
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
 
@@ -1165,6 +1166,51 @@ def _channel_distances(
     )
 
 
+# Checked largest-first: the wider a stock's real trading range, the more
+# that level has actually been tested and held, so a 200-day support/
+# resistance is real, tested evidence in a way a 20-day one, which any
+# ordinary pullback can print, is not. settings.donchian_exit_window (20)
+# is always included so a symbol too new for the larger windows still gets
+# *some* channel, matching this system's behavior before the larger
+# windows existed.
+_DONCHIAN_SOLIDIFICATION_WINDOWS = (200, 100, 50, 20)
+
+
+def _solidified_channel_distances(
+    symbols: list[str], price_by_symbol: dict[str, float]
+) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    (support_distance_by_symbol, resistance_distance_by_symbol), each side
+    resolved independently across _DONCHIAN_SOLIDIFICATION_WINDOWS: for a
+    given symbol, the largest window whose level is still "in play" (price
+    hasn't already cleared it -- see _channel_distances) wins that side,
+    falling through to progressively smaller windows only when a larger
+    one has no usable level (too little history yet, or price already
+    through it). The two sides can end up anchored to different windows --
+    e.g. a 200-day resistance still overhead but a 20-day support already
+    broken -- since each is genuinely independent evidence.
+
+    Reuses donchian_channel_levels/_channel_distances exactly as they
+    already work for a single window; this just calls that pair once per
+    window, largest first, narrowing to symbols still missing a resolved
+    side each time.
+    """
+    support_distance_by_symbol: dict[str, float] = {}
+    resistance_distance_by_symbol: dict[str, float] = {}
+    for window in _DONCHIAN_SOLIDIFICATION_WINDOWS:
+        pending = [s for s in symbols if s not in support_distance_by_symbol or s not in resistance_distance_by_symbol]
+        if not pending:
+            break
+        levels = donchian_channel_levels(pending, window=window)
+        for symbol in pending:
+            support_distance, resistance_distance = _channel_distances(price_by_symbol.get(symbol), levels.get(symbol))
+            if symbol not in support_distance_by_symbol and support_distance is not None:
+                support_distance_by_symbol[symbol] = support_distance
+            if symbol not in resistance_distance_by_symbol and resistance_distance is not None:
+                resistance_distance_by_symbol[symbol] = resistance_distance
+    return support_distance_by_symbol, resistance_distance_by_symbol
+
+
 def attach_exit_levels(
     candidates: list[TradeCandidate],
     vol_by_symbol: dict[str, float],
@@ -1393,20 +1439,23 @@ def run_screen_with_scores(
     )
 
     # Solidifies the ATR/sigma-derived bounds above against this stock's own
-    # recent trading range (settings.donchian_exit_window) -- take-profit
-    # and stop-loss are tightened toward real support/resistance when one
-    # sits closer than the ATR/sigma bound alone would allow (see
+    # recent trading range across several timeframes at once (see
+    # _solidified_channel_distances) -- take-profit and stop-loss are
+    # tightened toward the largest real support/resistance still in play
+    # when one sits closer than the ATR/sigma bound alone would allow (see
     # execution/exit_levels.py's resistance_distance_pct/support_distance_pct
     # and _channel_cap there for exactly how).
-    channel_levels_by_symbol = donchian_channel_levels(list(price_by_symbol.keys()))
-    support_distance_by_symbol: dict[str, float] = {}
-    resistance_distance_by_symbol: dict[str, float] = {}
-    for symbol, price in price_by_symbol.items():
-        support_distance, resistance_distance = _channel_distances(price, channel_levels_by_symbol.get(symbol))
-        if support_distance is not None:
-            support_distance_by_symbol[symbol] = support_distance
-        if resistance_distance is not None:
-            resistance_distance_by_symbol[symbol] = resistance_distance
+    support_distance_by_symbol, resistance_distance_by_symbol = _solidified_channel_distances(
+        list(price_by_symbol.keys()), price_by_symbol
+    )
+    # Display-only, for the LLM advisory payload's donchian_support/
+    # donchian_resistance context below -- the single largest window's raw
+    # levels (the most solid evidence available), not the per-side mix
+    # _solidified_channel_distances resolved above for the actual
+    # tightening math, which can anchor each side to a different window.
+    channel_levels_by_symbol = donchian_channel_levels(
+        list(price_by_symbol.keys()), window=max(_DONCHIAN_SOLIDIFICATION_WINDOWS)
+    )
 
     if settings.enable_macro_sector_block:
         macro_mkt_sentiment = None

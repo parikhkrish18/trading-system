@@ -3,9 +3,9 @@ Claude Sonnet 5 advisory pass over the screener's confident-candidate pool.
 
 Downstream of the quantitative model, never upstream of it: this only ever
 sees candidates models/screener.py has already put through score_universe's
-cost hurdle + Donchian breakout gate and apply_macro_sector_block's hard
-block -- it can rank and pick among them, but can never introduce a symbol
-that failed a hard gate (see _parse_advice's valid_symbols check).
+cost/ATR-floor hurdle and apply_macro_sector_block's hard block -- it can
+rank and pick among them, but can never introduce a symbol that failed a
+hard gate (see _parse_advice's valid_symbols check).
 
 Advisory, not authoritative, on money: its confidence score only
 RE-WEIGHTS capital within select_concentrated_trades's existing
@@ -55,8 +55,8 @@ def _build_system_prompt() -> str:
     donchian_window = settings.donchian_exit_window
     return (
         "You are a trading analyst reviewing a shortlist of stocks that have "
-        "ALREADY cleared a quantitative screen (a cost hurdle, a breakout-"
-        "direction gate, and a market/sector sentiment check) -- your job is "
+        "ALREADY cleared a quantitative screen (a cost/ATR-floor hurdle and "
+        "a market/sector sentiment check) -- your job is "
         "not to decide whether these are tradeable at all, but to synthesize "
         "everything given about each one (the model's forecast, its top "
         "feature drivers, market regime, sector sentiment, recent news, and "
@@ -84,10 +84,15 @@ def _build_system_prompt() -> str:
         f"on each candidate: its 14-day Average True Range as a fraction of "
         f"price) scaled to this horizon -- normally {tp_min_mult:g}x-{tp_max_mult:g}x "
         "of that horizon-scaled ATR for the target -- and then SOLIDIFIED "
-        "against this stock's own recent trading range: donchian_support/"
-        f"donchian_resistance on each candidate are its actual rolling "
-        f"{donchian_window}-day low/high, and both the target and the stop "
-        "get pulled in toward whichever is closer, so a target never sits past a "
+        "against this stock's own recent trading range across several "
+        f"timeframes at once, from a {donchian_window}-day channel up to a "
+        "200-day one (the wider the timeframe, the more that level has "
+        "actually been tested and held, so a genuinely major level always "
+        "wins over a minor one that just happens to sit closer): "
+        "donchian_support/donchian_resistance on each candidate are the "
+        "actual rolling low/high of the single widest one currently in "
+        "play, and both the target and the stop get pulled in toward "
+        "whichever side is closer, so a target never sits past a "
         "resistance this stock has actually failed to clear recently and a "
         "stop never sits past a support it has actually held. A stock with "
         f"no realistic path to a {tp_min_mult:g}x-ATR move in about a week, "
