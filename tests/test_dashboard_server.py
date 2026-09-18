@@ -1754,6 +1754,25 @@ def test_static_page_is_gated_too(monkeypatch):
     assert public.get("/").status_code == 200
 
 
+def test_static_assets_are_served_no_cache(monkeypatch):
+    """
+    A plain StaticFiles mount lets the browser skip revalidation and keep
+    rendering a deploy-old app.js/style.css indefinitely after a push --
+    exactly what happened the first time this panel's cadence badges
+    shipped (see _NoCacheStaticFiles' docstring). Cache-Control: no-cache
+    forces a conditional GET on every load instead, so a fresh deploy
+    shows up on the very next reload.
+    """
+    monkeypatch.setattr(server.settings, "dashboard_password", "s3cret")
+    public = TestClient(server.app, base_url="http://0.0.0.0", follow_redirects=False)
+    public.cookies.set(server._SESSION_COOKIE, server._session_token("s3cret"))
+
+    for path in ("/", "/app.js", "/style.css"):
+        resp = public.get(path)
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-cache"
+
+
 def test_logout_clears_the_session_cookie(monkeypatch):
     # The session is established through a real POST /login (rather than
     # poking the cookie jar directly) so the cookie is associated with the

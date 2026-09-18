@@ -2423,13 +2423,34 @@ def set_portal_risk_settings(request: Request, body: _RiskSettingsRequest) -> di
     }
 
 
+class _NoCacheStaticFiles(StaticFiles):
+    """
+    Plain StaticFiles lets the browser cache index.html/app.js/style.css
+    for as long as it wants once fetched -- fine on paper (Starlette still
+    sends Last-Modified/ETag), except Chrome and friends often skip the
+    revalidation round-trip entirely on a normal navigation/reload and
+    just serve the cached copy, so a deploy can go out and a tab left open
+    (or even freshly reloaded) keeps rendering the previous version's UI
+    with no visible sign anything's stale -- exactly what happened the
+    first time this file split its cadence badges out of app.js. Forcing
+    `Cache-Control: no-cache` (revalidate every time, not "never cache")
+    costs one cheap conditional request per load and makes every deploy
+    show up on the very next reload instead of an indefinite, silent lag.
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 # Static frontend, mounted last so it doesn't shadow /api/* routes. A mount
 # is not a route-level dependency, but the middleware above gates it anyway
 # (it runs in front of every request, mount or not) — the page, its JS and
 # its CSS are only reachable once the session cookie from /login is
 # present. The page ships no data of its own; every number on it arrives
 # through a gated /api call.
-app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+app.mount("/", _NoCacheStaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 
 def main() -> None:
