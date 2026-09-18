@@ -46,6 +46,7 @@ from monitoring.equity import load_equity_curve
 from monitoring.forecast_accuracy import compute_forecast_accuracy
 from monitoring.forward_test import graded_real_decisions, headline_metrics, monthly_success_buckets
 from monitoring.trade_log import (
+    attach_actual_outcomes,
     attach_feature_vectors,
     attach_nearby_headlines,
     grade_outcomes,
@@ -679,75 +680,137 @@ def get_true_report_card(limit: int = 365) -> dict:
     }
 
 
-def _price_at_or_before(sym_prices: pd.DataFrame, ts) -> float | None:
-    """Nearest known close at or before `ts`; falls back to the earliest known close if none exists."""
-    before = sym_prices[sym_prices["ts"] <= ts]
-    if not before.empty:
-        return float(before.iloc[-1]["close"])
-    if not sym_prices.empty:
-        return float(sym_prices.iloc[0]["close"])
-    return None
+def _reconstruct_symbol_episodes(fills: pd.DataFrame) -> list[dict]:
+    """
+    Walks one symbol's Alpaca fills (columns: side, qty, price, filled_at),
+    already sorted chronologically, tracking a running signed position and
+    volume-weighted entry/exit price. An episode runs flat -> nonzero ->
+    flat: same-direction fills within it (a resize) blend into the weighted
+    entry average, opposite-direction fills blend into the weighted exit
+    average, rather than only ever reading the first or the last fill in
+    isolation. A single fill that flips the position straight through flat
+    (closes the old side and opens the new one at once) closes out the old
+    episode and starts a fresh one from that same fill's price.
+    """
+    episodes: list[dict] = []
+    position_qty = 0.0
+    entry_notional = entry_qty = exit_notional = exit_qty = 0.0
+    entry_ts = None
+    side: str | None = None
+
+    def _open(ts, price: float, qty: float) -> None:
+        nonlocal position_qty, entry_notional, entry_qty, exit_notional, exit_qty, entry_ts, side
+        position_qty, entry_ts = qty, ts
+        entry_notional, entry_qty = price * abs(qty), abs(qty)
+        exit_notional = exit_qty = 0.0
+        side = "long" if qty > 0 else "short"
+
+    for _, fill in fills.iterrows():
+        signed_qty = fill["qty"] if fill["side"] == "buy" else -fill["qty"]
+        price, ts = float(fill["price"]), fill["filled_at"]
+
+        if position_qty == 0:
+            _open(ts, price, signed_qty)
+            continue
+
+        if (position_qty > 0) == (signed_qty > 0):
+            entry_notional += price * abs(signed_qty)
+            entry_qty += abs(signed_qty)
+            position_qty += signed_qty
+            continue
+
+        closing_qty = min(abs(signed_qty), abs(position_qty))
+        exit_notional += price * closing_qty
+        exit_qty += closing_qty
+        leftover_qty = abs(signed_qty) - closing_qty
+        position_qty += signed_qty
+
+        if position_qty == 0 or leftover_qty > 0:
+            entry_price = entry_notional / entry_qty
+            exit_price = exit_notional / exit_qty
+            pnl = (exit_price - entry_price) * exit_qty * (1 if side == "long" else -1)
+            episodes.append(
+                {
+                    "side": side,
+                    "entry_ts": entry_ts,
+                    "exit_ts": ts,
+                    "shares": exit_qty if side == "long" else -exit_qty,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "realized_pnl": pnl,
+                    "realized_pnl_pct": (exit_price / entry_price - 1) * (1 if side == "long" else -1),
+                }
+            )
+            if leftover_qty > 0:
+                _open(ts, price, leftover_qty if signed_qty > 0 else -leftover_qty)
+            else:
+                position_qty = 0.0
+                entry_ts = None
+                side = None
+
+    return episodes
+
+
+def _load_closed_episodes() -> list[dict]:
+    """
+    Every realized round-trip, reconstructed from Alpaca's own filled-order
+    history (execution/broker_alpaca.py::get_filled_orders) -- broker fills
+    are the ground truth for money math. Shared by /api/trades/closed and
+    /api/trades/log (monitoring.trade_log.attach_actual_outcomes), so both
+    panels agree on what actually happened rather than each approximating
+    it separately. entry_ts/exit_ts here are real pd.Timestamps, not yet
+    stringified -- callers that need JSON-safe values do that themselves
+    (see get_closed_trades below).
+
+    Returns [] (never raises) for a broker that can't even be constructed
+    (e.g. BROKER=ibkr with no TWS/IB Gateway reachable), one without fill
+    history (e.g. IBKR itself), an API failure, or no fills at all -- a
+    panel going blank beats the whole endpoint 500ing over data nothing
+    else here depends on.
+    """
+    try:
+        broker = get_broker()
+    except Exception:
+        logger.exception("Could not construct a broker — closed trades unavailable.")
+        return []
+    if not hasattr(broker, "get_filled_orders"):
+        logger.warning("%s has no get_filled_orders — closed trades unavailable.", type(broker).__name__)
+        return []
+    try:
+        fills = broker.get_filled_orders()
+    except Exception:
+        logger.exception("Could not fetch Alpaca fill history — closed trades unavailable.")
+        return []
+    if not fills:
+        return []
+
+    fills_df = pd.DataFrame(fills)
+    fills_df["filled_at"] = pd.to_datetime(fills_df["filled_at"], utc=True)
+    fills_df = fills_df.sort_values(["symbol", "filled_at"])
+
+    episodes: list[dict] = []
+    for symbol, group in fills_df.groupby("symbol"):
+        episodes.extend({"symbol": symbol, **episode} for episode in _reconstruct_symbol_episodes(group))
+    return episodes
 
 
 @app.get("/api/trades/closed")
 def get_closed_trades(limit: int = 100) -> list[dict]:
     """
-    Reconstructs realized round-trip trades from the decisions log: an
-    episode starts at the first decision that opens a nonzero position for a
-    symbol and ends at the next decision that flattens it (executed_position
-    == 0), using nearest-known prices at each end for entry/exit. This is an
-    approximation, not a broker-verified fill record -- if a position was
-    resized mid-episode (e.g. re-picked at a different weight the following
-    week), the original entry size/price is used for the whole episode
-    rather than tracking each resize individually.
+    Realized round-trip trades for display -- see _load_closed_episodes for
+    what "realized" means here (Alpaca's own fills, not an approximation).
     """
-    engine = get_engine()
-    decisions = pd.read_sql(
-        text("SELECT symbol, ts, target_position, executed_position, mode FROM decisions WHERE mode = 'paper' ORDER BY symbol, ts"),
-        engine,
-    )
-    if decisions.empty:
-        return []
-
-    symbols = decisions["symbol"].unique().tolist()
-    symbol_list = symbol_in_clause(symbols)
-    prices = pd.read_sql(f"SELECT symbol, ts, close FROM prices WHERE symbol IN ({symbol_list}) ORDER BY symbol, ts", engine)  # noqa: S608 — symbols validated via symbol_in_clause
-
-    trades: list[dict] = []
-    for symbol, group in decisions.groupby("symbol"):
-        group = group.sort_values("ts").reset_index(drop=True)
-        sym_prices = prices[prices["symbol"] == symbol].sort_values("ts")
-        entry = None
-        for _, row in group.iterrows():
-            executed = row["executed_position"]
-            if executed is None or pd.isna(executed):
-                continue
-            if entry is None:
-                if executed != 0:
-                    entry = row
-                continue
-            if executed == 0:
-                entry_price = _price_at_or_before(sym_prices, entry["ts"])
-                exit_price = _price_at_or_before(sym_prices, row["ts"])
-                shares = entry["executed_position"]
-                if entry_price is not None and exit_price is not None and shares:
-                    pnl = (exit_price - entry_price) * shares
-                    trades.append(
-                        {
-                            "symbol": symbol,
-                            "side": "long" if shares > 0 else "short",
-                            "entry_ts": entry["ts"].isoformat(),
-                            "exit_ts": row["ts"].isoformat(),
-                            "shares": float(shares),
-                            "entry_price": entry_price,
-                            "exit_price": exit_price,
-                            "realized_pnl": float(pnl),
-                            "realized_pnl_pct": float((exit_price / entry_price - 1) * (1 if shares > 0 else -1)),
-                        }
-                    )
-                entry = None
-            # else: still open (possibly resized) -- keep the original entry, see docstring.
-
+    trades = [
+        {
+            **episode,
+            "entry_ts": episode["entry_ts"].isoformat(),
+            "exit_ts": episode["exit_ts"].isoformat(),
+            "shares": float(episode["shares"]),
+            "realized_pnl": float(episode["realized_pnl"]),
+            "realized_pnl_pct": float(episode["realized_pnl_pct"]),
+        }
+        for episode in _load_closed_episodes()
+    ]
     trades.sort(key=lambda t: t["exit_ts"], reverse=True)
     return trades[:limit]
 
@@ -790,10 +853,17 @@ def get_trade_log(limit: int = 50, offset: int = 0) -> dict:
     """
     Every executed real (paper/live) decision -- opens, adds, reduces, and
     closes -- as raw study data: ticker, direction, forecast, regime,
-    confidence, outcome once matured (see monitoring/trade_log.py). Full
-    feature vectors, full reasoning, and nearby headlines are lazy-loaded
-    per row via /api/trades/log/{id} rather than embedded here, so a page
-    stays light; /api/trades/log/export gives everything in one CSV.
+    confidence, and actual_outcome/actual_realized_return (see
+    monitoring.trade_log.attach_actual_outcomes) -- what really happened to
+    the position, from Alpaca's own fills, not the separate forecast-
+    horizon hit/miss grading (still computed and returned as hit/
+    realized_return, for anyone studying the model's own calibration
+    instead of the money). A closing decision is folded into the entry
+    decision it closes out rather than shown as its own row, so a round
+    trip reads as one row, not two. Full feature vectors, full reasoning,
+    and nearby headlines are lazy-loaded per row via /api/trades/log/{id}
+    rather than embedded here, so a page stays light; /api/trades/log/export
+    gives every raw decision row, uncollapsed, in one CSV.
     """
     engine = get_engine()
     decisions = pd.read_sql(
@@ -811,7 +881,15 @@ def get_trade_log(limit: int = 50, offset: int = 0) -> dict:
     # Extracted before the drop below -- signal_to_noise lives inside the
     # reasoning JSON, not its own column (see _signal_to_noise_from_reasoning).
     graded["signal_to_noise"] = graded["reasoning"].apply(_signal_to_noise_from_reasoning)
-    graded = graded.drop(columns=["reasoning"]).sort_values("ts", ascending=False)
+    graded = graded.drop(columns=["reasoning"])
+
+    try:
+        open_symbols = {s for s, q in get_broker().get_positions().items() if q != 0}
+    except Exception:
+        logger.exception("Could not read open positions — actual_outcome will fall back to 'pending' for open trades.")
+        open_symbols = set()
+    graded = attach_actual_outcomes(graded, _load_closed_episodes(), open_symbols)
+    graded = graded.sort_values("ts", ascending=False)
 
     page = graded.iloc[offset : offset + limit]
     return {"total": len(graded), "rows": _clean_records(page)}
@@ -868,6 +946,14 @@ def get_trade_log_detail(decision_id: int) -> dict:
     feature vector, and nearby news headlines -- fetched lazily when a row
     in the Trade Log table is expanded, rather than embedded in every page
     of /api/trades/log.
+
+    /api/trades/log's list view folds a closing decision into the entry
+    decision it closes out (see monitoring.trade_log.attach_actual_outcomes),
+    so the closing decision's own row is no longer independently reachable
+    there. If this decision opened (or resized into) a position later
+    closed, its closing decision's own reasoning is folded in here instead,
+    as close_reasoning/closed_at -- so "why did this actually close" is
+    still one Expand away, not lost.
     """
     engine = get_engine()
     row = pd.read_sql(
@@ -884,6 +970,22 @@ def get_trade_log_detail(decision_id: int) -> dict:
     record["direction"] = trade_direction(record.get("target_position"))
 
     symbol, ts, feature_set_id = row.iloc[0]["symbol"], row.iloc[0]["ts"], row.iloc[0]["feature_set_id"]
+
+    if record["direction"] != "close":
+        closing = pd.read_sql(
+            text(
+                "SELECT ts, reasoning FROM decisions WHERE symbol = :symbol AND ts > :ts "
+                "AND executed_position = 0 AND mode IN ('paper', 'live') ORDER BY ts ASC LIMIT 1"
+            ),
+            engine,
+            params={"symbol": symbol, "ts": ts},
+        )
+        if not closing.empty:
+            close_reasoning = closing.iloc[0]["reasoning"]
+            if isinstance(close_reasoning, str):
+                close_reasoning = json.loads(close_reasoning)
+            record["closed_at"] = closing.iloc[0]["ts"].isoformat()
+            record["close_reasoning"] = close_reasoning
     features_long = pd.read_sql(
         text("SELECT feature_name, value FROM features WHERE symbol = :symbol AND feature_set_id = :fsid AND ts = :ts"),
         engine,

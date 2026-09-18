@@ -55,6 +55,16 @@ class _FakeOpenOrder:
     side: str = "buy"
 
 
+@dataclass
+class _FakeFilledOrder:
+    id: str
+    symbol: str
+    side: str
+    filled_qty: float
+    filled_avg_price: float
+    filled_at: dt.datetime | None
+
+
 class _FakeTradingClient:
     def __init__(
         self,
@@ -381,3 +391,66 @@ def test_submit_target_position_does_not_cancel_when_no_open_orders_exist(monkey
     broker, client = _make_broker(monkeypatch)
     broker.submit_target_position("AAPL", 3.0)
     assert client.canceled_order_ids == []
+
+
+def test_get_filled_orders_maps_fill_fields(monkeypatch):
+    filled_at = dt.datetime(2026, 9, 14, 22, 51, 40, tzinfo=dt.UTC)
+    broker, _ = _make_broker(
+        monkeypatch,
+        open_orders=[
+            _FakeFilledOrder(
+                id="order-1", symbol="TROW", side="sell", filled_qty=267.0, filled_avg_price=105.85, filled_at=filled_at
+            )
+        ],
+    )
+
+    fills = broker.get_filled_orders()
+
+    assert fills == [
+        {
+            "symbol": "TROW",
+            "side": "sell",
+            "qty": 267.0,
+            "price": 105.85,
+            "filled_at": filled_at,
+            "order_id": "order-1",
+        }
+    ]
+
+
+def test_get_filled_orders_skips_orders_that_never_actually_filled(monkeypatch):
+    """CLOSED also covers canceled/rejected/expired orders -- those never moved a share and must not appear."""
+    broker, _ = _make_broker(
+        monkeypatch,
+        open_orders=[
+            _FakeFilledOrder(id="canceled", symbol="AAPL", side="buy", filled_qty=0.0, filled_avg_price=None, filled_at=None),
+            _FakeFilledOrder(
+                id="filled", symbol="AAPL", side="buy", filled_qty=5.0, filled_avg_price=200.0,
+                filled_at=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+            ),
+        ],
+    )
+
+    fills = broker.get_filled_orders()
+
+    assert [f["order_id"] for f in fills] == ["filled"]
+
+
+def test_get_filled_orders_filters_by_symbol(monkeypatch):
+    broker, _client = _make_broker(
+        monkeypatch,
+        open_orders=[
+            _FakeFilledOrder(
+                id="a", symbol="AAPL", side="buy", filled_qty=1.0, filled_avg_price=100.0,
+                filled_at=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+            ),
+            _FakeFilledOrder(
+                id="m", symbol="MSFT", side="buy", filled_qty=1.0, filled_avg_price=200.0,
+                filled_at=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+            ),
+        ],
+    )
+
+    fills = broker.get_filled_orders(symbols=["AAPL"])
+
+    assert [f["symbol"] for f in fills] == ["AAPL"]

@@ -589,8 +589,15 @@ async function loadTradeLog(offset = 0) {
   } else {
     tbody.innerHTML = result.rows
       .map((r) => {
-        const outcome = r.hit === null || r.hit === undefined ? "pending" : r.hit ? "hit" : "miss";
-        const outcomeClass = outcome === "hit" ? "pl-pos" : outcome === "miss" ? "pl-neg" : "";
+        // actual_outcome ("closed"/"open"/"pending") is what actually
+        // happened to this position per Alpaca's own fills -- see
+        // monitoring.trade_log.attach_actual_outcomes. Not the same thing
+        // as the separate forecast-horizon hit/miss grading (r.hit), which
+        // answers a different question (was the N-day-ahead direction
+        // right) and can stay "pending" long after a position has closed.
+        const outcome = r.actual_outcome ?? "pending";
+        const outcomeClass =
+          outcome === "closed" ? (r.actual_realized_return >= 0 ? "pl-pos" : "pl-neg") : "";
         return `
         <tr>
           <td><button class="btn btn-secondary trade-log-expand-btn" data-id="${r.id}">Expand</button></td>
@@ -601,7 +608,7 @@ async function loadTradeLog(offset = 0) {
           <td>${escapeHTML(r.regime ?? "—")}</td>
           <td>${fmt.signalToNoise(r.signal_to_noise)}</td>
           <td class="${outcomeClass}">${outcome}</td>
-          <td>${fmt.pct(r.realized_return, 2)}</td>
+          <td>${fmt.pct(r.actual_realized_return, 2)}</td>
         </tr>`;
       })
       .join("");
@@ -624,11 +631,20 @@ async function showTradeLogDetail(id) {
     .map(([name, value]) => `<tr><td>${escapeHTML(name)}</td><td>${fmt.num(value, 4)}</td></tr>`)
     .join("");
 
+  // close_reasoning is only present when this entry decision was later
+  // closed -- its own decision row is folded out of the Trade Log list
+  // (see monitoring.trade_log.attach_actual_outcomes), so this is the only
+  // place its "why did this close" story is still reachable.
+  const closeSection = r.close_reasoning
+    ? `<p class="muted">Closed ${fmt.time(r.closed_at)} — why</p>${reasoningPhasesHTML(r.close_reasoning)}`
+    : "";
+
   box.innerHTML = `
     <div class="chart-box">
       <h3>${escapeHTML(r.symbol)} — ${fmt.time(r.ts)} (decision #${r.id})</h3>
       <p class="muted">Model reasoning</p>
       ${reasoningPhasesHTML(r.reasoning)}
+      ${closeSection}
       <p class="muted">Full feature vector (${featureEntries.length})</p>
       <div class="table-wrap"><table><tbody>${featureRows || '<tr><td class="empty-state">No stored feature snapshot matches this decision\'s timestamp.</td></tr>'}</tbody></table></div>
       <p class="muted">Nearby headlines (approximate, +/- 3 days)</p>
