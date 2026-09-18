@@ -685,6 +685,60 @@ def test_trade_log_endpoint_includes_a_close_as_its_own_row(monkeypatch, client)
     assert body["rows"][0]["direction"] == "close"
 
 
+def test_trade_log_endpoint_consolidates_a_linked_open_and_close_into_one_row(monkeypatch, client):
+    """
+    Regression test for the user-reported mismatch: an open decision and
+    the close decision that flattened it used to show as two separate
+    rows, BOTH stuck reading "pending" forever (grade_outcomes needs
+    target_horizon_days of future price bars to mature at all, a different
+    question from whether the position actually closed). They now fold
+    into one row, reading the real outcome from Alpaca's own fills.
+    """
+    decisions = pd.DataFrame(
+        [
+            {
+                "id": 2, "symbol": "TROW", "ts": pd.Timestamp("2026-09-16T21:08:21Z"), "feature_set_id": "v4",
+                "model_version": "v1", "forecast": None, "regime": None, "target_position": 0.0,
+                "executed_position": 0.0, "mode": "paper", "reasoning": None, "direction_agreement": None,
+                "approval_status": "auto", "take_profit_pct": None, "stop_loss_pct": None,
+            },
+            {
+                "id": 1, "symbol": "TROW", "ts": pd.Timestamp("2026-09-14T22:51:39Z"), "feature_set_id": "v4",
+                "model_version": "v1", "forecast": -0.0093, "regime": "trending", "target_position": -0.31,
+                "executed_position": -267.0, "mode": "paper", "reasoning": None, "direction_agreement": 0.9,
+                "approval_status": "auto", "take_profit_pct": 0.09, "stop_loss_pct": 0.045,
+            },
+        ]
+    )
+    prices = pd.DataFrame(columns=["symbol", "ts", "close"])
+    calls = iter([decisions, prices])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    fills = [
+        {"symbol": "TROW", "side": "sell", "qty": 267.0, "price": 105.85, "filled_at": "2026-09-14T22:51:40Z", "order_id": "a"},
+        {"symbol": "TROW", "side": "buy", "qty": 267.0, "price": 104.23, "filled_at": "2026-09-16T21:08:23Z", "order_id": "b"},
+    ]
+
+    class _TrowBroker:
+        def get_positions(self):
+            return {}  # flat -- TROW isn't held anymore
+
+        def get_filled_orders(self):
+            return fills
+
+    monkeypatch.setattr(server, "get_broker", lambda: _TrowBroker())
+
+    resp = client.get("/api/trades/log")
+    body = resp.json()
+    assert body["total"] == 1  # the close row folded into the entry row
+    row = body["rows"][0]
+    assert row["id"] == 1
+    assert row["symbol"] == "TROW"
+    assert row["actual_outcome"] == "closed"
+    assert row["actual_realized_return"] == pytest.approx(0.0153, abs=1e-3)
+
+
 def test_trade_log_endpoint_paginates(monkeypatch, client):
     rows = [
         {
@@ -727,11 +781,12 @@ def test_trade_log_detail_endpoint_returns_reasoning_features_and_headlines(monk
             }
         ]
     )
+    no_closing_decision = pd.DataFrame(columns=["ts", "reasoning"])
     features_long = pd.DataFrame({"feature_name": ["mom_ret_20d"], "value": [0.08]})
     news = pd.DataFrame(
         {"ts": pd.to_datetime(["2026-07-01T12:00:00Z"]), "headline": ["AAPL rallies"], "source": ["wire"], "sentiment": [0.4]}
     )
-    calls = iter([decision_row, features_long, news])
+    calls = iter([decision_row, no_closing_decision, features_long, news])
     monkeypatch.setattr(server, "get_engine", lambda: None)
     monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
 
@@ -742,6 +797,41 @@ def test_trade_log_detail_endpoint_returns_reasoning_features_and_headlines(monk
     assert body["reasoning"][0]["phase"] == 2
     assert body["features"] == {"mom_ret_20d": 0.08}
     assert body["nearby_headlines"][0]["headline"] == "AAPL rallies"
+    assert "close_reasoning" not in body  # no closing decision found for this still-open position
+
+
+def test_trade_log_detail_endpoint_folds_in_the_closing_decisions_reasoning(monkeypatch, client):
+    """
+    Regression test: /api/trades/log's list view folds the closing decision
+    into the entry row it closes out (one row per round trip), so the
+    close's own "why" is no longer reachable as its own list row -- it has
+    to surface here instead, when expanding the entry that was closed.
+    """
+    reasoning = json.dumps([{"phase": 2, "title": "opened", "summary": "x", "lines": []}])
+    decision_row = pd.DataFrame(
+        [
+            {
+                "id": 7, "symbol": "AAPL", "ts": pd.Timestamp("2026-07-01T00:00:00Z"), "feature_set_id": "v4",
+                "model_version": "v1", "forecast": 0.5, "regime": "trending", "target_position": 0.3,
+                "executed_position": 0.3, "mode": "paper", "reasoning": reasoning, "direction_agreement": 0.9,
+                "approval_status": "auto", "take_profit_pct": 0.1, "stop_loss_pct": 0.05,
+            }
+        ]
+    )
+    close_reasoning = [{"phase": 4, "title": "closed", "summary": "y", "lines": []}]
+    closing_decision = pd.DataFrame(
+        [{"ts": pd.Timestamp("2026-07-08T00:00:00Z"), "reasoning": json.dumps(close_reasoning)}]
+    )
+    features_long = pd.DataFrame(columns=["feature_name", "value"])
+    news = pd.DataFrame(columns=["ts", "headline", "source", "sentiment"])
+    calls = iter([decision_row, closing_decision, features_long, news])
+    monkeypatch.setattr(server, "get_engine", lambda: None)
+    monkeypatch.setattr(server.pd, "read_sql", lambda *a, **k: next(calls))
+
+    resp = client.get("/api/trades/log/7")
+    body = resp.json()
+    assert body["close_reasoning"][0]["title"] == "closed"
+    assert body["closed_at"] == "2026-07-08T00:00:00+00:00"
 
 
 def test_trade_log_detail_endpoint_404_for_unknown_id(monkeypatch, client):

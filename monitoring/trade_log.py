@@ -66,6 +66,80 @@ def grade_outcomes(trades: pd.DataFrame, prices: pd.DataFrame, horizon_bars: int
     return trades.merge(scored[["symbol", "ts", *outcome_cols]], on=["symbol", "ts"], how="left")
 
 
+def attach_actual_outcomes(trades: pd.DataFrame, episodes: list[dict], open_symbols: set[str]) -> pd.DataFrame:
+    """
+    Replaces the forecast-horizon "pending" reading with what actually
+    happened to the position this decision belongs to, and folds each
+    closing decision into the entry decision it closes out -- one row per
+    round trip instead of a separate row for the close that would
+    otherwise also just read "pending" forever (grade_outcomes' hit/
+    realized_return need horizon_bars of FUTURE price bars past the
+    decision to mature at all, a completely different question from
+    whether the position itself has actually closed).
+
+    `episodes`: closed round-trips reconstructed from Alpaca's own fill
+    history (monitoring.dashboard.server._load_closed_episodes) -- symbol,
+    entry_ts, exit_ts, realized_pnl_pct. Matched to a (entry decision,
+    close decision) pair per symbol in ts order: both this system's
+    decisions and Alpaca's fills are chronological for the same symbol, so
+    a straightforward FIFO pairing per symbol is enough for this system's
+    normal operation (one clean open, one clean close per round trip).
+
+    `open_symbols`: symbols with a nonzero broker position right now -- an
+    entry decision with no closing decision (yet) reads "open" when its
+    symbol is still held, else "pending" (the position closed by some path
+    this couldn't match -- e.g. outside the fetched fill-history window).
+
+    `trades`: needs id, symbol, ts, executed_position. Every other column
+    (forecast, regime, hit, realized_return, ...) passes through untouched
+    -- this only adds actual_outcome/actual_realized_return and drops the
+    now-redundant closing rows.
+    """
+    if trades.empty:
+        return trades.assign(actual_outcome=pd.Series(dtype="object"), actual_realized_return=pd.Series(dtype="float64"))
+
+    episodes_by_symbol: dict[str, list[dict]] = {}
+    for ep in episodes:
+        episodes_by_symbol.setdefault(ep["symbol"], []).append(ep)
+    for eps in episodes_by_symbol.values():
+        eps.sort(key=lambda e: e["entry_ts"])
+
+    drop_ids: set = set()
+    outcome_by_id: dict = {}
+    realized_by_id: dict = {}
+
+    for symbol, group in trades.groupby("symbol", sort=False):
+        remaining = list(episodes_by_symbol.get(symbol, []))
+        entry_id = None
+        for _, row in group.sort_values("ts").iterrows():
+            executed = row["executed_position"]
+            if pd.isna(executed):
+                continue
+            row_id = row["id"]
+            if entry_id is None:
+                if executed != 0:
+                    entry_id = row_id
+                    outcome_by_id[row_id] = "open" if symbol in open_symbols else "pending"
+                continue
+            if executed == 0:
+                if remaining:
+                    ep = remaining.pop(0)
+                    outcome_by_id[entry_id] = "closed"
+                    realized_by_id[entry_id] = ep["realized_pnl_pct"]
+                else:
+                    outcome_by_id[entry_id] = "closed"
+                drop_ids.add(row_id)
+                entry_id = None
+            else:
+                # A resize mid-episode -- its own row, still just "open".
+                outcome_by_id[row_id] = "open" if symbol in open_symbols else "pending"
+
+    result = trades[~trades["id"].isin(drop_ids)].copy()
+    result["actual_outcome"] = result["id"].map(outcome_by_id).fillna("pending")
+    result["actual_realized_return"] = result["id"].map(realized_by_id)
+    return result
+
+
 def pivot_feature_vector(features_long: pd.DataFrame) -> dict[str, float]:
     """features_long: columns feature_name, value for ONE (symbol, feature_set_id, ts). {} if none stored."""
     if features_long.empty:
