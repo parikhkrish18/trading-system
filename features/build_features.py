@@ -25,7 +25,7 @@ from features.qualitative.macro_sentiment import (
     build_macro_interaction_features,
     build_macro_sentiment_features,
 )
-from features.quant.donchian import donchian_breakout, donchian_pct
+from features.quant.donchian import donchian_breakout, donchian_pct, higher_low_pct
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
 from features.quant.momentum import adx, rolling_return, trend_pullback_score
 from features.quant.volatility import atr, realized_vol, vol_of_vol
@@ -57,6 +57,41 @@ QUANT_FEATURES = {
     # Uptrend-with-a-pullback / downtrend-with-a-bounce continuation setup —
     # see trend_pullback_score's own docstring.
     "mom_pullback_20_5": lambda df: trend_pullback_score(df["close"], 20, 5),
+    # The 20-day features above are structurally blind to a genuine
+    # multi-month uptrend: a healthy pullback to a rising floor (each old
+    # ceiling becoming the next floor, a staircase pattern that can span
+    # many months) and an actual breakdown produce nearly identical 20-day
+    # signatures -- both a fresh 20-day low, both a negative 5-day return.
+    # Confirmed live on FDS, entered short 2026-09-16 mid-staircase-uptrend:
+    # mom_pullback_20_5 read exactly 0.0 that cycle, because the 20-day
+    # TREND measure it depends on had already flipped negative by then --
+    # by construction it can only ever see a pullback that fits inside its
+    # own 20-day trend window, never one riding on top of a much longer
+    # uptrend. Three features give the model a longer lookback to tell
+    # "still mid-staircase, riding a rising floor" apart from "the
+    # structure actually broke":
+    #   donchian_pct_200     where price sits in its own ~200-trading-day
+    #                        (~9-month) range -- long enough to span a
+    #                        multi-leg staircase.
+    #   mom_pullback_100_10  the same continuation logic as
+    #                        mom_pullback_20_5, measured over a ~5-month
+    #                        trend with a 2-week pullback.
+    #   donchian_higher_low_20  the literal ceiling-becomes-floor test --
+    #                        is this swing low higher than the one before
+    #                        it, or did support actually break.
+    # All three reuse existing, already-tested functions (donchian_pct_20/
+    # donchian_breakout_20/mom_pullback_20_5's own) with wider windows or a
+    # new small function built the same way (higher_low_pct) -- not a
+    # retrained model change beyond that. New feature_set_id required
+    # (this changes the trained schema). Shipped without a walk-forward
+    # validation run first, on explicit instruction -- scripts/
+    # compare_feature_sets.py exists to run that comparison later; until
+    # it does, treat these three as unvalidated and don't move
+    # FEATURE_SET_ID's live default off "v4" on the strength of this
+    # commit alone.
+    "donchian_pct_200": lambda df: donchian_pct(df["high"], df["low"], df["close"], 200),
+    "mom_pullback_100_10": lambda df: trend_pullback_score(df["close"], 100, 10),
+    "donchian_higher_low_20": lambda df: higher_low_pct(df["low"], 20, 20),
 }
 
 
@@ -282,8 +317,10 @@ def fundamentals_prior_context(
 # history the `prices` table actually holds. Hit live: an unbounded pull of
 # the full 5-year backfill (503 symbols x ~5yrs) produced a features batch
 # large enough to stall a single-transaction upsert for 3+ hours (see
-# data/ingest/db.py). 3 years is plenty for the rolling-window quant features
-# (max window is 20 days) and the model's own training lookback.
+# data/ingest/db.py). 3 years (~750 trading days) comfortably covers the
+# rolling-window quant features -- the widest is donchian_pct_200's 200-day
+# window, which still leaves ~550 days of warmed-up history after it -- and
+# the model's own training lookback.
 FEATURE_LOOKBACK_YEARS = 3
 
 

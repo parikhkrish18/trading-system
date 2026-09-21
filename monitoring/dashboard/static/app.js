@@ -1040,6 +1040,21 @@ const FEATURE_INFO = {
   // bearish/neither (see signBySign()).
   donchian_breakout_20: { label: "20-day breakout", group: "Price & Trend", fmt: (v) => fmt.num(v, 0), signal: signBySign() },
   mom_pullback_20_5: { label: "Trend pullback score", group: "Price & Trend", fmt: (v) => fmt.num(v, 2), signal: signBySign() },
+  // The ~200-trading-day (~9-month) counterpart to donchian_pct_20 --
+  // where price sits in its own LONGER range, long enough to span a
+  // multi-leg staircase uptrend that a 20-day-only read can't see. Same
+  // "genuinely ambiguous on its own" reasoning as the 20-day version.
+  donchian_pct_200: { label: "200-day range position", group: "Price & Trend", fmt: (v) => fmt.num(v, 2), signal: alwaysNeutral },
+  // mom_pullback_20_5's counterpart measured over a ~5-month trend with a
+  // 2-week pullback, so a genuine intermediate-term uptrend still reads
+  // as one even after the trailing 20 days alone have already turned down.
+  mom_pullback_100_10: { label: "Trend pullback score (100d)", group: "Price & Trend", fmt: (v) => fmt.num(v, 2), signal: signBySign() },
+  // The literal ceiling-becomes-floor test: this swing low vs. the one
+  // before it. Unlike donchian_pct's range-position read, this IS a
+  // directional signal (a rising floor is genuinely bullish structure, a
+  // broken one bearish), so it gets the same sign-based read as
+  // donchian_breakout_20.
+  donchian_higher_low_20: { label: "Swing low vs. prior swing low", group: "Price & Trend", fmt: (v) => fmt.pct(v, 1), signal: signBySign() },
   vol_realized_20d: { label: "Realized volatility (20d, annualized)", group: "Volatility", fmt: (v) => fmt.pct(v, 1), signal: alwaysNeutral },
   vol_atr_14: { label: "Average daily range (ATR-14)", group: "Volatility", fmt: (v) => fmt.money(v), signal: alwaysNeutral },
   vol_of_vol: { label: "Vol-of-vol (10d ÷ 60d)", group: "Volatility", fmt: (v) => fmt.num(v, 2), signal: alwaysNeutral },

@@ -255,6 +255,21 @@
                   <td><strong>Positive:</strong> a real uptrend that's pulling back right now — the classic "buy the dip" setup. <strong>Negative:</strong> a real downtrend that's bouncing right now — "sell the bounce". <strong>0:</strong> no such setup — either no clear trend, or the recent move is running with the trend rather than against it.</td>
                 </tr>
                 <tr>
+                  <td><code>donchian_pct_200</code> — 200-day Donchian channel position</td>
+                  <td>(Price − 200-day low) / (200-day high − 200-day low), using the trailing ~200-trading-day (~9-month) high/low including today</td>
+                  <td>Same read as <code>donchian_pct_20</code>, just over a range long enough to span a multi-leg "staircase" uptrend (each old ceiling becoming the next floor) that the 20-day version alone can't see. <strong>1 = sitting at its 200-day high, 0 = sitting at its 200-day low, 0.5 = middle of the range.</strong> Lets the model tell "pulling back within a much bigger uptrend" apart from "genuinely breaking down", which the 20-day-only features can't — both look identical on a 20-day view alone.</td>
+                </tr>
+                <tr>
+                  <td><code>mom_pullback_100_10</code> — trend pullback score (100d)</td>
+                  <td>100-day trend return ÷ its volatility-scaled expected move, kept only when the last 10 days moved <strong>against</strong> that trend; 0 otherwise</td>
+                  <td>Same "buy the dip / sell the bounce" read as <code>mom_pullback_20_5</code>, just measured over a ~5-month trend with a 2-week pullback — so a genuine intermediate-term uptrend still reads <strong>positive</strong> here even in a stretch where the trailing 20 days alone have already turned negative.</td>
+                </tr>
+                <tr>
+                  <td><code>donchian_higher_low_20</code> — swing low vs. prior swing low</td>
+                  <td>(Lowest low of the last 20 days − lowest low of the 20 days before that) ÷ the prior swing low</td>
+                  <td>The literal "ceiling becomes the next floor" test. <strong>Positive:</strong> this swing low sits above the one before it — a rising floor, the staircase structure is still intact. <strong>Negative:</strong> this swing low undercut the previous one — support actually broke, not just a normal pullback. <strong>0:</strong> the floor is unchanged.</td>
+                </tr>
+                <tr>
                   <td><code>Regime</code> — market trend/chop regime</td>
                   <td>Calculate ADX-14 for SPY. If ADX ≥ 25, label market Trending; otherwise label Choppy.</td>
                   <td>Gives every stock market context. <strong>Trending:</strong> momentum-type signals may be more reliable. <strong>Choppy:</strong> breakouts may fail more often and mean-reversion behavior may matter more.</td>
