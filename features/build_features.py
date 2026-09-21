@@ -57,6 +57,28 @@ QUANT_FEATURES = {
     # Uptrend-with-a-pullback / downtrend-with-a-bounce continuation setup —
     # see trend_pullback_score's own docstring.
     "mom_pullback_20_5": lambda df: trend_pullback_score(df["close"], 20, 5),
+    # The 20-day features above are structurally blind to a genuine
+    # multi-month uptrend: a healthy pullback to a rising floor (each old
+    # ceiling becoming the next floor, a staircase pattern that can span
+    # many months) and an actual breakdown produce nearly identical 20-day
+    # signatures -- both a fresh 20-day low, both a negative 5-day return.
+    # Confirmed live on FDS, entered short 2026-09-16 mid-staircase-uptrend:
+    # mom_pullback_20_5 read exactly 0.0 that cycle, because the 20-day
+    # TREND measure it depends on had already flipped negative by then --
+    # by construction it can only ever see a pullback that fits inside its
+    # own 20-day trend window, never one riding on top of a much longer
+    # uptrend. donchian_pct_200 (where price sits in its own ~200-trading-
+    # day/~9-month range -- long enough to span a multi-leg staircase) and
+    # mom_pullback_100_10 (the same continuation logic as mom_pullback_20_5,
+    # just measured over a ~5-month trend with a 2-week pullback) give the
+    # model a longer lookback to tell "still mid-staircase, riding a rising
+    # floor" apart from "the structure actually broke" -- reusing the exact
+    # same, already-tested functions above with wider windows, not new
+    # logic. New feature_set_id required (this changes the trained schema);
+    # walk-forward validated before this becomes the live default -- see
+    # scripts/compare_feature_sets.py.
+    "donchian_pct_200": lambda df: donchian_pct(df["high"], df["low"], df["close"], 200),
+    "mom_pullback_100_10": lambda df: trend_pullback_score(df["close"], 100, 10),
 }
 
 
@@ -282,8 +304,10 @@ def fundamentals_prior_context(
 # history the `prices` table actually holds. Hit live: an unbounded pull of
 # the full 5-year backfill (503 symbols x ~5yrs) produced a features batch
 # large enough to stall a single-transaction upsert for 3+ hours (see
-# data/ingest/db.py). 3 years is plenty for the rolling-window quant features
-# (max window is 20 days) and the model's own training lookback.
+# data/ingest/db.py). 3 years (~750 trading days) comfortably covers the
+# rolling-window quant features -- the widest is donchian_pct_200's 200-day
+# window, which still leaves ~550 days of warmed-up history after it -- and
+# the model's own training lookback.
 FEATURE_LOOKBACK_YEARS = 3
 
 
