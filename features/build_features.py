@@ -25,7 +25,7 @@ from features.qualitative.macro_sentiment import (
     build_macro_interaction_features,
     build_macro_sentiment_features,
 )
-from features.quant.donchian import donchian_breakout, donchian_pct
+from features.quant.donchian import donchian_breakout, donchian_pct, higher_low_pct
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
 from features.quant.momentum import adx, rolling_return, trend_pullback_score
 from features.quant.volatility import atr, realized_vol, vol_of_vol
@@ -67,18 +67,31 @@ QUANT_FEATURES = {
     # TREND measure it depends on had already flipped negative by then --
     # by construction it can only ever see a pullback that fits inside its
     # own 20-day trend window, never one riding on top of a much longer
-    # uptrend. donchian_pct_200 (where price sits in its own ~200-trading-
-    # day/~9-month range -- long enough to span a multi-leg staircase) and
-    # mom_pullback_100_10 (the same continuation logic as mom_pullback_20_5,
-    # just measured over a ~5-month trend with a 2-week pullback) give the
-    # model a longer lookback to tell "still mid-staircase, riding a rising
-    # floor" apart from "the structure actually broke" -- reusing the exact
-    # same, already-tested functions above with wider windows, not new
-    # logic. New feature_set_id required (this changes the trained schema);
-    # walk-forward validated before this becomes the live default -- see
-    # scripts/compare_feature_sets.py.
+    # uptrend. Three features give the model a longer lookback to tell
+    # "still mid-staircase, riding a rising floor" apart from "the
+    # structure actually broke":
+    #   donchian_pct_200     where price sits in its own ~200-trading-day
+    #                        (~9-month) range -- long enough to span a
+    #                        multi-leg staircase.
+    #   mom_pullback_100_10  the same continuation logic as
+    #                        mom_pullback_20_5, measured over a ~5-month
+    #                        trend with a 2-week pullback.
+    #   donchian_higher_low_20  the literal ceiling-becomes-floor test --
+    #                        is this swing low higher than the one before
+    #                        it, or did support actually break.
+    # All three reuse existing, already-tested functions (donchian_pct_20/
+    # donchian_breakout_20/mom_pullback_20_5's own) with wider windows or a
+    # new small function built the same way (higher_low_pct) -- not a
+    # retrained model change beyond that. New feature_set_id required
+    # (this changes the trained schema). Shipped without a walk-forward
+    # validation run first, on explicit instruction -- scripts/
+    # compare_feature_sets.py exists to run that comparison later; until
+    # it does, treat these three as unvalidated and don't move
+    # FEATURE_SET_ID's live default off "v4" on the strength of this
+    # commit alone.
     "donchian_pct_200": lambda df: donchian_pct(df["high"], df["low"], df["close"], 200),
     "mom_pullback_100_10": lambda df: trend_pullback_score(df["close"], 100, 10),
+    "donchian_higher_low_20": lambda df: higher_low_pct(df["low"], 20, 20),
 }
 
 

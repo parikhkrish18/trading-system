@@ -265,6 +265,11 @@
                   <td>Same "buy the dip / sell the bounce" read as <code>mom_pullback_20_5</code>, just measured over a ~5-month trend with a 2-week pullback — so a genuine intermediate-term uptrend still reads <strong>positive</strong> here even in a stretch where the trailing 20 days alone have already turned negative.</td>
                 </tr>
                 <tr>
+                  <td><code>donchian_higher_low_20</code> — swing low vs. prior swing low</td>
+                  <td>(Lowest low of the last 20 days − lowest low of the 20 days before that) ÷ the prior swing low</td>
+                  <td>The literal "ceiling becomes the next floor" test. <strong>Positive:</strong> this swing low sits above the one before it — a rising floor, the staircase structure is still intact. <strong>Negative:</strong> this swing low undercut the previous one — support actually broke, not just a normal pullback. <strong>0:</strong> the floor is unchanged.</td>
+                </tr>
+                <tr>
                   <td><code>Regime</code> — market trend/chop regime</td>
                   <td>Calculate ADX-14 for SPY. If ADX ≥ 25, label market Trending; otherwise label Choppy.</td>
                   <td>Gives every stock market context. <strong>Trending:</strong> momentum-type signals may be more reliable. <strong>Choppy:</strong> breakouts may fail more often and mean-reversion behavior may matter more.</td>

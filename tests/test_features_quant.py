@@ -210,6 +210,51 @@ def test_donchian_breakout_is_nan_during_warmup():
     assert result.iloc[5:].notna().all()
 
 
+def test_higher_low_pct_positive_when_the_swing_low_rises():
+    # Prior window (idx 0-2): low=8.0. Recent window (idx 3-5): low=9.0 -- a higher floor.
+    low = pd.Series([9.0, 8.0, 8.5, 9.5, 9.0, 9.2])
+    result = donchian.higher_low_pct(low, recent_window=3, prior_window=3)
+    # (9.0 - 8.0) / 8.0 = 0.125
+    assert result.iloc[5] == pytest.approx(0.125)
+
+
+def test_higher_low_pct_negative_when_the_floor_breaks():
+    # Prior window (idx 0-2): low=8.0. Recent window (idx 3-5): low=7.0 -- support broken.
+    low = pd.Series([9.0, 8.0, 8.5, 7.5, 7.0, 7.8])
+    result = donchian.higher_low_pct(low, recent_window=3, prior_window=3)
+    # (7.0 - 8.0) / 8.0 = -0.125
+    assert result.iloc[5] == pytest.approx(-0.125)
+
+
+def test_higher_low_pct_zero_when_the_floor_is_unchanged():
+    low = pd.Series([8.0, 8.5, 9.0, 8.0, 8.8, 9.2])
+    result = donchian.higher_low_pct(low, recent_window=3, prior_window=3)
+    assert result.iloc[5] == pytest.approx(0.0)
+
+
+def test_higher_low_pct_is_nan_during_warmup():
+    """Needs both windows filled -- recent_window + prior_window bars of history."""
+    low = pd.Series([9.0, 8.0, 8.5, 9.5, 9.0, 9.2])
+    result = donchian.higher_low_pct(low, recent_window=3, prior_window=3)
+    assert result.iloc[:5].isna().all()
+    assert result.iloc[5:].notna().all()
+
+
+def test_higher_low_pct_windows_are_back_to_back_not_overlapping():
+    """
+    The prior window must be the bars strictly BEFORE the recent window,
+    not a window that includes some of the same bars -- a swing low
+    compared partly against itself would understate any real change.
+    """
+    # idx 0-2 prior=1.0, idx 3-5 recent=100.0 (a huge jump) -- if the
+    # windows overlapped, idx 3-5's own low (100.0) would leak into a
+    # rolling min that's supposed to be the PRIOR window only, and the
+    # result would read as unchanged (0.0) instead of the true, huge rise.
+    low = pd.Series([1.0, 1.0, 1.0, 100.0, 100.0, 100.0])
+    result = donchian.higher_low_pct(low, recent_window=3, prior_window=3)
+    assert result.iloc[5] == pytest.approx(99.0)  # (100-1)/1
+
+
 # ---------------------------------------------------------------------
 # volatility.py
 # ---------------------------------------------------------------------

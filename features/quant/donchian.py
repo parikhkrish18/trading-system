@@ -41,3 +41,32 @@ def donchian_breakout(high: pd.Series, low: pd.Series, close: pd.Series, window:
         np.select([close >= prior_upper, close <= prior_lower], [1.0, -1.0], default=0.0),
         index=close.index,
     ).where(prior_upper.notna() & prior_lower.notna())
+
+
+def higher_low_pct(low: pd.Series, recent_window: int = 20, prior_window: int = 20) -> pd.Series:
+    """
+    The literal "ceiling becomes the next floor" test: is the current
+    swing low (the lowest low of the trailing `recent_window` bars) sitting
+    ABOVE the swing low before it (the lowest low of the `prior_window`
+    bars before THAT), or has it broken below it?
+
+    Positive = a rising floor -- this swing low is higher than the last
+    one, the staircase structure is still intact. Negative = the floor
+    broke -- this swing low undercut the previous one, a real structural
+    change rather than a normal pullback. Expressed as a fraction of the
+    prior low's own price level, so it's comparable across stocks at very
+    different price levels the same way donchian_pct already is.
+
+    The two windows are non-overlapping and back-to-back (`prior_window`
+    shifted `recent_window` bars further back) -- comparing consecutive
+    swing lows, not a swing low against a window that partly contains it.
+    This is deliberately the simple, already-proven-out rolling-min
+    building block (see donchian_pct/donchian_breakout above) rather than
+    a bespoke peak/trough detector: less new logic to get wrong, at the
+    cost of reading two FIXED windows rather than genuinely detected swing
+    points -- a real swing low that lands right at a window boundary can
+    still be missed or double-counted.
+    """
+    recent_low = low.rolling(recent_window).min()
+    prior_low = low.rolling(prior_window).min().shift(recent_window)
+    return (recent_low - prior_low) / prior_low.replace(0, np.nan)

@@ -13,7 +13,7 @@ from features.build_features import (
     build_quant_features,
     fundamentals_prior_context,
 )
-from features.quant.donchian import donchian_pct
+from features.quant.donchian import donchian_pct, higher_low_pct
 from features.quant.momentum import trend_pullback_score
 
 
@@ -263,12 +263,12 @@ def _ohlc_prices(symbol: str, n_days: int, start: str = "2024-01-01") -> pd.Data
 
 def test_build_quant_features_includes_the_longer_structural_features():
     """
-    donchian_pct_200/mom_pullback_100_10 (added to see the multi-month
-    staircase structure the 20-day-only features can't -- see their
-    registration comment in build_features.py's QUANT_FEATURES) must come
-    out of the registry wired to the SAME window semantics as calling the
-    underlying functions directly, not silently reordered arguments or the
-    wrong window.
+    donchian_pct_200/mom_pullback_100_10/donchian_higher_low_20 (added to
+    see the multi-month staircase structure the 20-day-only features
+    can't -- see their registration comment in build_features.py's
+    QUANT_FEATURES) must come out of the registry wired to the SAME
+    window semantics as calling the underlying functions directly, not
+    silently reordered arguments or the wrong window.
     """
     prices = _ohlc_prices("AAPL", 210)
     result = build_quant_features(prices)
@@ -276,9 +276,11 @@ def test_build_quant_features_includes_the_longer_structural_features():
     by_name = {name: group.sort_values("ts")["value"].to_numpy() for name, group in result.groupby("feature_name")}
     assert "donchian_pct_200" in by_name
     assert "mom_pullback_100_10" in by_name
+    assert "donchian_higher_low_20" in by_name
 
     expected_donchian = donchian_pct(prices["high"], prices["low"], prices["close"], 200).to_numpy()
     expected_pullback = trend_pullback_score(prices["close"], 100, 10).to_numpy()
+    expected_higher_low = higher_low_pct(prices["low"], 20, 20).to_numpy()
     # NaN warmup rows are dropped by build_quant_features's caller
     # (build_and_store), not by build_quant_features itself -- compare the
     # raw arrays including warmup, same length either way.
@@ -287,6 +289,9 @@ def test_build_quant_features_includes_the_longer_structural_features():
     )
     pd.testing.assert_series_equal(
         pd.Series(by_name["mom_pullback_100_10"], dtype="float64"), pd.Series(expected_pullback), check_names=False
+    )
+    pd.testing.assert_series_equal(
+        pd.Series(by_name["donchian_higher_low_20"], dtype="float64"), pd.Series(expected_higher_low), check_names=False
     )
     # Sanity: with 210 days of history, the 200-day window has warmed up
     # for at least the last few rows -- this isn't all-NaN.
