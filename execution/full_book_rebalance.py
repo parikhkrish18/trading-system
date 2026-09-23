@@ -58,6 +58,42 @@ def _freed_capital_fraction(broker, engine) -> float:
     return freed_capital_fraction(broker, engine)
 
 
+def _drop_immediately_contradicted(engine, candidates: list[TradeCandidate]) -> list[TradeCandidate]:
+    """
+    Filters out any candidate that would immediately trip the exact same
+    sentiment/sector/momentum contradiction signals
+    execution/contradiction_monitor.py already applies hourly to HELD
+    positions (see its _contradiction_reasons) -- without this, a
+    reactivation can reopen the very symbol/side a contradiction close just
+    exited. Real gap, not hypothetical: this candidate can come from
+    _candidates_from_recent_pool's persisted pool (models/
+    candidate_pool_store.py), which is up to MAX_POOL_AGE old and has no way
+    to know about news/momentum that arrived after it was saved -- and even
+    a same-cycle fresh run_screen doesn't apply this specific check, only
+    score_universe's own gates. excluded_symbols above only blocks a
+    same-cycle reopen of a symbol closed THIS pass; this blocks any
+    candidate, from either source, that contradicts current signals right
+    now, whatever cycle closed it.
+    """
+    if not candidates:
+        return candidates
+    from execution.contradiction_monitor import _contradiction_reasons, _sector_by_symbol
+
+    sector_by_symbol = _sector_by_symbol(engine, [c.symbol for c in candidates])
+    kept = []
+    for c in candidates:
+        reasons = _contradiction_reasons(engine, c.symbol, c.side, sector_by_symbol.get(c.symbol))
+        if reasons:
+            detail = "; ".join(r["detail"] for r in reasons)
+            logger.warning(
+                "Reactivation candidate %s (%s) dropped — would immediately contradict current signals: %s",
+                c.symbol, c.side, detail,
+            )
+            continue
+        kept.append(c)
+    return kept
+
+
 def _candidates_from_recent_pool(
     excluded: set[str], is_shortable_fn, max_positions: int
 ) -> list[TradeCandidate] | None:
@@ -191,6 +227,14 @@ def rebalance_after_exit(
 
     if not candidates:
         logger.info("No confident candidates after the exit — keeping surviving positions and cash as-is.")
+        return
+
+    candidates = _drop_immediately_contradicted(engine, candidates)
+    if not candidates:
+        logger.info(
+            "No confident candidates after the exit — every candidate would immediately contradict current "
+            "news/momentum signals."
+        )
         return
 
     candidate_symbols = {c.symbol for c in candidates}

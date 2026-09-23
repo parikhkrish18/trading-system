@@ -9,6 +9,12 @@ from execution.approval_gate import ApprovalOutcome, number_proposals
 from execution.exit_levels import ExitLevels
 from models.screener import TradeCandidate
 
+# Captured before _quiet_side_effects (below) monkeypatches fbr's own
+# attribute to a no-op default for every test in this file -- the two
+# direct unit tests of the real function need this original reference,
+# not the per-test-patched one.
+_real_drop_immediately_contradicted = fbr._drop_immediately_contradicted
+
 
 class _Broker:
     def __init__(self, positions, portfolio_value=100_000.0):
@@ -84,6 +90,10 @@ def _quiet_side_effects(monkeypatch):
     # monkeypatch.setattr(fbr, "load_recent_pool", ...) instead of relying on
     # the real load_recent_pool's own internal DB-failure fallback to [].
     monkeypatch.setattr(fbr, "load_recent_pool", lambda *a, **k: [])
+    # Same reasoning: real usage hits the DB (news_events/prices/universe)
+    # for the contradiction pre-check. Default to a no-op passthrough; tests
+    # of the check itself override this back via monkeypatch per-case.
+    monkeypatch.setattr(fbr, "_drop_immediately_contradicted", lambda engine, candidates: candidates)
 
 
 def test_post_exit_rebalance_resizes_survivors_and_new_name_by_conviction(monkeypatch):
@@ -310,6 +320,77 @@ def test_reactivation_pool_fast_path_is_skipped_in_diversified_mode(monkeypatch)
     fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
 
     assert any(symbol == "A" for symbol, _ in broker.targets)
+
+
+# ---------- pre-open contradiction check on reactivation candidates ----------
+
+
+def test_drop_immediately_contradicted_filters_out_a_symbol_flagged_by_current_signals(monkeypatch):
+    """
+    Regression test: a symbol closed by contradiction_monitor's hourly check
+    for contradicting current sentiment/momentum must not be immediately
+    reopened by a reactivation sourced from a stale persisted pool that has
+    no way to know about that same news/momentum (live: P short closed at
+    00:37 on sentiment+momentum contradiction, reopened at 00:58 from the
+    persisted pool with no re-check).
+    """
+    from execution import contradiction_monitor as cm
+
+    monkeypatch.setattr(cm, "_sector_by_symbol", lambda engine, symbols: {})
+
+    def fake_reasons(engine, symbol, side, sector=None):
+        if symbol == "P":
+            return [{"signal": "news_sentiment", "value": 0.7, "detail": "P's own sentiment contradicts short"}]
+        return []
+
+    monkeypatch.setattr(cm, "_contradiction_reasons", fake_reasons)
+
+    candidates = [_candidate("TECH", 0.50), TradeCandidate(
+        symbol="P", side="short", predicted_return=-0.05, direction_agreement=0.9,
+        conviction_score=0.05, target_position_pct=0.0, reasoning=[],
+    )]
+
+    kept = _real_drop_immediately_contradicted(object(), candidates)
+
+    assert [c.symbol for c in kept] == ["TECH"]
+
+
+def test_drop_immediately_contradicted_is_a_noop_on_an_empty_list():
+    assert _real_drop_immediately_contradicted(object(), []) == []
+
+
+def test_rebalance_skips_a_reactivation_candidate_that_would_immediately_recontradict(monkeypatch):
+    monkeypatch.setattr(settings, "strategy_mode", "concentrated")
+    monkeypatch.setattr(settings, "max_concentrated_position_pct", 0.70)
+    broker = _Broker({})
+
+    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 1.0)
+    monkeypatch.setattr(fbr, "load_active_universe", lambda: ["TECH", "P"])
+    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: [_candidate("TECH", 0.60), _candidate("P", 0.20)])
+    monkeypatch.setattr(fbr, "_latest_prices", lambda *a, **k: {"TECH": 100.0, "P": 100.0})
+    monkeypatch.setattr(
+        fbr, "_drop_immediately_contradicted", lambda engine, candidates: [c for c in candidates if c.symbol != "P"]
+    )
+
+    fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
+
+    targets = {s for s, _ in broker.targets}
+    assert "P" not in targets
+    assert "TECH" in targets
+
+
+def test_rebalance_no_ops_when_every_candidate_would_immediately_recontradict(monkeypatch):
+    monkeypatch.setattr(settings, "strategy_mode", "concentrated")
+    broker = _Broker({})
+
+    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 1.0)
+    monkeypatch.setattr(fbr, "load_active_universe", lambda: ["P"])
+    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: [_candidate("P", 0.20)])
+    monkeypatch.setattr(fbr, "_drop_immediately_contradicted", lambda engine, candidates: [])
+
+    fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
+
+    assert broker.targets == []
 
 
 # ---------- hold-state persistence (exit levels / miss counters) ----------
