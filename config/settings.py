@@ -181,14 +181,16 @@ class Settings(BaseSettings):
 
     # --- Risk limits ---
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
-    # Conservative defaults: these cap sizing in the diversified strategy
-    # (risk.sizing.select_trades) AND act as circuit-breaker thresholds.
-    # The concentrated 2-trade strategy legitimately deploys up to ~70% in
-    # one name — when running STRATEGY_MODE=concentrated, raise these via
-    # env (MAX_SINGLE_POSITION_PCT=0.80, MAX_CORRELATED_EXPOSURE_PCT=0.95)
-    # so the breakers sit above the strategy's intended sizes instead of
-    # tripping on normal operation.
-    max_single_position_pct: float = Field(default=0.25, alias="MAX_SINGLE_POSITION_PCT")
+    # This caps sizing in the diversified strategy (risk.sizing.select_trades)
+    # AND acts as a circuit-breaker threshold (risk/circuit_breakers.py,
+    # checked on every held position every cycle regardless of strategy
+    # mode). The concentrated strategy legitimately deploys up to 70% in one
+    # name (max_concentrated_position_pct) — this is set to 0.80, above that
+    # ceiling, so the breaker has real headroom instead of tripping on a
+    # normal-sized position that simply appreciates. Also live-overridden
+    # via Railway env (MAX_SINGLE_POSITION_PCT) on every production service
+    # that reads it — update both together.
+    max_single_position_pct: float = Field(default=0.80, alias="MAX_SINGLE_POSITION_PCT")
     # Lower than max_single_position_pct deliberately: a long position can
     # only ever lose 100% of what's put in, but a short's loss is structurally
     # uncapped (the underlying can keep rising) — size shorts more
