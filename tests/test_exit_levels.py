@@ -38,9 +38,16 @@ def test_the_target_follows_what_the_model_predicted():
     """
     Taking profit at a fixed +10% means holding a 3% forecast long past its
     thesis and leaving most of a 15% one on the table.
+
+    daily_vol left at _levels' own default (0.02, not a highly volatile
+    stock): at 0.03 the stop-loss hits its 20% cap for both cases, and
+    exit_min_reward_risk_ratio's floor (0.6x that capped stop) then swamps
+    both forecasts up to the same number -- a real, intended effect of
+    that floor, just not what THIS test is checking, so it needs inputs
+    that don't collide with it.
     """
-    small = _levels(predicted=0.04, daily_vol=0.03)
-    large = _levels(predicted=0.09, daily_vol=0.03)
+    small = _levels(predicted=0.04)
+    large = _levels(predicted=0.09)
 
     assert large.take_profit_pct > small.take_profit_pct
 
@@ -224,6 +231,63 @@ def test_take_profit_floors_at_the_minimum_atr_multiple_even_for_a_tiny_forecast
 def test_take_profit_caps_at_the_maximum_atr_multiple_for_an_extreme_forecast():
     levels = exit_levels_for(predicted_return=0.90, daily_volatility=0.01, horizon_days=5, atr_pct=0.02)
     assert levels.take_profit_pct == pytest.approx(4.0 * 0.02 * math.sqrt(5))
+
+
+# --------------------------------------------------------------------------
+# exit_min_reward_risk_ratio: take-profit is never left far below stop-loss
+# --------------------------------------------------------------------------
+
+
+def test_a_very_calm_stock_still_gets_a_take_profit_worth_the_stop_loss_risked():
+    """
+    Hit live: TECH's ATR was so small that 2x-ATR (the take-profit floor)
+    came out to a 2% target, while the stop-loss -- sized off a completely
+    different, unrelated formula (volatility-sigma, floored at
+    exit_min_stop_loss_pct) -- landed at 5%. A trade risking more than
+    double what it targeted. The take-profit must never sit below
+    settings.exit_min_reward_risk_ratio (0.6x by default) of the stop-loss
+    it's paired with.
+    """
+    # atr_pct tiny enough that 2x-ATR-horizon is well under 1%; daily_vol
+    # large enough (relative to atr_pct) that stop-loss lands at its own
+    # 5% floor -- the exact TECH shape.
+    levels = exit_levels_for(predicted_return=0.001, daily_volatility=0.005, horizon_days=5, atr_pct=0.002)
+    assert levels.stop_loss_pct == pytest.approx(0.05)
+    assert levels.take_profit_pct == pytest.approx(0.6 * 0.05)
+    assert levels.take_profit_pct >= 0.6 * levels.stop_loss_pct
+
+
+def test_reward_risk_floor_only_ever_raises_take_profit_never_lowers_stop_loss():
+    """The fix for a lopsided ratio is a bigger target, not a tighter stop closer to ordinary noise."""
+    floored = exit_levels_for(predicted_return=0.0001, daily_volatility=0.005, horizon_days=5, atr_pct=0.002)
+    # take-profit was lifted by the ratio floor, above what 2x-ATR alone
+    # would have set -- stop-loss is untouched, still exactly its own
+    # 5% floor, not tightened to bring the ratio into line some other way.
+    assert floored.take_profit_pct > 2 * 0.002 * math.sqrt(5)
+    assert floored.stop_loss_pct == pytest.approx(0.05)
+
+
+def test_reward_risk_floor_does_not_touch_an_already_healthy_ratio():
+    """A take-profit already comfortably above the ratio floor is left exactly as sized."""
+    levels = exit_levels_for(predicted_return=0.15, daily_volatility=0.01, horizon_days=5, atr_pct=0.02)
+    assert levels.take_profit_pct > 0.6 * levels.stop_loss_pct
+    assert levels.take_profit_pct == pytest.approx(0.15)  # the raw forecast, unchanged -- well within the ATR band
+
+
+def test_advised_reapplies_the_reward_risk_floor_after_an_llm_suggestion():
+    """
+    An LLM's own take-profit suggestion is clamped into [tp_lo, tp_hi] --
+    tp_lo is the SAME unfloored ATR-derived value the ratio floor exists
+    to guard against, so a low LLM suggestion on a TECH-shaped stock must
+    still come out no lower than the ratio floor, exactly like the
+    unadvised path.
+    """
+    levels = exit_levels_advised(
+        predicted_return=0.001, daily_volatility=0.005, horizon_days=5, atr_pct=0.002,
+        llm_take_profit_pct=0.0001, llm_stop_loss_pct=None,
+    )
+    assert levels.stop_loss_pct == pytest.approx(0.05)
+    assert levels.take_profit_pct == pytest.approx(0.6 * 0.05)
 
 
 def test_a_more_volatile_stocks_atr_produces_a_bigger_take_profit_band():

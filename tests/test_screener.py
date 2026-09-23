@@ -137,6 +137,57 @@ def test_score_universe_missing_atr_falls_back_to_the_cost_hurdle_alone():
     assert result.set_index("symbol").loc["AAPL", "confident"]  # 1% clears the 0.02% cost hurdle, no ATR bar to also clear
 
 
+def test_score_universe_rejects_a_symbol_too_calm_to_trade_regardless_of_forecast(monkeypatch):
+    """
+    Hit live: TECH's ATR was small enough that even a forecast scaled to
+    match it (bar 2, the RELATIVE floor) still cleared the bar, and got
+    picked with a 2% take-profit no one should hold a position for. Bar 3
+    is an ABSOLUTE floor on the ATR itself -- below settings.screener_min_atr_pct,
+    a symbol is never confident, no matter how the forecast compares to
+    its own (tiny) ATR.
+    """
+    monkeypatch.setattr(settings, "screener_min_atr_pct", 0.006)
+    latest = pd.DataFrame({"symbol": ["TECH"], "f1": [0.1]})
+    # Forecast deliberately scaled to clear bar 2 (the relative floor) --
+    # this is the exact case bar 2 alone would wrongly admit.
+    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        atr_pct_by_symbol={"TECH": 0.002}, horizon_days=5,  # 0.2% ATR -- well under the 0.6% floor
+    )
+
+    relative_floor = settings.exit_take_profit_min_atr_mult * settings.screener_min_return_atr_fraction * 0.002 * math.sqrt(5)
+    assert 0.01 > relative_floor  # sanity: bar 2 alone would have passed this
+    assert not result.set_index("symbol").loc["TECH", "confident"]
+
+
+def test_score_universe_accepts_a_symbol_at_or_above_the_absolute_atr_floor(monkeypatch):
+    monkeypatch.setattr(settings, "screener_min_atr_pct", 0.006)
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        atr_pct_by_symbol={"AAPL": 0.02}, horizon_days=5,  # 2% ATR, well above the 0.6% floor
+    )
+
+    assert result.set_index("symbol").loc["AAPL", "confident"]
+
+
+def test_score_universe_missing_atr_is_not_subject_to_the_absolute_atr_floor():
+    """Same graceful fallback as bar 2 -- a symbol with no measurable ATR is neither filtered nor required to clear this."""
+    latest = pd.DataFrame({"symbol": ["NEWCO"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        atr_pct_by_symbol={}, horizon_days=5,
+    )
+
+    assert result.set_index("symbol").loc["NEWCO", "confident"]
+
+
 def test_conviction_score_is_the_size_of_the_move_alone():
     """
     Ranking used to be agreement x |move|, which mixed a noise term into

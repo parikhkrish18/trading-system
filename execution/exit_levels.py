@@ -55,6 +55,13 @@ first ordinary day.
 When volatility, ATR, or a channel level is unknown — a new listing, a gap
 in prices — this falls back to the global settings rather than guessing.
 Guessing a stop is worse than using a blunt one.
+
+Finally, take-profit is floored to settings.exit_min_reward_risk_ratio of
+whatever stop-loss it ends up paired with (see _apply_reward_risk_floor).
+Target and stop are sized off two different, independent things above (this
+stock's ATR vs. its own volatility-sigma), so nothing else here guarantees
+any relationship between them — a calm-enough stock could otherwise get a
+take-profit smaller than its stop-loss, risking more than it targets.
 """
 from __future__ import annotations
 
@@ -132,6 +139,29 @@ def _channel_cap(ceiling: float, distance_pct: float | None, floor: float) -> fl
     return max(min(ceiling, distance_pct), floor)
 
 
+def _apply_reward_risk_floor(take_profit: float, stop_loss: float) -> float:
+    """
+    Take-profit and stop-loss are sized independently above -- one off
+    this stock's own ATR, the other off its own volatility-sigma, each
+    with its own bounds -- so nothing upstream guarantees any particular
+    relationship between the two. Hit live: TECH proposed at a 2%
+    take-profit against a 5% stop-loss (a trade risking more than double
+    what it targeted), because exit_min_take_profit_pct only floors the
+    no-ATR fallback path, never the ATR-derived value the common case
+    actually uses (see its own comment above).
+
+    This is the last line of defense, applied to whatever take_profit and
+    stop_loss come out of either sizing path above OR an LLM's own
+    suggestion (see exit_levels_advised): never let take-profit sit below
+    settings.exit_min_reward_risk_ratio of the stop-loss it's paired
+    with. Only ever raises take_profit, never lowers stop_loss -- the
+    stop stays sized to what this stock actually needs room to wander
+    within, and the fix is a bigger target, not a tighter stop closer to
+    ordinary noise.
+    """
+    return max(take_profit, stop_loss * settings.exit_min_reward_risk_ratio)
+
+
 def exit_levels_for(
     predicted_return: float | None,
     daily_volatility: float | None,
@@ -187,6 +217,7 @@ def exit_levels_for(
         settings.exit_max_stop_loss_pct,
     )
     stop_loss = _channel_cap(sl_ceiling, sl_channel, settings.exit_min_stop_loss_pct)
+    take_profit = _apply_reward_risk_floor(take_profit, stop_loss)
     return ExitLevels(take_profit_pct=take_profit, stop_loss_pct=stop_loss, derived=True)
 
 
@@ -234,6 +265,12 @@ def exit_levels_advised(
     if llm_stop_loss_pct is not None and math.isfinite(llm_stop_loss_pct):
         stop_loss = min(max(llm_stop_loss_pct, sl_lo), sl_hi)
 
+    # baseline already carries this floor (exit_levels_for applies it),
+    # but an LLM suggestion clamped into [tp_lo, tp_hi] above bypasses
+    # that -- tp_lo is the same unfloored ATR-derived value
+    # _apply_reward_risk_floor exists to guard against, so re-apply it
+    # here against whichever take_profit/stop_loss actually won above.
+    take_profit = _apply_reward_risk_floor(take_profit, stop_loss)
     return ExitLevels(take_profit_pct=take_profit, stop_loss_pct=stop_loss, derived=True)
 
 

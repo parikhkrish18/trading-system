@@ -158,7 +158,7 @@ def score_universe(
     Returns: symbol, predicted_return, direction_agreement, conviction_score,
     donchian_breakout_20, trend_pullback_score, confident.
 
-    Two bars decide "confident":
+    Three bars decide "confident":
 
     1. The predicted move must be bigger than what the round trip costs (a
        prediction smaller than the cost of acting on it is a guaranteed
@@ -170,6 +170,13 @@ def score_universe(
        to that stock's own volatility that the take-profit it gets sized
        with (2x-4x ATR) has no realistic path from where the model actually
        thinks it's going. Missing ATR for a symbol falls back to bar 1 alone.
+    3. This stock's own ATR must clear settings.screener_min_atr_pct in
+       absolute terms, not just relative to its own forecast -- bar 2 above
+       scales the required forecast to a stock's ATR, so an almost-motionless
+       stock can still pass it on an almost-equally-tiny forecast. This bar
+       rules out trading a stock that barely moves at all, whatever it
+       cleared above. Missing ATR neither filters nor requires clearing
+       this, same as bar 2.
 
     donchian_breakout_20 is computed and returned (still read from
     `raw_features` when given, see below) but no longer gates `confident` --
@@ -275,7 +282,21 @@ def score_universe(
     )
     effective_min_return = np.where(has_atr, np.maximum(min_abs_return, atr_floor), min_abs_return)
 
-    result["confident"] = result["predicted_return"].abs() >= effective_min_return
+    # Bar 3: a stock too calm to trade at all, whatever the forecast says.
+    # Bar 2 above only scales the required forecast to this stock's OWN
+    # ATR -- a stock with almost no ATR can still clear it on an almost
+    # equally tiny forecast, since both shrink together. Hit live: TECH
+    # cleared bar 2 and got picked with a 2% take-profit against a 5%
+    # stop-loss, because its ATR was so small that even 2x-ATR (the
+    # take-profit floor) barely cleared 2% -- a target with no meaningful
+    # room to run, sized off a stock that barely moves. settings.
+    # screener_min_atr_pct is an ABSOLUTE floor on the ATR itself, not
+    # scaled to anything: below it, a symbol is never confident regardless
+    # of its forecast. Same graceful fallback as bar 2 -- a symbol with no
+    # measurable ATR is neither filtered nor required to clear this.
+    too_calm = has_atr & (atr_pct_series < settings.screener_min_atr_pct)
+
+    result["confident"] = (result["predicted_return"].abs() >= effective_min_return) & ~too_calm
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
 
