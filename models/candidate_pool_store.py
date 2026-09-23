@@ -118,7 +118,23 @@ def load_recent_pool(feature_set_id: str, max_age: dt.timedelta = MAX_POOL_AGE) 
             "confidence": row["confidence"],
             "take_profit_pct": row["take_profit_pct"],
             "stop_loss_pct": row["stop_loss_pct"],
-            "reasoning": json.loads(row["reasoning"]) if row["reasoning"] else [],
+            "reasoning": _decode_reasoning(row["reasoning"]),
         }
         for _, row in df.iterrows()
     ]
+
+
+def _decode_reasoning(value: object) -> list:
+    """
+    `reasoning` is a JSONB column (data/schema/019_llm_candidate_pool.sql) --
+    the driver hands back an already-deserialized list, never a string, so
+    json.loads on it raises ("...not list"). Only decode when it actually is
+    a string, which covers the one case that isn't JSONB: the table getting
+    auto-created by to_sql (see this module's docstring) before the JSONB
+    migration ever ran, where reasoning lands as plain TEXT instead.
+    """
+    if not value:
+        return []
+    if isinstance(value, str):
+        return json.loads(value)
+    return list(value)

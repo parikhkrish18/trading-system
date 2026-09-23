@@ -120,3 +120,20 @@ def test_load_failure_returns_empty_not_raises(monkeypatch):
     monkeypatch.setattr(store, "get_engine", lambda: _BoomEngine())
 
     assert store.load_recent_pool("v4") == []
+
+
+def test_decode_reasoning_handles_a_jsonb_columns_native_list():
+    """
+    Regression test: reasoning is a JSONB column in production (see
+    data/schema/019_llm_candidate_pool.sql), so the driver hands back an
+    already-deserialized list, never a string -- json.loads on that raised
+    "the JSON object must be str, bytes or bytearray, not list" and crashed
+    every reactivation that hit this fast path. This fixture's SQLite
+    engine stores/returns JSON as plain text, so it can't reproduce that
+    round trip; exercise the decode helper directly instead.
+    """
+    assert store._decode_reasoning([{"phase": 2, "title": "x"}]) == [{"phase": 2, "title": "x"}]
+    assert store._decode_reasoning('[{"phase": 2, "title": "x"}]') == [{"phase": 2, "title": "x"}]
+    assert store._decode_reasoning(None) == []
+    assert store._decode_reasoning("") == []
+    assert store._decode_reasoning([]) == []
