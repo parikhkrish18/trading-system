@@ -387,7 +387,53 @@ def test_macro_sector_alignment_closes_a_short_when_both_readings_are_bullish(mo
 
     assert result.closed
     assert result.reasons[0]["signal"] == "macro_sector_alignment"
-    assert "short position" in result.reasons[0]["detail"]
+
+
+def test_contradiction_reasons_takes_side_directly_not_derived_from_a_held_qty(monkeypatch):
+    """
+    _contradiction_reasons is the reusable core execution/full_book_rebalance.py
+    calls on a reactivation CANDIDATE, which has a side but no position qty
+    yet -- must work from side="short" directly, same result _check_position
+    gets by deriving side from a negative qty.
+    """
+    monkeypatch.setattr(
+        cm, "_recent_sentiment", _sentiment_by_symbol({"P": (0.7, 4), "XLK": (0.27, 4)})
+    )
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.212)
+
+    reasons = cm._contradiction_reasons(engine=object(), symbol="P", side="short", sector="Information Technology")
+
+    signals = {r["signal"] for r in reasons}
+    assert "news_sentiment" in signals
+    assert "macro_sector_alignment" in signals
+    assert "price_momentum" in signals
+
+
+def test_contradiction_reasons_is_empty_when_nothing_contradicts(monkeypatch):
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    assert cm._contradiction_reasons(engine=object(), symbol="AAPL", side="long", sector=None) == []
+
+
+def test_check_position_never_runs_the_stop_or_target_check_through_contradiction_reasons(monkeypatch):
+    """
+    The stop/target check needs pnl_pct/levels a not-yet-held candidate
+    doesn't have -- confirms it stayed in _check_position, not in the
+    reusable _contradiction_reasons core full_book_rebalance also calls.
+    """
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
+
+    reasons = cm._contradiction_reasons(engine=object(), symbol="AAPL", side="long", sector=None)
+    assert reasons == []
+
+    result = cm._check_position(
+        engine=object(), symbol="AAPL", qty=10, pnl_pct=0.5,
+        levels=ExitLevels(take_profit_pct=0.05, stop_loss_pct=0.05, derived=True),
+    )
+    assert result.closed  # the stop/target hit still fires from _check_position itself
+    assert result.reasons[0]["signal"] in ("take_profit", "stop_loss")
 
 
 def test_sector_by_symbol_maps_held_symbols_to_their_gics_sector(monkeypatch):

@@ -200,16 +200,23 @@ def _sector_by_symbol(engine, symbols: list[str]) -> dict[str, str]:
     return dict(zip(df["symbol"], df["gics_sector"], strict=False))
 
 
-def _check_position(
-    engine,
-    symbol: str,
-    qty: float,
-    pnl_pct: float | None = None,
-    levels: ExitLevels | None = None,
-    sector: str | None = None,
-) -> ContradictionResult:
-    side = "long" if qty > 0 else "short"
-    sign = 1.0 if qty > 0 else -1.0
+def _contradiction_reasons(engine, symbol: str, side: str, sector: str | None = None) -> list[dict]:
+    """
+    The sentiment/sector/momentum contradiction signals -- the reusable core
+    of _check_position, factored out so a candidate that ISN'T held yet can
+    be vetted against the exact same live signals before it's opened, not
+    just checked for contradiction after the fact once it's a position.
+
+    Used two ways: _check_position layers the stop/target check on top of
+    this for a currently HELD position, and execution/full_book_rebalance.py
+    calls this directly on a reactivation candidate before opening it --
+    without that second use, a symbol closed here for contradicting current
+    news/momentum could be reopened moments later by a reactivation sourced
+    from a persisted candidate pool that has no way to know about the same
+    news/momentum (see models/candidate_pool_store.py's MAX_POOL_AGE; hit
+    live, see the 2026-09-24 00:37/00:58 P short open-close-reopen).
+    """
+    sign = 1.0 if side == "long" else -1.0
     reasons: list[dict] = []
 
     sentiment, news_count = _recent_sentiment(engine, symbol)
@@ -262,6 +269,20 @@ def _check_position(
             }
         )
 
+    return reasons
+
+
+def _check_position(
+    engine,
+    symbol: str,
+    qty: float,
+    pnl_pct: float | None = None,
+    levels: ExitLevels | None = None,
+    sector: str | None = None,
+) -> ContradictionResult:
+    side = "long" if qty > 0 else "short"
+    reasons = _contradiction_reasons(engine, symbol, side, sector)
+
     # This is not a second contradiction signal, it's the swing trade
     # actually finishing: a stock's own target/stop, sized to its own
     # volatility (execution/exit_levels.py), can resolve in a few days for a
@@ -269,6 +290,9 @@ def _check_position(
     # hourly clock as the two signals above means a trade closes when IT
     # resolves rather than sitting past its own target or stop until next
     # Monday's weekly cycle just because the calendar hadn't come around.
+    # Only meaningful for an already-held position, so it lives here rather
+    # than in _contradiction_reasons -- a reactivation candidate has no P&L
+    # or recorded levels yet.
     hit = hold_rules.check_stop_or_target(pnl_pct, levels, settings.hold_stop_loss_pct, settings.hold_take_profit_pct)
     if hit:
         reasons.append({"signal": hit.kind, "value": pnl_pct, "detail": hit.message})
