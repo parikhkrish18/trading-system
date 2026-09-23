@@ -181,14 +181,16 @@ class Settings(BaseSettings):
 
     # --- Risk limits ---
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
-    # Conservative defaults: these cap sizing in the diversified strategy
-    # (risk.sizing.select_trades) AND act as circuit-breaker thresholds.
-    # The concentrated 2-trade strategy legitimately deploys up to ~70% in
-    # one name — when running STRATEGY_MODE=concentrated, raise these via
-    # env (MAX_SINGLE_POSITION_PCT=0.80, MAX_CORRELATED_EXPOSURE_PCT=0.95)
-    # so the breakers sit above the strategy's intended sizes instead of
-    # tripping on normal operation.
-    max_single_position_pct: float = Field(default=0.25, alias="MAX_SINGLE_POSITION_PCT")
+    # This caps sizing in the diversified strategy (risk.sizing.select_trades)
+    # AND acts as a circuit-breaker threshold (risk/circuit_breakers.py,
+    # checked on every held position every cycle regardless of strategy
+    # mode). The concentrated strategy legitimately deploys up to 70% in one
+    # name (max_concentrated_position_pct) — this is set to 0.80, above that
+    # ceiling, so the breaker has real headroom instead of tripping on a
+    # normal-sized position that simply appreciates. Also live-overridden
+    # via Railway env (MAX_SINGLE_POSITION_PCT) on every production service
+    # that reads it — update both together.
+    max_single_position_pct: float = Field(default=0.80, alias="MAX_SINGLE_POSITION_PCT")
     # Lower than max_single_position_pct deliberately: a long position can
     # only ever lose 100% of what's put in, but a short's loss is structurally
     # uncapped (the underlying can keep rising) — size shorts more
@@ -449,12 +451,18 @@ class Settings(BaseSettings):
     #     regardless of how many names are held.
     #   - min_concentrated_leg_floor_fraction: every leg is guaranteed at
     #     least this fraction of what an EQUAL split would have given it
-    #     (e.g. 0.6 with 3 legs = at least 0.6 * 1/3 = 20% each). Expressed
-    #     as a fraction of the equal share, not an absolute percentage, so
-    #     it stays feasible however many names end up held (2 or 3) instead
-    #     of being tuned for one specific count.
+    #     (e.g. 0.2 with 3 legs = at least 0.2 * 1/3 ~= 6.7% each; with 2
+    #     legs, 0.2 * 1/2 = 10% each). Expressed as a fraction of the equal
+    #     share, not an absolute percentage, so it stays feasible however
+    #     many names end up held (2 or 3) instead of being tuned for one
+    #     specific count. Lowered from 0.6 deliberately: a high floor makes
+    #     the optimizer reluctant to add a 2nd/3rd leg at all when
+    #     conviction is uneven, since every leg it adds must clear this
+    #     floor -- a lower floor lets a lower-conviction second or third
+    #     pick still get a real, if smaller, allocation instead of being
+    #     left out entirely.
     max_concentrated_position_pct: float = Field(default=0.70, alias="MAX_CONCENTRATED_POSITION_PCT")
-    min_concentrated_leg_floor_fraction: float = Field(default=0.6, alias="MIN_CONCENTRATED_LEG_FLOOR_FRACTION")
+    min_concentrated_leg_floor_fraction: float = Field(default=0.2, alias="MIN_CONCENTRATED_LEG_FLOOR_FRACTION")
 
     @property
     def db_url(self) -> str:
