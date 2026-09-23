@@ -893,14 +893,35 @@ def _apply_llm_advice_to_scored(scored: pd.DataFrame, advice: dict) -> pd.DataFr
     column populated for them -- handed to select_concentrated_trades so
     its own, unmodified picking/weighting/shortability logic operates on
     Claude's recommended pool instead of the raw conviction-score ranking.
+
+    Claude's own predicted_return_pct, when given, REPLACES predicted_return
+    (and the conviction_score derived from it) for a picked symbol --
+    magnitude only, never direction: the sign is kept from whatever the
+    quant model already forecast for that symbol, since that's what decided
+    long vs. short and cleared score_universe's gates in the first place.
+    This flows through to everything downstream that reads predicted_return
+    off this row -- select_concentrated_trades's weighting, and
+    attach_exit_levels' take-profit target sizing (see execution/
+    exit_levels.py's exit_levels_for/exit_levels_advised). A missing or
+    non-finite predicted_return_pct leaves the quant value untouched for
+    that symbol, same fail-open convention as the rest of this pipeline.
     """
     result = scored.copy()
     result["llm_confidence"] = np.nan
     picks = set(advice["picks"])
     result["confident"] = result["symbol"].isin(picks)
     for symbol, info in advice["by_symbol"].items():
-        if symbol in picks:
-            result.loc[result["symbol"] == symbol, "llm_confidence"] = info["confidence"]
+        if symbol not in picks:
+            continue
+        mask = result["symbol"] == symbol
+        result.loc[mask, "llm_confidence"] = info["confidence"]
+        pr_pct = info.get("predicted_return_pct")
+        if pr_pct is not None:
+            current = result.loc[mask, "predicted_return"]
+            if not current.empty:
+                original_sign = 1.0 if current.iloc[0] >= 0 else -1.0
+                result.loc[mask, "predicted_return"] = original_sign * pr_pct
+                result.loc[mask, "conviction_score"] = pr_pct
     return result
 
 
@@ -1584,8 +1605,9 @@ def run_screen_with_scores(
             # advised on would silently vanish from that chart even though
             # the attribution was computed and shown to Claude as input.
             top_features_by_symbol = {c["symbol"]: c["top_features"] for c in llm_pool}
+            scored_with_llm_advice = _apply_llm_advice_to_scored(scored, llm_advice)
             candidates = select_concentrated_trades(
-                _apply_llm_advice_to_scored(scored, llm_advice),
+                scored_with_llm_advice,
                 max_leg_pct=settings.max_concentrated_position_pct,
                 min_leg_floor_fraction=settings.min_concentrated_leg_floor_fraction,
                 max_positions=len(llm_advice["picks"]),
@@ -1612,7 +1634,14 @@ def run_screen_with_scores(
             # ensemble retrain + rescreen every time it finds the book
             # empty. Best-effort: never worth failing a live screen over.
             try:
-                extra_by_symbol = scored.set_index("symbol")[["direction_agreement", "conviction_score"]].to_dict("index")
+                # From scored_with_llm_advice, not scored -- carries Claude's
+                # replacement predicted_return/conviction_score for picked
+                # symbols (see _apply_llm_advice_to_scored), so a later
+                # reactivation redeploys against the same forecast this
+                # cycle actually traded on, not the superseded quant one.
+                extra_by_symbol = scored_with_llm_advice.set_index("symbol")[
+                    ["direction_agreement", "conviction_score", "predicted_return"]
+                ].to_dict("index")
                 pool_to_save = [
                     {
                         "symbol": c["symbol"],

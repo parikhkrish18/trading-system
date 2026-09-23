@@ -57,13 +57,14 @@ def _candidate(symbol="AAPL", **overrides):
     return base
 
 
-def _valid_response(symbols, picks=None):
+def _valid_response(symbols, picks=None, predicted_return_pct=0.05):
     return json.dumps(
         {
             "candidates": [
                 {
                     "symbol": s,
                     "confidence": 0.7,
+                    "predicted_return_pct": predicted_return_pct,
                     "take_profit_pct": 0.08,
                     "stop_loss_pct": 0.04,
                     "signals_summary": "sig", "signals_lines": ["a"],
@@ -102,11 +103,38 @@ def test_happy_path_parses_confidence_reasoning_and_picks(monkeypatch):
     assert result["picks"] == ["AAPL", "MSFT"]
     aapl = result["by_symbol"]["AAPL"]
     assert aapl["confidence"] == pytest.approx(0.7)
+    assert aapl["predicted_return_pct"] == pytest.approx(0.05)
     assert aapl["take_profit_pct"] == pytest.approx(0.08)
     assert aapl["stop_loss_pct"] == pytest.approx(0.04)
     assert [p["phase"] for p in aapl["reasoning"]] == [2, 3, 4]
     assert aapl["reasoning"][0]["summary"] == "sig"
     assert aapl["reasoning"][0]["lines"] == ["a"]
+
+
+def test_predicted_return_pct_is_taken_as_a_positive_magnitude(monkeypatch):
+    """Direction is fixed by the candidate's own side upstream -- a negative value from Claude is a magnitude, not a sign flip."""
+    monkeypatch.setattr(llm_advisor.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        llm_advisor, "Anthropic",
+        lambda api_key: _FakeAnthropic(lambda m: _valid_response(["AAPL"], predicted_return_pct=-0.06)),
+    )
+
+    result = llm_advisor.get_llm_trade_advice([_candidate("AAPL")], {}, max_picks=1)
+    assert result["by_symbol"]["AAPL"]["predicted_return_pct"] == pytest.approx(0.06)
+
+
+def test_predicted_return_pct_is_none_when_omitted(monkeypatch):
+    monkeypatch.setattr(llm_advisor.settings, "anthropic_api_key", "test-key")
+
+    def respond(messages):
+        resp = json.loads(_valid_response(["AAPL"]))
+        del resp["candidates"][0]["predicted_return_pct"]
+        return json.dumps(resp)
+
+    monkeypatch.setattr(llm_advisor, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+
+    result = llm_advisor.get_llm_trade_advice([_candidate("AAPL")], {}, max_picks=1)
+    assert result["by_symbol"]["AAPL"]["predicted_return_pct"] is None
 
 
 def test_confidence_is_clamped_to_zero_one(monkeypatch):

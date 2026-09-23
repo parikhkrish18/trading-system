@@ -1919,3 +1919,36 @@ def test_apply_llm_advice_to_scored_never_mutates_the_original():
     _apply_llm_advice_to_scored(scored, {"by_symbol": {}, "picks": []})
     assert "llm_confidence" not in scored.columns
     assert scored["confident"].iloc[0]
+
+
+def test_apply_llm_advice_to_scored_replaces_predicted_return_magnitude_for_a_long_pick():
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True}])
+    advice = {"by_symbol": {"AAPL": {"confidence": 0.8, "predicted_return_pct": 0.07}}, "picks": ["AAPL"]}
+
+    result = _apply_llm_advice_to_scored(scored, advice)
+
+    row = result.set_index("symbol").loc["AAPL"]
+    assert row["predicted_return"] == pytest.approx(0.07)  # sign kept positive (long), magnitude replaced
+    assert row["conviction_score"] == pytest.approx(0.07)
+
+
+def test_apply_llm_advice_to_scored_replaces_predicted_return_magnitude_never_direction_for_a_short_pick():
+    scored = _scored_df([{"symbol": "TSLA", "predicted_return": -0.03, "direction_agreement": 1.0, "confident": True}])
+    advice = {"by_symbol": {"TSLA": {"confidence": 0.6, "predicted_return_pct": 0.09}}, "picks": ["TSLA"]}
+
+    result = _apply_llm_advice_to_scored(scored, advice)
+
+    row = result.set_index("symbol").loc["TSLA"]
+    assert row["predicted_return"] == pytest.approx(-0.09)  # stays short, magnitude replaced
+    assert row["conviction_score"] == pytest.approx(0.09)
+
+
+def test_apply_llm_advice_to_scored_leaves_quant_forecast_when_claude_gives_no_predicted_return_pct():
+    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True}])
+    advice = {"by_symbol": {"AAPL": {"confidence": 0.8, "predicted_return_pct": None}}, "picks": ["AAPL"]}
+
+    result = _apply_llm_advice_to_scored(scored, advice)
+
+    row = result.set_index("symbol").loc["AAPL"]
+    assert row["predicted_return"] == pytest.approx(0.04)
+    assert row["conviction_score"] == pytest.approx(0.04)

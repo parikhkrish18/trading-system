@@ -7,12 +7,22 @@ cost/ATR-floor hurdle and apply_macro_sector_block's hard block -- it can
 rank and pick among them, but can never introduce a symbol that failed a
 hard gate (see _parse_advice's valid_symbols check).
 
-Advisory, not authoritative, on money: its confidence score only
-RE-WEIGHTS capital within select_concentrated_trades's existing
-_bounded_conviction_weights floor/cap, and its suggested TP/SL is clamped
-to execution/exit_levels.py's existing volatility-derived bounds
+Its confidence score RE-WEIGHTS capital within select_concentrated_trades's
+existing _bounded_conviction_weights floor/cap, and its suggested TP/SL is
+clamped to execution/exit_levels.py's existing volatility-derived bounds
 (exit_levels_advised) -- it can never set a position size or exit level
 outside what the system's existing risk settings already allow.
+
+Its predicted_return_pct DOES replace the quant ensemble's own forecast
+for a picked symbol (see models/screener.py's _apply_llm_advice_to_scored)
+-- magnitude only, never direction: the candidate's side (long/short) was
+already decided by the quant model and can't be flipped here, only how big
+the move is expected to be, informed by qualitative context (news,
+Donchian support/resistance, sector sentiment) the quant model never sees.
+That replaces conviction_score too, and everything downstream that reads
+it -- position sizing weight, take-profit target sizing. A missing or
+invalid predicted_return_pct falls back to the quant forecast unchanged,
+same fail-open convention as everything else here.
 
 Fails closed: an unset ANTHROPIC_API_KEY, an API error, or a response that
 never parses after retries all return None. The caller
@@ -25,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 
 from anthropic import Anthropic
 
@@ -123,6 +134,23 @@ def _build_system_prompt() -> str:
         "regime) argues for more or less conviction than that raw number "
         "alone suggests, or if the setup doesn't realistically support "
         "resolving within the week.\n\n"
+        "Also give your own predicted_return_pct: how large a move you "
+        "genuinely expect over the week, as a POSITIVE fraction (e.g. 0.04 "
+        "for 4%) -- magnitude only, in the direction the candidate's side "
+        "already establishes (long or short was decided upstream of you "
+        "and can't change here). predicted_return on each candidate is the "
+        "quant model's own forecast, informational, not a floor or ceiling "
+        "-- weigh it against everything else you were given (top_features, "
+        "recent_headlines, donchian_support/donchian_resistance, "
+        "macro_sector_sentiment, atr_pct, signal_to_noise) and give your "
+        "own honest estimate. A story with strong confirming news and a "
+        "clean breakout past resistance can genuinely support a bigger "
+        "move than the quant number alone suggests; a stock with the same "
+        "quant forecast but stale/contradicting news or real resistance "
+        "sitting right on top of entry should get a smaller one. This "
+        "number replaces the quant forecast for sizing and the "
+        "take-profit target on any candidate you pick, so it should be a "
+        "real, considered estimate, not a rubber stamp of the input.\n\n"
         "Suggest take_profit_pct and stop_loss_pct (positive fractions of "
         "entry price, e.g. 0.07 for 7%) for an entry at current_price -- "
         "quant_take_profit_pct/quant_stop_loss_pct on each candidate show "
@@ -140,6 +168,7 @@ def _build_system_prompt() -> str:
         "list.\n\n"
         "Respond with ONLY a JSON object of this exact shape, no other text:\n"
         '{"candidates": [{"symbol": <string>, "confidence": <float 0-1>, '
+        '"predicted_return_pct": <float, positive>, '
         '"take_profit_pct": <float>, "stop_loss_pct": <float>, '
         '"signals_summary": <string>, "signals_lines": [<string>, ...], '
         '"forecast_summary": <string>, "forecast_lines": [<string>, ...], '
@@ -172,8 +201,14 @@ def _parse_advice(text: str, valid_symbols: set[str]) -> dict:
         symbol = str(c["symbol"])
         if symbol not in valid_symbols:
             continue
+        predicted_return_pct = c.get("predicted_return_pct")
+        if predicted_return_pct is not None:
+            predicted_return_pct = abs(float(predicted_return_pct))
+            if not math.isfinite(predicted_return_pct):
+                predicted_return_pct = None
         by_symbol[symbol] = {
             "confidence": max(0.0, min(1.0, float(c["confidence"]))),
+            "predicted_return_pct": predicted_return_pct,
             "take_profit_pct": float(c["take_profit_pct"]) if c.get("take_profit_pct") is not None else None,
             "stop_loss_pct": float(c["stop_loss_pct"]) if c.get("stop_loss_pct") is not None else None,
             "reasoning": [
@@ -228,10 +263,14 @@ def get_llm_trade_advice(candidates: list[dict], market_context: dict, max_picks
     exit_bounds (see models/screener.py's _build_llm_candidate_pool for the
     exact assembly).
 
-    Returns {"by_symbol": {symbol: {confidence, take_profit_pct,
-    stop_loss_pct, reasoning}}, "picks": [symbol, ...]} on success, or None
-    (never raises) when the API key is unset, the pool is empty, the call
-    fails, or the response never validates after retries.
+    Returns {"by_symbol": {symbol: {confidence, predicted_return_pct,
+    take_profit_pct, stop_loss_pct, reasoning}}, "picks": [symbol, ...]} on
+    success, or None (never raises) when the API key is unset, the pool is
+    empty, the call fails, or the response never validates after retries.
+    predicted_return_pct is a positive magnitude (direction already fixed
+    by the candidate's own side) or None when Claude didn't give one --
+    see models/screener.py's _apply_llm_advice_to_scored for how it
+    replaces the quant forecast.
     """
     if not settings.anthropic_api_key or not candidates:
         return None
