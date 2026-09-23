@@ -449,12 +449,18 @@ class Settings(BaseSettings):
     #     regardless of how many names are held.
     #   - min_concentrated_leg_floor_fraction: every leg is guaranteed at
     #     least this fraction of what an EQUAL split would have given it
-    #     (e.g. 0.6 with 3 legs = at least 0.6 * 1/3 = 20% each). Expressed
-    #     as a fraction of the equal share, not an absolute percentage, so
-    #     it stays feasible however many names end up held (2 or 3) instead
-    #     of being tuned for one specific count.
+    #     (e.g. 0.2 with 3 legs = at least 0.2 * 1/3 ~= 6.7% each; with 2
+    #     legs, 0.2 * 1/2 = 10% each). Expressed as a fraction of the equal
+    #     share, not an absolute percentage, so it stays feasible however
+    #     many names end up held (2 or 3) instead of being tuned for one
+    #     specific count. Lowered from 0.6 deliberately: a high floor makes
+    #     the optimizer reluctant to add a 2nd/3rd leg at all when
+    #     conviction is uneven, since every leg it adds must clear this
+    #     floor -- a lower floor lets a lower-conviction second or third
+    #     pick still get a real, if smaller, allocation instead of being
+    #     left out entirely.
     max_concentrated_position_pct: float = Field(default=0.70, alias="MAX_CONCENTRATED_POSITION_PCT")
-    min_concentrated_leg_floor_fraction: float = Field(default=0.6, alias="MIN_CONCENTRATED_LEG_FLOOR_FRACTION")
+    min_concentrated_leg_floor_fraction: float = Field(default=0.2, alias="MIN_CONCENTRATED_LEG_FLOOR_FRACTION")
 
     @property
     def db_url(self) -> str:
