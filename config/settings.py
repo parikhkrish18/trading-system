@@ -279,6 +279,23 @@ class Settings(BaseSettings):
     # this stock's own ATR is available; the cost floor alone is the bar
     # otherwise, same as before this existed.
     screener_min_return_atr_fraction: float = Field(default=0.5, alias="SCREENER_MIN_RETURN_ATR_FRACTION")
+    # A DIFFERENT bar from the fraction above -- that one scales the
+    # required forecast to THIS stock's own ATR, so a barely-moving stock
+    # can still pass on a barely-moving forecast (both small, but small
+    # relative to each other). This one is an absolute floor on the ATR
+    # itself: a stock whose own 14-day ATR never even clears this fraction
+    # of its price is too calm to be worth trading at all, regardless of
+    # what the model predicts -- a 2% take-profit target isn't "small but
+    # proportionate" on a stock like that, it's a target with no
+    # meaningful room to run before the round-trip cost eats it, sized off
+    # a stock that barely moves in the first place. Hit live: TECH (ATR
+    # under 0.5% of price) cleared the scaled bar above on a tiny forecast
+    # and got a 2% take-profit against a 5% stop-loss -- see
+    # execution/exit_levels.py's exit_min_reward_risk_ratio for the other
+    # half of that same fix. Same graceful fallback as the fraction above:
+    # a symbol with no measurable ATR is neither filtered nor required to
+    # clear this.
+    screener_min_atr_pct: float = Field(default=0.006, alias="SCREENER_MIN_ATR_PCT")
     # Both take-profit AND stop-loss are additionally tightened toward the
     # nearest real Donchian support/resistance level within this many
     # trading days of history, when one sits closer than the ATR/sigma
@@ -299,6 +316,22 @@ class Settings(BaseSettings):
     # set a 1% stop that closes on the first ordinary day.
     exit_min_stop_loss_pct: float = Field(default=0.05, alias="EXIT_MIN_STOP_LOSS_PCT")
     exit_max_stop_loss_pct: float = Field(default=0.20, alias="EXIT_MAX_STOP_LOSS_PCT")
+    # Take-profit and stop-loss are sized independently -- one off this
+    # stock's own ATR, the other off its own volatility-sigma -- with no
+    # link between them, so nothing stopped a trade from targeting a take-
+    # profit smaller than what it risked. Hit live: TECH proposed at a 2%
+    # take-profit against a 5% stop-loss, because exit_min_take_profit_pct
+    # (3%) is documented as a fallback for the no-ATR case only (see its
+    # own comment above) and was never meant to floor the ATR-derived
+    # value the way it does the sigma-derived one. The screener-side fix
+    # (models/screener.py's settings.screener_min_atr_pct) stops a stock
+    # this calm from being picked at all, but this is the last line of
+    # defense in exit_levels_for/exit_levels_advised: whatever take-profit
+    # comes out of ATR/sigma/channel sizing, or an LLM's own suggestion,
+    # never gets proposed at less than this fraction of the stop-loss it's
+    # paired with. 0.6 matches the ratio the two independent floors above
+    # (3%/5%) already implied was the intended worst case.
+    exit_min_reward_risk_ratio: float = Field(default=0.6, alias="EXIT_MIN_REWARD_RISK_RATIO")
 
     # --- Between-cycle emergency brake (execution/contradiction_monitor.py) ---
     # How far a held position must move against itself, over the monitor's
