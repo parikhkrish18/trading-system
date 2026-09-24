@@ -51,7 +51,6 @@ from data.ingest.universe import resolve_symbols
 from execution.exit_levels import ExitLevels, exit_levels_advised, exit_levels_for
 from features.build_features import fundamentals_prior_context
 from features.quant.volatility import realized_vol
-from models.candidate_pool_store import save_candidate_pool
 from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
 from models.llm_advisor import get_llm_trade_advice
@@ -925,37 +924,6 @@ def _apply_llm_advice_to_scored(scored: pd.DataFrame, advice: dict) -> pd.DataFr
     return result
 
 
-def _build_pool_to_save(llm_pool: list[dict], llm_advice: dict, scored_with_llm_advice: pd.DataFrame) -> list[dict]:
-    """
-    This cycle's actual picks only, for models/candidate_pool_store.py to
-    persist -- see that module's docstring for why not every symbol Claude
-    was merely consulted on: a symbol Claude wrote up as a pass must not be
-    eligible to resurface via a later reactivation just because it was
-    saved alongside the real picks.
-
-    predicted_return/conviction_score/direction_agreement come from
-    scored_with_llm_advice (the _apply_llm_advice_to_scored output), not
-    llm_pool's own quant-only values -- carries Claude's replacement
-    forecast for a picked symbol, so a later reactivation redeploys
-    against the same forecast this cycle actually traded on.
-    """
-    extra_by_symbol = scored_with_llm_advice.set_index("symbol")[
-        ["direction_agreement", "conviction_score", "predicted_return"]
-    ].to_dict("index")
-    picks = set(llm_advice["picks"])
-    return [
-        {
-            "symbol": c["symbol"],
-            "side": c.get("side"),
-            "predicted_return": c.get("predicted_return"),
-            **extra_by_symbol.get(c["symbol"], {}),
-            **llm_advice["by_symbol"][c["symbol"]],
-        }
-        for c in llm_pool
-        if c["symbol"] in picks
-    ]
-
-
 def _load_fundamentals_context(symbols: list[str]) -> dict[tuple[str, str], dict]:
     """
     Loads just enough of the raw `fundamentals` history (two filings per
@@ -1657,18 +1625,6 @@ def run_screen_with_scores(
                     if phase["phase"] == 2:
                         phase["top_features"] = top_features_by_symbol.get(candidate.symbol, [])
                 llm_exit_hints[candidate.symbol] = (info["take_profit_pct"], info["stop_loss_pct"])
-
-            # Persisted so a later flat-book reactivation can redeploy
-            # against this week's already-computed analysis instead of
-            # paying for a fresh ensemble retrain + rescreen every time it
-            # finds the book empty -- picks only, see _build_pool_to_save
-            # and models/candidate_pool_store.py's docstring for why.
-            # Best-effort: never worth failing a live screen over.
-            try:
-                pool_to_save = _build_pool_to_save(llm_pool, llm_advice, scored_with_llm_advice)
-                save_candidate_pool(feature_set_id, pool_to_save)
-            except Exception:
-                logger.exception("Could not persist this cycle's candidate pool for later reactivation reuse.")
         else:
             candidates = select_concentrated_trades(
                 scored,

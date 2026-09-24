@@ -67,32 +67,14 @@ def _candidate(symbol, conviction):
     )
 
 
-def _pool_row(symbol, confidence, side="long", predicted_return=0.05):
-    return {
-        "symbol": symbol,
-        "side": side,
-        "predicted_return": predicted_return,
-        "direction_agreement": 0.9,
-        "conviction_score": confidence,
-        "confidence": confidence,
-        "take_profit_pct": 0.08,
-        "stop_loss_pct": 0.04,
-        "reasoning": [{"phase": 2, "title": "x", "summary": "s", "lines": []}],
-    }
-
-
 @pytest.fixture(autouse=True)
 def _quiet_side_effects(monkeypatch):
     monkeypatch.setattr(fbr, "send_followup", lambda *a, **k: None)
     monkeypatch.setattr(fbr, "replicate_to_clients", lambda *a, **k: None)
     monkeypatch.setattr(fbr, "_correlation_matrix", lambda *a, **k: pd.DataFrame())
-    # Real usage hits the DB; tests opt in per-case with their own pool via
-    # monkeypatch.setattr(fbr, "load_recent_pool", ...) instead of relying on
-    # the real load_recent_pool's own internal DB-failure fallback to [].
-    monkeypatch.setattr(fbr, "load_recent_pool", lambda *a, **k: [])
-    # Same reasoning: real usage hits the DB (news_events/prices/universe)
-    # for the contradiction pre-check. Default to a no-op passthrough; tests
-    # of the check itself override this back via monkeypatch per-case.
+    # Real usage hits the DB (news_events/prices/universe) for the
+    # contradiction pre-check. Default to a no-op passthrough; tests of the
+    # check itself override this back via monkeypatch per-case.
     monkeypatch.setattr(fbr, "_drop_immediately_contradicted", lambda engine, candidates: candidates)
 
 
@@ -237,89 +219,6 @@ def test_rebalance_proceeds_once_the_exit_settles_during_the_wait(monkeypatch):
     fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols={"EXITED"}, request_fn=_approve_all)
 
     assert any(symbol == "NEW" for symbol, _ in broker.targets)
-
-
-# ---------- fast path: reuse this week's persisted candidate pool ----------
-
-
-def test_reactivation_uses_the_persisted_pool_instead_of_a_fresh_rescreen(monkeypatch):
-    """
-    A recent persisted pool (models/candidate_pool_store.py) must skip
-    run_screen entirely -- that's the whole point, it's several minutes of
-    ensemble retraining a flat-book redeploy shouldn't have to pay for
-    every time.
-    """
-    monkeypatch.setattr(settings, "strategy_mode", "concentrated")
-    monkeypatch.setattr(settings, "max_concentrated_position_pct", 0.70)
-    monkeypatch.setattr(settings, "min_concentrated_leg_floor_fraction", 0.6)
-    monkeypatch.setattr(settings, "max_concentrated_positions", 2)
-    monkeypatch.setattr(settings, "allow_shorts", False)
-    broker = _Broker({})
-
-    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 1.0)
-    monkeypatch.setattr(
-        fbr, "load_recent_pool", lambda *a, **k: [_pool_row("A", 0.9), _pool_row("B", 0.6)]
-    )
-    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: pytest.fail("must not rescreen when a persisted pool is usable"))
-    monkeypatch.setattr(fbr, "load_active_universe", lambda: pytest.fail("must not load the universe when a persisted pool is usable"))
-    monkeypatch.setattr(fbr, "_latest_prices", lambda *a, **k: {"A": 100.0, "B": 100.0})
-
-    fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
-
-    assert {s for s, _ in broker.targets} == {"A", "B"}
-
-
-def test_reactivation_falls_back_to_rescreen_when_no_pool_is_persisted(monkeypatch):
-    monkeypatch.setattr(settings, "strategy_mode", "concentrated")
-    monkeypatch.setattr(settings, "max_concentrated_position_pct", 0.70)
-    broker = _Broker({})
-
-    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 1.0)
-    monkeypatch.setattr(fbr, "load_recent_pool", lambda *a, **k: [])
-    monkeypatch.setattr(fbr, "load_active_universe", lambda: ["A"])
-    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: [_candidate("A", 0.5)])
-    monkeypatch.setattr(fbr, "_latest_prices", lambda *a, **k: {"A": 100.0})
-
-    fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
-
-    assert any(symbol == "A" for symbol, _ in broker.targets)
-
-
-def test_reactivation_pool_fast_path_excludes_the_symbol_that_just_closed(monkeypatch):
-    """Same exclusion rule the rescreen path already applies via load_active_universe's filter."""
-    monkeypatch.setattr(settings, "strategy_mode", "concentrated")
-    monkeypatch.setattr(settings, "max_concentrated_position_pct", 0.70)
-    monkeypatch.setattr(settings, "max_concentrated_positions", 2)
-    monkeypatch.setattr(settings, "allow_shorts", False)
-    broker = _Broker({"KEEP": 100.0})
-
-    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 0.5)
-    monkeypatch.setattr(
-        fbr, "load_recent_pool", lambda *a, **k: [_pool_row("EXITED", 0.9), _pool_row("NEW", 0.6)]
-    )
-    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: pytest.fail("must not rescreen when a persisted pool is usable"))
-    monkeypatch.setattr(fbr, "_latest_prices", lambda *a, **k: {"KEEP": 100.0, "NEW": 100.0})
-
-    fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols={"EXITED"}, request_fn=_approve_all)
-
-    assert "EXITED" not in {s for s, _ in broker.targets}
-    assert any(symbol == "NEW" for symbol, _ in broker.targets)
-
-
-def test_reactivation_pool_fast_path_is_skipped_in_diversified_mode(monkeypatch):
-    """The persisted pool is written in the concentrated-mode shape (llm_confidence-ranked) -- diversified mode always rescreens."""
-    monkeypatch.setattr(settings, "strategy_mode", "diversified")
-    broker = _Broker({})
-
-    monkeypatch.setattr(fbr, "_freed_capital_fraction", lambda *a, **k: 1.0)
-    monkeypatch.setattr(fbr, "load_recent_pool", lambda *a, **k: [_pool_row("A", 0.9)])
-    monkeypatch.setattr(fbr, "load_active_universe", lambda: ["A"])
-    monkeypatch.setattr(fbr, "run_screen", lambda *a, **k: [_candidate("A", 0.5)])
-    monkeypatch.setattr(fbr, "_latest_prices", lambda *a, **k: {"A": 100.0})
-
-    fbr.rebalance_after_exit(broker, engine=object(), excluded_symbols=set(), request_fn=_approve_all)
-
-    assert any(symbol == "A" for symbol, _ in broker.targets)
 
 
 # ---------- pre-open contradiction check on reactivation candidates ----------

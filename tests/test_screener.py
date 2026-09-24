@@ -15,7 +15,6 @@ from models.screener import (
     _apply_llm_advice_to_scored,
     _attach_reasoning,
     _bounded_conviction_weights,
-    _build_pool_to_save,
     _channel_distances,
     _solidified_channel_distances,
     apply_macro_sector_block,
@@ -1953,63 +1952,3 @@ def test_apply_llm_advice_to_scored_leaves_quant_forecast_when_claude_gives_no_p
     row = result.set_index("symbol").loc["AAPL"]
     assert row["predicted_return"] == pytest.approx(0.04)
     assert row["conviction_score"] == pytest.approx(0.04)
-
-
-# --------------------------------------------------------------------------
-# _build_pool_to_save
-# --------------------------------------------------------------------------
-
-
-def test_build_pool_to_save_only_includes_symbols_claude_actually_picked():
-    """
-    Regression test: a symbol Claude was consulted on but wrote up as a
-    pass (e.g. "This is a pass-level setup ... better to sit out") must
-    not be persisted -- the reactivation fast path treats every persisted
-    row as confident=True with no way to tell picked from merely-advised,
-    so a pass that got saved could resurface as a live trade days later.
-    """
-    llm_pool = [
-        {"symbol": "AAPL", "side": "long", "predicted_return": 0.04},
-        {"symbol": "PASSED", "side": "short", "predicted_return": -0.01},
-    ]
-    llm_advice = {
-        "by_symbol": {
-            "AAPL": {"confidence": 0.8, "reasoning": [], "take_profit_pct": 0.08, "stop_loss_pct": 0.04},
-            "PASSED": {"confidence": 0.1, "reasoning": [], "take_profit_pct": None, "stop_loss_pct": None},
-        },
-        "picks": ["AAPL"],  # PASSED was consulted on but not picked
-    }
-    scored = _scored_df(
-        [
-            {"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": True},
-            {"symbol": "PASSED", "predicted_return": -0.01, "direction_agreement": 1.0, "confident": False},
-        ]
-    )
-
-    pool_to_save = _build_pool_to_save(llm_pool, llm_advice, scored)
-
-    assert [row["symbol"] for row in pool_to_save] == ["AAPL"]
-
-
-def test_build_pool_to_save_uses_the_llm_adjusted_forecast_not_the_raw_quant_one():
-    llm_pool = [{"symbol": "AAPL", "side": "long", "predicted_return": 0.04}]
-    llm_advice = {
-        "by_symbol": {"AAPL": {"confidence": 0.8, "reasoning": [], "take_profit_pct": 0.08, "stop_loss_pct": 0.04}},
-        "picks": ["AAPL"],
-    }
-    # As _apply_llm_advice_to_scored would leave it after replacing the forecast.
-    scored_with_llm_advice = _scored_df(
-        [{"symbol": "AAPL", "predicted_return": 0.07, "direction_agreement": 1.0, "confident": True}]
-    )
-
-    pool_to_save = _build_pool_to_save(llm_pool, llm_advice, scored_with_llm_advice)
-
-    assert pool_to_save[0]["predicted_return"] == pytest.approx(0.07)
-
-
-def test_build_pool_to_save_is_empty_when_nothing_was_picked():
-    llm_pool = [{"symbol": "AAPL", "side": "long", "predicted_return": 0.04}]
-    llm_advice = {"by_symbol": {"AAPL": {"confidence": 0.1, "reasoning": [], "take_profit_pct": None, "stop_loss_pct": None}}, "picks": []}
-    scored = _scored_df([{"symbol": "AAPL", "predicted_return": 0.04, "direction_agreement": 1.0, "confident": False}])
-
-    assert _build_pool_to_save(llm_pool, llm_advice, scored) == []
