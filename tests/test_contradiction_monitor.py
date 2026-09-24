@@ -551,6 +551,131 @@ def test_reversed_momentum_closes_a_short_position(monkeypatch):
     assert results[0].reasons[0]["signal"] == "price_momentum"
 
 
+# --------------------------------------------------------------------------
+# _apply_second_opinions
+# --------------------------------------------------------------------------
+
+
+def _flagged(symbol="P", side="short", signal="news_sentiment", detail="P's own sentiment contradicts short"):
+    return cm.ContradictionResult(symbol=symbol, side=side, closed=True, reasons=[{"signal": signal, "value": 0.7, "detail": detail}])
+
+
+def test_apply_second_opinions_skips_a_hard_stop_or_target_hit(monkeypatch):
+    """A mechanical stop/target exit is never a judgment call -- must never even reach the API-key check."""
+    monkeypatch.setattr(cm.settings, "anthropic_api_key", "test-key")
+    called = []
+    monkeypatch.setattr(cm, "get_second_opinions", lambda payload: called.append(payload) or {})
+
+    result = cm.ContradictionResult(
+        symbol="AAPL", side="long", closed=True,
+        reasons=[{"signal": "stop_loss", "value": -0.1, "detail": "stop loss: -10.0% unrealized, limit -5.0%"}],
+    )
+    cm._apply_second_opinions([result], {})
+
+    assert called == []
+    assert result.closed is True
+
+
+def test_apply_second_opinions_is_skipped_entirely_when_api_key_is_unset(monkeypatch):
+    monkeypatch.setattr(cm.settings, "anthropic_api_key", "")
+    headline_calls = []
+    monkeypatch.setattr(cm, "_load_recent_headlines", lambda symbols: headline_calls.append(symbols) or {})
+
+    result = _flagged()
+    cm._apply_second_opinions([result], {})
+
+    assert headline_calls == []  # never pays for the DB round trip on the common (unset-key) case
+    assert result.closed is True
+
+
+def test_apply_second_opinions_overrules_a_close_when_claude_disagrees(monkeypatch):
+    monkeypatch.setattr(cm.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(cm, "_load_recent_headlines", lambda symbols: {})
+    monkeypatch.setattr(
+        cm, "get_second_opinions",
+        lambda payload: {"P": {"close": False, "reasoning": "Bullish headline flow outweighs the momentum blip."}},
+    )
+    alerts = []
+    monkeypatch.setattr(cm, "send_slack_alert", lambda msg, severity="info": alerts.append(msg))
+    monkeypatch.setattr(cm, "send_followup", lambda msg: alerts.append(msg))
+
+    result = _flagged()
+    cm._apply_second_opinions([result], {})
+
+    assert result.closed is False  # the record must not claim a close that didn't happen
+    assert any("Bullish headline flow" in a for a in alerts)
+
+
+def test_apply_second_opinions_keeps_the_close_and_records_reasoning_when_claude_agrees(monkeypatch):
+    monkeypatch.setattr(cm.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(cm, "_load_recent_headlines", lambda symbols: {})
+    monkeypatch.setattr(
+        cm, "get_second_opinions",
+        lambda payload: {"P": {"close": True, "reasoning": "No real catalyst supports holding through this."}},
+    )
+
+    result = _flagged()
+    cm._apply_second_opinions([result], {})
+
+    assert result.closed is True
+    assert result.reasons[-1]["signal"] == "llm_second_opinion"
+    assert "No real catalyst" in result.reasons[-1]["detail"]
+
+
+def test_apply_second_opinions_fails_closed_when_claude_is_unreachable(monkeypatch):
+    """An API outage, a bad response after retries, or an unset key must never silently keep a flagged position open."""
+    monkeypatch.setattr(cm.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(cm, "_load_recent_headlines", lambda symbols: {})
+    monkeypatch.setattr(cm, "get_second_opinions", lambda payload: None)
+
+    result = _flagged()
+    cm._apply_second_opinions([result], {})
+
+    assert result.closed is True
+    assert result.reasons[-1]["signal"] == "news_sentiment"  # nothing appended -- opinion never came back
+
+
+def test_apply_second_opinions_fails_closed_when_claude_omits_a_symbol(monkeypatch):
+    monkeypatch.setattr(cm.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(cm, "_load_recent_headlines", lambda symbols: {})
+    monkeypatch.setattr(cm, "get_second_opinions", lambda payload: {})  # responded, but not about P
+
+    result = _flagged()
+    cm._apply_second_opinions([result], {})
+
+    assert result.closed is True
+
+
+def test_second_opinion_overrule_keeps_the_position_out_of_the_close_proposal(monkeypatch):
+    """End to end: an overruled contradiction must never reach the approval gate or actually close at the broker."""
+    broker = _FakeBroker({"P": -20})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.7, 5))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: _past_the_brake())
+    monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
+    monkeypatch.setattr(cm.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(cm, "_load_recent_headlines", lambda symbols: {})
+    monkeypatch.setattr(
+        cm, "get_second_opinions",
+        lambda payload: {"P": {"close": False, "reasoning": "False alarm -- ride it out."}},
+    )
+
+    proposal_calls = []
+
+    def _gate(proposals, *, context, **kwargs):
+        proposal_calls.append(list(proposals))
+        return _approve_all(proposals, context=context, **kwargs)
+
+    results = cm.run_contradiction_check(request_fn=_gate)
+
+    assert proposal_calls == []  # never even asked to approve a close
+    assert broker.closed == []
+    assert results[0].closed is False
+
+
 def test_closure_triggers_reactivation_attempt(monkeypatch):
     broker = _FakeBroker({"AAPL": 10})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)

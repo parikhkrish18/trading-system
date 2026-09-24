@@ -58,6 +58,7 @@ from execution.approval_gate import ProposedTrade, advisory_lock, request_approv
 from execution.broker import get_broker
 from execution.client_fanout import replicate_to_clients
 from execution.client_risk_controls import check_all_clients_risk
+from execution.contradiction_advisor import get_second_opinions
 from execution.exit_levels import ExitLevels
 from execution.trading_loop import (
     _allocation_confirmation,
@@ -70,7 +71,7 @@ from execution.trading_loop import (
 from features.qualitative.macro_sentiment import SECTOR_ETF_BY_GICS_SECTOR
 from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
-from models.screener import run_screen
+from models.screener import _load_recent_headlines, run_screen
 from monitoring import reasoning
 from monitoring.alerts import configure_file_logging, send_slack_alert
 from monitoring.equity import record_equity_snapshot
@@ -209,12 +210,13 @@ def _contradiction_reasons(engine, symbol: str, side: str, sector: str | None = 
 
     Used two ways: _check_position layers the stop/target check on top of
     this for a currently HELD position, and execution/full_book_rebalance.py
-    calls this directly on a reactivation candidate before opening it --
-    without that second use, a symbol closed here for contradicting current
-    news/momentum could be reopened moments later by a reactivation sourced
-    from a persisted candidate pool that has no way to know about the same
-    news/momentum (see models/candidate_pool_store.py's MAX_POOL_AGE; hit
-    live, see the 2026-09-24 00:37/00:58 P short open-close-reopen).
+    calls this directly on every reactivation candidate before opening it --
+    a second, independent check even though reactivation now always
+    consults a fresh ensemble + Claude call rather than a cached one (hit
+    live before that change, see the 2026-09-24 00:37/00:58 P short
+    open-close-reopen: closed on contradiction, reopened minutes later
+    from a stale persisted pool with no way to know about the same
+    news/momentum).
     """
     sign = 1.0 if side == "long" else -1.0
     reasons: list[dict] = []
@@ -298,6 +300,71 @@ def _check_position(
         reasons.append({"signal": hit.kind, "value": pnl_pct, "detail": hit.message})
 
     return ContradictionResult(symbol=symbol, side=side, closed=bool(reasons), reasons=reasons)
+
+
+# Signals a stop-loss/take-profit hit belongs to -- a mechanical exit sized
+# to the position's own volatility, never sent for a second opinion (see
+# _apply_second_opinions).
+_HARD_EXIT_SIGNALS = frozenset({"stop_loss", "take_profit"})
+
+
+def _apply_second_opinions(flagged: list[ContradictionResult], pnl_by_symbol: dict) -> None:
+    """
+    Consults Claude (execution/contradiction_advisor.py) on every flagged
+    position whose reasons are ONLY soft signals (news_sentiment/
+    macro_sector_alignment/price_momentum) -- never on a stop-loss/
+    take-profit hit. Mutates `flagged`'s ContradictionResult objects in
+    place: a position Claude recommends keeping open gets result.closed
+    set back to False (same "the record must not claim a close that
+    didn't happen" convention _run_contradiction_check already uses for a
+    human-rejected close) so it's dropped from what actually gets proposed;
+    one Claude agrees with gets its reasoning appended for visibility in
+    the close proposal.
+
+    Best-effort in the fail-CLOSED direction: get_second_opinions returning
+    None (unset key, API error, unparseable response) or omitting a symbol
+    leaves that position's result.closed exactly as the rule-based check
+    left it -- an LLM outage must never silently suppress a real signal
+    that already tripped.
+    """
+    soft = [r for r in flagged if not any(x["signal"] in _HARD_EXIT_SIGNALS for x in r.reasons)]
+    if not soft:
+        return
+    # The headline fetch below is real work (a DB round trip) -- worth
+    # skipping outright, same as models/screener.py's identical guard,
+    # since an unset key is the common case (left blank on Railway by
+    # default) and get_second_opinions would no-op on it anyway.
+    if not settings.anthropic_api_key:
+        return
+
+    headlines_by_symbol = _load_recent_headlines([r.symbol for r in soft])
+    payload = [
+        {
+            "symbol": r.symbol,
+            "side": r.side,
+            "reasons": [x["detail"] for x in r.reasons],
+            "pnl_pct": pnl_by_symbol.get(r.symbol, (None, None))[0],
+            "recent_headlines": headlines_by_symbol.get(r.symbol, []),
+        }
+        for r in soft
+    ]
+
+    opinions = get_second_opinions(payload)
+    if opinions is None:
+        return
+
+    for result in soft:
+        opinion = opinions.get(result.symbol)
+        if opinion is None:
+            continue
+        if opinion["close"]:
+            result.reasons.append({"signal": "llm_second_opinion", "value": None, "detail": opinion["reasoning"]})
+            continue
+        result.closed = False  # the record must not claim a close that didn't happen
+        logger.info("Claude second opinion overruled a contradiction close for %s: %s", result.symbol, opinion["reasoning"])
+        message = f"🤔 Claude kept {result.symbol} open despite a contradiction signal: {opinion['reasoning']}"
+        send_slack_alert(message, severity="info")
+        send_followup(message)
 
 
 def _log_closure(
@@ -774,6 +841,10 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
             flagged.append(result)
             detail = "; ".join(r["detail"] for r in result.reasons)
             logger.warning("Contradiction detected for %s (%s). %s", symbol, result.side, detail)
+
+    if flagged:
+        _apply_second_opinions(flagged, pnl_by_symbol)
+        flagged = [r for r in flagged if r.closed]
 
     if not flagged:
         # A quiet cycle -- nothing to close -- still deserves a shot at
