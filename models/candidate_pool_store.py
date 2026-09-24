@@ -1,10 +1,17 @@
 """
-Persists the full Claude-advised candidate pool from a concentrated-mode
-screen (every symbol Claude scored that cycle, not just the top picks that
-actually got opened) — so a later flat-book reactivation
+Persists this cycle's actual Claude-advised picks from a concentrated-mode
+screen — so a later flat-book reactivation
 (execution/full_book_rebalance.py) can redeploy against this week's
 already-computed analysis instead of paying for a fresh ensemble retrain +
 rescreen (several minutes) every single time it finds the book empty.
+
+Picks only, not every symbol Claude was merely consulted on: the
+reactivation path treats every persisted row as confident=True and ranks
+purely by llm_confidence (see full_book_rebalance.py's
+_candidates_from_recent_pool), with no other way to tell "Claude picked
+this" apart from "Claude analyzed this and recommended passing". A symbol
+Claude wrote up as a pass would otherwise still be eligible to resurface
+days later once it was one of the few candidates left in a thinning pool.
 
 Deliberately separate from models/screener.py's own DB reads (training
 data) for the same reason monitoring/breaker_state.py stays separate from
@@ -38,10 +45,11 @@ MAX_POOL_AGE = dt.timedelta(days=7)
 
 def save_candidate_pool(feature_set_id: str, pool: list[dict]) -> None:
     """
-    `pool`: one dict per candidate Claude scored this cycle (not just its
-    picks) — symbol, side, predicted_return, direction_agreement,
-    conviction_score, confidence, take_profit_pct, stop_loss_pct, reasoning
-    (the phase 2-4 list). Call once per concentrated, LLM-advised screen.
+    `pool`: one dict per symbol Claude actually picked this cycle (see this
+    module's docstring for why not every consulted symbol) — symbol, side,
+    predicted_return, direction_agreement, conviction_score, confidence,
+    take_profit_pct, stop_loss_pct, reasoning (the phase 2-4 list). Call
+    once per concentrated, LLM-advised screen.
     Best-effort: a write failure here must never break the screen that
     produced this pool, only cost the next flat-book event its fast path.
     """
