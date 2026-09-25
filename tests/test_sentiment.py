@@ -122,28 +122,32 @@ def test_score_sentiment_works_without_a_summary_column_at_all(monkeypatch):
     assert list(scored["sentiment"]) == [0.0]
 
 
-def test_system_prompt_instructs_neutral_scoring_for_an_already_priced_in_recap():
+def test_system_prompt_instructs_muted_scoring_for_an_already_priced_in_recap():
     """
     Sentiment must measure forward-looking effect, not tone: a "Why X Stock
     Is Up Today"-style recap explaining a move that already happened is
-    scored 0.0 regardless of how positive the underlying reason sounds,
-    since that move is already priced in by the time the story runs (see
+    scored at a small, muted magnitude (well short of the underlying
+    reason's full strength) rather than 0.0 -- the catalyst is priced in,
+    but the recap's own attention/readership can still nudge some
+    incremental trading slightly afterward (see
     features/qualitative/sentiment.py's module docstring -- this also feeds
     execution/contradiction_monitor.py's exit check, where a stale recap
-    read as fresh news would otherwise trigger a contradiction close on
-    nothing new).
+    read as fresh, full-strength news would otherwise trigger a
+    contradiction close on nothing new).
     """
     prompt = sentiment._SYSTEM_PROMPT.lower()
     assert "forward-looking" in prompt
     assert "already" in prompt and "priced" in prompt
     assert "why x stock is up today" in prompt
+    assert "small magnitude" in prompt
+    assert "0.1 to 0.3" in prompt
 
 
-def test_score_sentiment_wires_a_neutral_recap_score_through(monkeypatch):
+def test_score_sentiment_wires_a_muted_recap_score_through(monkeypatch):
     """
     Wiring check for the recap case: Claude scoring a "why is it up today"
-    headline as neutral (with a reason explaining why) must flow through
-    score_sentiment unchanged, same as any other score.
+    headline at a small, muted magnitude (with a reason explaining why) must
+    flow through score_sentiment unchanged, same as any other score.
     """
 
     def respond(messages):
@@ -152,8 +156,8 @@ def test_score_sentiment_wires_a_neutral_recap_score_through(monkeypatch):
             [
                 {
                     "id": item["id"],
-                    "sentiment": 0.0,
-                    "reason": "Recaps an already-realized rally -- no new forward-looking information",
+                    "sentiment": 0.2,
+                    "reason": "Recaps an already-realized rally -- catalyst is priced in, muted score reflects residual attention only",
                     "relevant": True,
                 }
                 for item in items
@@ -173,8 +177,8 @@ def test_score_sentiment_wires_a_neutral_recap_score_through(monkeypatch):
 
     scored = sentiment.score_sentiment(headlines)
 
-    assert scored.loc[0, "sentiment"] == 0.0
-    assert "already-realized" in scored.loc[0, "sentiment_reason"]
+    assert scored.loc[0, "sentiment"] == 0.2
+    assert "residual attention" in scored.loc[0, "sentiment_reason"]
 
 
 def test_score_sentiment_flags_a_mistagged_symbol_as_not_relevant(monkeypatch):

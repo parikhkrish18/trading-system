@@ -9,12 +9,14 @@ matters more than for the core forecast model).
 
 "Sentiment" here means forward-looking effect, not tone: a story explaining
 or recapping a price move that has ALREADY happened (e.g. "Why X Stock Is
-Up Today") is scored neutral even when the underlying reason for the move
-reads very positively, since that move is already priced in by the time the
-story runs and the story itself adds no new information going forward (see
-_SYSTEM_PROMPT). This matters beyond the model's own features -- the same
-score also feeds execution/contradiction_monitor.py's mid-week exit check,
-where a stale recap being read as fresh negative/positive news would
+Up Today") is scored at a small, muted magnitude (roughly +-0.1 to 0.3)
+rather than at the underlying reason's full strength, since the catalyst
+itself is already priced in by the time the story runs -- but not fully
+neutral either, since the recap's own attention/readership can still nudge
+some incremental trading slightly afterward (see _SYSTEM_PROMPT). This
+matters beyond the model's own features -- the same score also feeds
+execution/contradiction_monitor.py's mid-week exit check, where a stale
+recap being read as fresh, full-strength negative/positive news would
 otherwise trigger (or block) a close on a signal that was never actually
 new.
 
@@ -70,12 +72,18 @@ _SYSTEM_PROMPT = (
     "ALREADY happened -- e.g. a headline like 'Why X Stock Is Up Today', "
     "'X Shares Surge After Y', 'Here's What's Behind X's Drop', or any "
     "story whose own framing is reporting on a move rather than a fresh "
-    "event -- is backward-looking: by the time that story runs, the move it "
-    "describes is already reflected in the price, so it has no further "
-    "effect going forward. Score these 0.0 (neutral) regardless of how "
-    "positive or negative the underlying reason for the move sounds. The "
-    "one exception: if the story ALSO surfaces something genuinely new on "
-    "top of the recap -- a fresh analyst upgrade, a guidance raise, a "
+    "event -- is backward-looking: by the time that story runs, the "
+    "underlying catalyst it describes is already reflected in the price, so "
+    "that catalyst itself has no further effect going forward. Score these "
+    "with a SMALL magnitude in the same direction as the move -- roughly "
+    "0.1 to 0.3 (or -0.1 to -0.3), well short of a full-strength 1.0 "
+    "score -- rather than 0.0 or scoring the underlying reason at full "
+    "strength: the catalyst itself is priced in, but the recap getting more "
+    "attention and readership can still nudge some incremental buying or "
+    "selling pressure slightly afterward, an attention effect distinct "
+    "from, and much weaker than, genuinely new information. The one "
+    "exception: if the story ALSO surfaces something genuinely new on top "
+    "of the recap -- a fresh analyst upgrade, a guidance raise, a "
     "catalyst that hasn't fully played out yet -- score THAT new piece on "
     "its own forward-looking merits rather than the stale 'up/down today' "
     "framing around it. An ordinary story reporting a fresh event as it "
@@ -89,9 +97,9 @@ _SYSTEM_PROMPT = (
     "25 words) -- e.g. 'Direct competitor's product launch threatens market "
     "share' or 'Company beat EPS estimates by a wide margin'; if relevant is "
     "false, the reason should say what the story is actually about instead. "
-    "If sentiment was scored neutral because the story is a recap of an "
-    "already-priced move, say so instead (e.g. 'Recaps an already-realized "
-    "rally -- no new forward-looking information'). "
+    "If sentiment was scored as a muted recap rather than a fresh catalyst, "
+    "say so instead (e.g. 'Recaps an already-realized rally -- catalyst is "
+    "priced in, muted score reflects residual attention only'). "
     "Respond with ONLY a JSON array of objects: "
     '[{"id": <id>, "sentiment": <float>, "reason": <string>, "relevant": '
     "<bool>}, ...], one entry per story, in the same order given. No "
