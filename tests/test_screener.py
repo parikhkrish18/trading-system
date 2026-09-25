@@ -1583,18 +1583,36 @@ def test_run_screen_computes_atr_pct_from_vol_atr_14_and_close(monkeypatch):
     assert captured["atr_pct_by_symbol"]["A"] == pytest.approx(0.02)  # 2.0 / 100.0
 
 
-def test_run_screen_passes_donchian_channel_levels_to_the_llm_pool_builder(monkeypatch):
+def test_run_screen_passes_multi_window_donchian_levels_to_the_llm_pool_builder(monkeypatch):
+    """
+    Every window in _DONCHIAN_SOLIDIFICATION_WINDOWS that the symbol has
+    history for gets wired through as donchian_levels_by_window -- not just
+    whichever single window a narrower, 200-day-only lookup would have
+    found (the bug this replaced: that lookup went empty, and so showed
+    Claude no Donchian context at all, for any symbol under 200 days of
+    history even though a smaller window had a perfectly good level).
+    """
     scr, _ = _run_screen_harness(monkeypatch, "concentrated")
     monkeypatch.setattr(scr.settings, "anthropic_api_key", "test-key")
     monkeypatch.setattr(
         scr, "load_latest_features",
         lambda *a, **k: pd.DataFrame({"symbol": ["A"], "f1": [3], "close": [100.0]}),
     )
-    monkeypatch.setattr(scr, "donchian_channel_levels", lambda symbols, window=None: {"A": (90.0, 120.0)})
+
+    def fake_channel_levels(symbols, window=None):
+        # Only the 100- and 20-day windows have enough history -- mirrors a
+        # symbol too new for a 200-day (or 50-day) channel.
+        if window in (100, 20):
+            return {"A": (float(window), float(window) * 2)}
+        return {}
+
+    monkeypatch.setattr(scr, "donchian_channel_levels", fake_channel_levels)
     captured = {}
 
     def fake_build_pool(*args, **kwargs):
-        captured["channel_levels_by_symbol"] = kwargs.get("channel_levels_by_symbol")
+        captured["support_distance_by_symbol"] = kwargs.get("support_distance_by_symbol")
+        captured["resistance_distance_by_symbol"] = kwargs.get("resistance_distance_by_symbol")
+        captured["donchian_levels_by_window"] = kwargs.get("donchian_levels_by_window")
         return []
 
     monkeypatch.setattr(scr, "_build_llm_candidate_pool", fake_build_pool)
@@ -1602,7 +1620,11 @@ def test_run_screen_passes_donchian_channel_levels_to_the_llm_pool_builder(monke
 
     scr.run_screen("v3", ["A"])
 
-    assert captured["channel_levels_by_symbol"]["A"] == pytest.approx((90.0, 120.0))
+    assert captured["donchian_levels_by_window"]["A"] == {100: (100.0, 200.0), 20: (20.0, 40.0)}
+    # The same solidified distances that drive the real trade's exit levels
+    # (see _solidified_channel_distances), not recomputed from a single window.
+    assert captured["support_distance_by_symbol"] is not None
+    assert captured["resistance_distance_by_symbol"] is not None
 
 
 def test_build_llm_candidate_pool_includes_donchian_levels_and_solidified_quant_bounds(monkeypatch):
@@ -1618,15 +1640,27 @@ def test_build_llm_candidate_pool_includes_donchian_levels_and_solidified_quant_
         pool_df, ensemble=None, latest_features=pd.DataFrame(), raw_features=pd.DataFrame(),
         feature_cols=[], vol_by_symbol={"A": 0.01}, latest_close_by_symbol={"A": 100.0},
         macro_sector_sentiment_by_symbol={}, horizon_days=5,
-        atr_pct_by_symbol={"A": 0.02}, channel_levels_by_symbol={"A": (90.0, 112.0)},
+        atr_pct_by_symbol={"A": 0.02},
+        # support=90 -> distance 0.10, resistance=112 -> distance 0.12, the
+        # same distances _solidified_channel_distances would have resolved.
+        support_distance_by_symbol={"A": 0.10}, resistance_distance_by_symbol={"A": 0.12},
+        donchian_levels_by_window={"A": {200: (80.0, 130.0), 100: (85.0, 120.0), 20: (90.0, 112.0)}},
     )
 
     assert len(payload) == 1
     row = payload[0]
+    # Backed out of the solidified distances above (price * (1 ± distance)),
+    # not the single-window raw levels -- 90/112 only by coincidence of the
+    # 20-day window being used to construct this fixture.
     assert row["donchian_support"] == pytest.approx(90.0)
     assert row["donchian_resistance"] == pytest.approx(112.0)
     # resistance_distance = (112-100)/100 = 0.12, inside the ATR band [0.089, 0.179] -- solidifies the ceiling.
     assert row["quant_take_profit_pct"] == pytest.approx(0.12)
+    assert row["donchian_levels"] == [
+        {"window_days": 200, "support": 80.0, "resistance": 130.0},
+        {"window_days": 100, "support": 85.0, "resistance": 120.0},
+        {"window_days": 20, "support": 90.0, "resistance": 112.0},
+    ]
 
 
 def test_build_llm_candidate_pool_includes_volume_profile_and_confirmation_flags(monkeypatch):
@@ -1643,7 +1677,8 @@ def test_build_llm_candidate_pool_includes_volume_profile_and_confirmation_flags
         pool_df, ensemble=None, latest_features=pd.DataFrame(), raw_features=pd.DataFrame(),
         feature_cols=[], vol_by_symbol={"A": 0.01}, latest_close_by_symbol={"A": 100.0},
         macro_sector_sentiment_by_symbol={}, horizon_days=5,
-        atr_pct_by_symbol={"A": 0.02}, channel_levels_by_symbol={"A": (90.0, 112.0)},
+        atr_pct_by_symbol={"A": 0.02},
+        support_distance_by_symbol={"A": 0.10}, resistance_distance_by_symbol={"A": 0.12},
         volume_profile_by_symbol={"A": profile},
     )
 
