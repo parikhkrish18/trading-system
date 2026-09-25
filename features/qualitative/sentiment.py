@@ -7,6 +7,17 @@ numeric sentiment score per (symbol, day), via batched calls to Claude
 (cheap model -- this is a high-volume, low-value-per-call task, so cost
 matters more than for the core forecast model).
 
+"Sentiment" here means forward-looking effect, not tone: a story explaining
+or recapping a price move that has ALREADY happened (e.g. "Why X Stock Is
+Up Today") is scored neutral even when the underlying reason for the move
+reads very positively, since that move is already priced in by the time the
+story runs and the story itself adds no new information going forward (see
+_SYSTEM_PROMPT). This matters beyond the model's own features -- the same
+score also feeds execution/contradiction_monitor.py's mid-week exit check,
+where a stale recap being read as fresh negative/positive news would
+otherwise trigger (or block) a close on a signal that was never actually
+new.
+
 Kept as a separate pass from ingestion (see data/ingest/news.py) so you can
 re-score historical news with a better model without re-pulling raw data.
 """
@@ -52,11 +63,35 @@ _SYSTEM_PROMPT = (
     "the stock) to 1.0 (very positive for the stock), 0.0 for neutral/mixed -- "
     "if relevant is false, still give your best-guess sentiment, it just won't "
     "be used. "
+    "Sentiment measures FORWARD-LOOKING effect, not tone: whether this story "
+    "gives the market genuinely new information the price hasn't already "
+    "absorbed, not just whether its content sounds favorable or unfavorable. "
+    "A story that is itself explaining or recapping a price move that has "
+    "ALREADY happened -- e.g. a headline like 'Why X Stock Is Up Today', "
+    "'X Shares Surge After Y', 'Here's What's Behind X's Drop', or any "
+    "story whose own framing is reporting on a move rather than a fresh "
+    "event -- is backward-looking: by the time that story runs, the move it "
+    "describes is already reflected in the price, so it has no further "
+    "effect going forward. Score these 0.0 (neutral) regardless of how "
+    "positive or negative the underlying reason for the move sounds. The "
+    "one exception: if the story ALSO surfaces something genuinely new on "
+    "top of the recap -- a fresh analyst upgrade, a guidance raise, a "
+    "catalyst that hasn't fully played out yet -- score THAT new piece on "
+    "its own forward-looking merits rather than the stale 'up/down today' "
+    "framing around it. An ordinary story reporting a fresh event as it "
+    "happens (an earnings beat just announced, a new product launch, a "
+    "lawsuit just filed, an analyst initiating coverage) is forward-looking "
+    "and should be scored normally -- the test is whether the story's own "
+    "framing is explaining a move that already occurred, not whether "
+    "good/bad news happened at some point in the past. "
     "Also give a one-sentence, plain-English reason a trader could read at "
     "a glance explaining why THIS symbol is affected by THIS story (under "
     "25 words) -- e.g. 'Direct competitor's product launch threatens market "
     "share' or 'Company beat EPS estimates by a wide margin'; if relevant is "
     "false, the reason should say what the story is actually about instead. "
+    "If sentiment was scored neutral because the story is a recap of an "
+    "already-priced move, say so instead (e.g. 'Recaps an already-realized "
+    "rally -- no new forward-looking information'). "
     "Respond with ONLY a JSON array of objects: "
     '[{"id": <id>, "sentiment": <float>, "reason": <string>, "relevant": '
     "<bool>}, ...], one entry per story, in the same order given. No "

@@ -122,6 +122,61 @@ def test_score_sentiment_works_without_a_summary_column_at_all(monkeypatch):
     assert list(scored["sentiment"]) == [0.0]
 
 
+def test_system_prompt_instructs_neutral_scoring_for_an_already_priced_in_recap():
+    """
+    Sentiment must measure forward-looking effect, not tone: a "Why X Stock
+    Is Up Today"-style recap explaining a move that already happened is
+    scored 0.0 regardless of how positive the underlying reason sounds,
+    since that move is already priced in by the time the story runs (see
+    features/qualitative/sentiment.py's module docstring -- this also feeds
+    execution/contradiction_monitor.py's exit check, where a stale recap
+    read as fresh news would otherwise trigger a contradiction close on
+    nothing new).
+    """
+    prompt = sentiment._SYSTEM_PROMPT.lower()
+    assert "forward-looking" in prompt
+    assert "already" in prompt and "priced" in prompt
+    assert "why x stock is up today" in prompt
+
+
+def test_score_sentiment_wires_a_neutral_recap_score_through(monkeypatch):
+    """
+    Wiring check for the recap case: Claude scoring a "why is it up today"
+    headline as neutral (with a reason explaining why) must flow through
+    score_sentiment unchanged, same as any other score.
+    """
+
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        return json.dumps(
+            [
+                {
+                    "id": item["id"],
+                    "sentiment": 0.0,
+                    "reason": "Recaps an already-realized rally -- no new forward-looking information",
+                    "relevant": True,
+                }
+                for item in items
+            ]
+        )
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+
+    headlines = pd.DataFrame(
+        {
+            "id": [1],
+            "ts": pd.to_datetime(["2026-07-27"], utc=True),
+            "symbol": ["P"],
+            "headline": ["Why Everpure (P) Stock Is Up Today"],
+        }
+    )
+
+    scored = sentiment.score_sentiment(headlines)
+
+    assert scored.loc[0, "sentiment"] == 0.0
+    assert "already-realized" in scored.loc[0, "sentiment_reason"]
+
+
 def test_score_sentiment_flags_a_mistagged_symbol_as_not_relevant(monkeypatch):
     """A news vendor mistagging a symbol onto a story (e.g. an MSFT story tagged NYT)
     should come back with relevant=False rather than a fabricated sentiment reading."""
