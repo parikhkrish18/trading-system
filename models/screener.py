@@ -830,7 +830,9 @@ def _build_llm_candidate_pool(
     horizon_days: int,
     top_n: int = 5,
     atr_pct_by_symbol: dict[str, float] | None = None,
-    channel_levels_by_symbol: dict[str, tuple[float, float]] | None = None,
+    support_distance_by_symbol: dict[str, float] | None = None,
+    resistance_distance_by_symbol: dict[str, float] | None = None,
+    donchian_levels_by_window: dict[str, dict[int, tuple[float, float]]] | None = None,
     volume_profile_by_symbol: dict[str, VolumeProfile] | None = None,
 ) -> list[dict]:
     """
@@ -845,12 +847,27 @@ def _build_llm_candidate_pool(
     headlines, and the existing quant formula's own take-profit/stop-loss
     (now ATR-relative and channel-solidified — see execution/exit_levels.py)
     as a reference point.
+
+    support_distance_by_symbol/resistance_distance_by_symbol are the SAME
+    _solidified_channel_distances output that actually drives the real
+    trade's exit levels (see run_screen_with_scores) -- reused here rather
+    than recomputed from a single window's raw levels so quant_take_profit_pct/
+    quant_stop_loss_pct (and the donchian_support/donchian_resistance shown
+    below, backed out from these distances) always match what the system
+    actually used, instead of silently diverging for any symbol whose
+    winning window differs from whichever one a separate, narrower lookup
+    would have checked. donchian_levels_by_window supplements that single
+    resolved level with the full 200/100/50/20-day breakdown (see
+    _donchian_levels_by_window) so Claude isn't limited to the one window
+    solidification happened to pick.
     """
     symbols = list(pool["symbol"])
     if not symbols:
         return []
     atr_pct_by_symbol = atr_pct_by_symbol or {}
-    channel_levels_by_symbol = channel_levels_by_symbol or {}
+    support_distance_by_symbol = support_distance_by_symbol or {}
+    resistance_distance_by_symbol = resistance_distance_by_symbol or {}
+    donchian_levels_by_window = donchian_levels_by_window or {}
     volume_profile_by_symbol = volume_profile_by_symbol or {}
     fundamentals_context = _load_fundamentals_context(symbols)
     per_symbol_top_features = _explain_features(
@@ -864,12 +881,19 @@ def _build_llm_candidate_pool(
         vol = vol_by_symbol.get(symbol)
         atr_pct = atr_pct_by_symbol.get(symbol)
         price = latest_close_by_symbol.get(symbol)
-        channel = channel_levels_by_symbol.get(symbol)
-        support_distance, resistance_distance = _channel_distances(price, channel)
+        support_distance = support_distance_by_symbol.get(symbol)
+        resistance_distance = resistance_distance_by_symbol.get(symbol)
         quant_bounds = exit_levels_for(
             predicted_return=row["predicted_return"], daily_volatility=vol, horizon_days=horizon_days,
             atr_pct=atr_pct, support_distance_pct=support_distance, resistance_distance_pct=resistance_distance,
         )
+        # Raw prices, backed out of the exact same distance formula
+        # _channel_distances itself uses (support_distance = (price -
+        # support) / price, resistance_distance = (resistance - price) /
+        # price) -- an exact inversion, not an approximation, so this
+        # never needs a second raw-level lookup for the winning window.
+        resolved_support = price * (1 - support_distance) if price and support_distance is not None else None
+        resolved_resistance = price * (1 + resistance_distance) if price and resistance_distance is not None else None
         profile = volume_profile_by_symbol.get(symbol)
         payload.append(
             {
@@ -882,8 +906,18 @@ def _build_llm_candidate_pool(
                 "daily_volatility_pct": vol,
                 "atr_pct": atr_pct,
                 "signal_to_noise": _safe_signal_to_noise(row),
-                "donchian_support": channel[0] if channel else None,
-                "donchian_resistance": channel[1] if channel else None,
+                "donchian_support": resolved_support,
+                "donchian_resistance": resolved_resistance,
+                # Every window with enough history for this symbol (see
+                # _donchian_levels_by_window), largest first -- the full
+                # multi-timeframe picture, not just whichever single level
+                # donchian_support/donchian_resistance above resolved to.
+                "donchian_levels": [
+                    {"window_days": window, "support": level[0], "resistance": level[1]}
+                    for window, level in sorted(
+                        donchian_levels_by_window.get(symbol, {}).items(), reverse=True
+                    )
+                ],
                 "volume_profile_poc": profile.poc if profile else None,
                 "volume_profile_value_area_low": profile.val if profile else None,
                 "volume_profile_value_area_high": profile.vah if profile else None,
@@ -893,8 +927,12 @@ def _build_llm_candidate_pool(
                 # alone can't tell apart (it fails open to True on a missing
                 # level, correct for _solidified_channel_distances' gating
                 # but misleading to show Claude as if it meant something).
-                "donchian_support_volume_confirmed": is_level_volume_confirmed(channel[0], profile) if channel else None,
-                "donchian_resistance_volume_confirmed": is_level_volume_confirmed(channel[1], profile) if channel else None,
+                "donchian_support_volume_confirmed": (
+                    is_level_volume_confirmed(resolved_support, profile) if resolved_support is not None else None
+                ),
+                "donchian_resistance_volume_confirmed": (
+                    is_level_volume_confirmed(resolved_resistance, profile) if resolved_resistance is not None else None
+                ),
                 "top_features": per_symbol_top_features.get(symbol, []),
                 "recent_headlines": headlines_by_symbol.get(symbol, []),
                 "quant_take_profit_pct": quant_bounds.take_profit_pct,
@@ -1313,6 +1351,35 @@ def _solidified_channel_distances(
     return support_distance_by_symbol, resistance_distance_by_symbol
 
 
+def _donchian_levels_by_window(symbols: list[str]) -> dict[str, dict[int, tuple[float, float]]]:
+    """
+    symbol -> {window: (support, resistance)} across every window in
+    _DONCHIAN_SOLIDIFICATION_WINDOWS the symbol has enough history for --
+    the full multi-timeframe picture, for the LLM advisory payload
+    (_build_llm_candidate_pool's donchian_levels field) so Claude can see
+    e.g. "resistance is close at 20 days but there's real room out to 100"
+    directly, rather than only ever seeing whichever single window
+    _solidified_channel_distances resolved as the winner for actual
+    take-profit/stop-loss tightening. A window missing from a symbol's
+    dict means too little price history for that window (see
+    donchian_channel_levels), not a level of zero.
+
+    A separate, unconditional call per window (not reused from
+    _solidified_channel_distances' own per-window loop above) for the same
+    reason donchian_channel_levels was already called separately just for
+    display before this existed: that loop narrows to symbols still
+    missing a resolved side and stops once none remain, so it doesn't
+    necessarily fetch every window for every symbol -- this needs all of
+    them, for every symbol, regardless of which side solidification
+    already resolved.
+    """
+    out: dict[str, dict[int, tuple[float, float]]] = {s: {} for s in symbols}
+    for window in _DONCHIAN_SOLIDIFICATION_WINDOWS:
+        for symbol, level in donchian_channel_levels(symbols, window=window).items():
+            out[symbol][window] = level
+    return out
+
+
 def attach_exit_levels(
     candidates: list[TradeCandidate],
     vol_by_symbol: dict[str, float],
@@ -1560,14 +1627,12 @@ def run_screen_with_scores(
     support_distance_by_symbol, resistance_distance_by_symbol = _solidified_channel_distances(
         list(price_by_symbol.keys()), price_by_symbol
     )
-    # Display-only, for the LLM advisory payload's donchian_support/
-    # donchian_resistance context below -- the single largest window's raw
-    # levels (the most solid evidence available), not the per-side mix
-    # _solidified_channel_distances resolved above for the actual
-    # tightening math, which can anchor each side to a different window.
-    channel_levels_by_symbol = donchian_channel_levels(
-        list(price_by_symbol.keys()), window=max(_DONCHIAN_SOLIDIFICATION_WINDOWS)
-    )
+    # Display-only, for the LLM advisory payload's donchian_levels context
+    # below -- every window's raw levels (see _donchian_levels_by_window),
+    # not the per-side mix _solidified_channel_distances resolved above for
+    # the actual tightening math, which can anchor each side to a
+    # different window and returns distances rather than raw prices.
+    donchian_levels_by_window = _donchian_levels_by_window(list(price_by_symbol.keys()))
 
     if settings.enable_macro_sector_block:
         macro_mkt_sentiment = None
@@ -1655,7 +1720,10 @@ def run_screen_with_scores(
             llm_pool = _build_llm_candidate_pool(
                 eligible, ensemble, latest, raw_latest, feature_cols, vol_by_symbol,
                 latest_close_by_symbol, macro_sector_map, target_horizon_days,
-                atr_pct_by_symbol=atr_pct_by_symbol, channel_levels_by_symbol=channel_levels_by_symbol,
+                atr_pct_by_symbol=atr_pct_by_symbol,
+                support_distance_by_symbol=support_distance_by_symbol,
+                resistance_distance_by_symbol=resistance_distance_by_symbol,
+                donchian_levels_by_window=donchian_levels_by_window,
                 volume_profile_by_symbol=volume_profile_by_symbol,
             )
             llm_advice = get_llm_trade_advice(
