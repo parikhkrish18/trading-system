@@ -646,7 +646,11 @@ def test_run_cycle_logs_rejected_proposals_with_their_status(monkeypatch):
     assert captured["args"][1] == []  # no approved closes
 
 
-def test_log_decisions_writes_rejected_rows_with_zero_executed_position(monkeypatch):
+def test_log_decisions_writes_rejected_open_rows_with_zero_executed_position(monkeypatch):
+    """
+    A rejected OPEN candidate (NOPE) truly never touched the broker, so 0.0
+    is correct and unambiguous here.
+    """
     captured = {}
     monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
     monkeypatch.setattr(
@@ -668,18 +672,61 @@ def test_log_decisions_writes_rejected_rows_with_zero_executed_position(monkeypa
         phase6_by_symbol={},
         order_type="market",
         rejected_candidates=[rejected],
-        rejected_close_symbols=["KEEP"],
-        approval_status_by_symbol={"NOPE": "rejected", "KEEP": "timeout"},
+        rejected_close_symbols=[],
+        approval_status_by_symbol={"NOPE": "rejected"},
     )
 
     rows = {r["symbol"]: r for r in captured["rows"]}
     assert rows["NOPE"]["executed_position"] == 0.0
     assert rows["NOPE"]["approval_status"] == "rejected"
     assert rows["NOPE"]["direction_agreement"] == 0.85
-    assert rows["KEEP"]["executed_position"] == 0.0
-    assert rows["KEEP"]["approval_status"] == "timeout"
     nope_phase5 = next(p for p in json.loads(rows["NOPE"]["reasoning"]) if p["phase"] == 5)
     assert "no order" in nope_phase5["summary"].lower() or "rejected" in nope_phase5["summary"].lower()
+
+
+def test_log_decisions_writes_a_rejected_close_row_with_the_real_unchanged_position(monkeypatch):
+    """
+    Regression test: a rejected CLOSE (KEEP) is NOT a flatten -- the human
+    said no, so the position is exactly as open as it was before this
+    cycle. Before the fix, this row hardcoded executed_position=0.0
+    regardless, which falsely read as "flattened to zero" to
+    monitoring/dashboard/server.py's decisions-table round-trip pairing
+    (_decision_episode_boundaries/attach_actual_outcomes, which key off
+    executed_position == 0 alone with no reference to approval_status) --
+    silently consuming KEEP's real entry decision against a close that
+    never actually happened, so its real close later had no entry left to
+    pair with and never completed an episode: visible as its own unpaired
+    row in Trade Log but absent from Closed Trades entirely.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+
+    _real_log_decisions(
+        candidates=[],
+        closing_symbols=[],
+        # KEEP's rejected close never touched the broker -- still open at
+        # its real size, exactly like `executed` (broker.get_positions())
+        # would actually report it.
+        executed={"KEEP": 10.0},
+        intended_shares={},
+        feature_set_id="v3",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        rejected_candidates=[],
+        rejected_close_symbols=["KEEP"],
+        approval_status_by_symbol={"KEEP": "timeout"},
+    )
+
+    rows = {r["symbol"]: r for r in captured["rows"]}
+    assert rows["KEEP"]["executed_position"] == 10.0
+    assert rows["KEEP"]["approval_status"] == "timeout"
 
 
 def test_log_decisions_records_a_no_price_skip_instead_of_a_silent_zero(monkeypatch):

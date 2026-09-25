@@ -509,7 +509,20 @@ def _log_decisions(
         # and still under hourly contradiction watch.
         phase7 = reasoning.phase_ongoing_monitoring(closed=False)
         full_reasoning = reasoning.combine_phases(phase1, phase4, phase5, phase7)
-        rows.append(_row(symbol, None, 0.0, 0.0, None, full_reasoning))
+        # executed.get(symbol), NOT a hardcoded 0.0: the close was refused,
+        # so the position is still open at whatever actual_positions already
+        # reports for it (mirrors the real, unchanged size intended_shares
+        # records for this same symbol just below, in the main flow). A
+        # hardcoded 0.0 here would falsely read as "flattened to zero" to
+        # monitoring/dashboard/server.py's decisions-table round-trip
+        # pairing (_decision_episode_boundaries/attach_actual_outcomes,
+        # which key off executed_position == 0 alone) -- consuming this
+        # symbol's real entry decision against a close that never actually
+        # happened, so the position's REAL close later has no entry left to
+        # pair with and never completes an episode: it shows as its own
+        # unpaired row in Trade Log but silently never appears in Closed
+        # Trades at all.
+        rows.append(_row(symbol, None, 0.0, executed.get(symbol), None, full_reasoning))
 
     held_reasoning = held_reasoning or {}
     held_levels_by_symbol = held_levels_by_symbol or {}
