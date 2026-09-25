@@ -47,10 +47,12 @@ from sqlalchemy.dialects.postgresql import JSONB
 from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
+from data.ingest.intraday_bars import fetch_recent_minute_bars
 from data.ingest.universe import resolve_symbols
 from execution.exit_levels import ExitLevels, exit_levels_advised, exit_levels_for
 from features.build_features import fundamentals_prior_context
 from features.quant.volatility import realized_vol
+from features.quant.volume_profile import VolumeProfile, compute_volume_profile, is_level_volume_confirmed
 from models.evaluation import cross_sectional_zscore
 from models.forecast.ensemble import EnsembleForecastModel
 from models.llm_advisor import get_llm_trade_advice
@@ -829,22 +831,27 @@ def _build_llm_candidate_pool(
     top_n: int = 5,
     atr_pct_by_symbol: dict[str, float] | None = None,
     channel_levels_by_symbol: dict[str, tuple[float, float]] | None = None,
+    volume_profile_by_symbol: dict[str, VolumeProfile] | None = None,
 ) -> list[dict]:
     """
     Assembles the per-candidate payload models/llm_advisor.py sends to
     Claude: the same SHAP top-features _attach_reasoning uses (so the LLM
     reasons off the exact attribution a human reading the dashboard would
     see), plus market price, volatility, ATR, this stock's own Donchian
-    support/resistance, sector sentiment, recent headlines, and the
-    existing quant formula's own take-profit/stop-loss (now ATR-relative
-    and channel-solidified — see execution/exit_levels.py) as a reference
-    point.
+    support/resistance AND whether real trading volume actually clustered
+    near each (see features/quant/volume_profile.py -- a Donchian edge and
+    a volume profile answer different questions: where price reached vs.
+    where the market actually transacted size), sector sentiment, recent
+    headlines, and the existing quant formula's own take-profit/stop-loss
+    (now ATR-relative and channel-solidified — see execution/exit_levels.py)
+    as a reference point.
     """
     symbols = list(pool["symbol"])
     if not symbols:
         return []
     atr_pct_by_symbol = atr_pct_by_symbol or {}
     channel_levels_by_symbol = channel_levels_by_symbol or {}
+    volume_profile_by_symbol = volume_profile_by_symbol or {}
     fundamentals_context = _load_fundamentals_context(symbols)
     per_symbol_top_features = _explain_features(
         symbols, ensemble, latest_features, raw_features, feature_cols, fundamentals_context, top_n=top_n
@@ -863,6 +870,7 @@ def _build_llm_candidate_pool(
             predicted_return=row["predicted_return"], daily_volatility=vol, horizon_days=horizon_days,
             atr_pct=atr_pct, support_distance_pct=support_distance, resistance_distance_pct=resistance_distance,
         )
+        profile = volume_profile_by_symbol.get(symbol)
         payload.append(
             {
                 "symbol": symbol,
@@ -876,6 +884,17 @@ def _build_llm_candidate_pool(
                 "signal_to_noise": _safe_signal_to_noise(row),
                 "donchian_support": channel[0] if channel else None,
                 "donchian_resistance": channel[1] if channel else None,
+                "volume_profile_poc": profile.poc if profile else None,
+                "volume_profile_value_area_low": profile.val if profile else None,
+                "volume_profile_value_area_high": profile.vah if profile else None,
+                # None (not True/False) when there's no Donchian level to
+                # confirm in the first place -- distinct from "there is a
+                # level and it's confirmed", which is_level_volume_confirmed
+                # alone can't tell apart (it fails open to True on a missing
+                # level, correct for _solidified_channel_distances' gating
+                # but misleading to show Claude as if it meant something).
+                "donchian_support_volume_confirmed": is_level_volume_confirmed(channel[0], profile) if channel else None,
+                "donchian_resistance_volume_confirmed": is_level_volume_confirmed(channel[1], profile) if channel else None,
                 "top_features": per_symbol_top_features.get(symbol, []),
                 "recent_headlines": headlines_by_symbol.get(symbol, []),
                 "quant_take_profit_pct": quant_bounds.take_profit_pct,
@@ -1217,6 +1236,34 @@ def _channel_distances(
 _DONCHIAN_SOLIDIFICATION_WINDOWS = (200, 100, 50, 20)
 
 
+def _volume_profile_by_symbol(symbols: list[str]) -> dict[str, VolumeProfile]:
+    """
+    symbol -> VolumeProfile over settings.volume_profile_lookback_days of
+    real intraday bars (data/ingest/intraday_bars.py) -- used to grade
+    Donchian levels in _solidified_channel_distances, never as a
+    competing support/resistance source of its own. A symbol missing from
+    the result (no intraday history available, or the profile came back
+    degenerate -- see compute_volume_profile) simply gets no confirmation
+    check; is_level_volume_confirmed already fails open to True for that
+    case, so this never blocks or corrupts channel solidification, only
+    costs it the extra confirmation grading for that symbol.
+    """
+    if not symbols:
+        return {}
+    bars = fetch_recent_minute_bars(symbols)
+    if bars.empty:
+        return {}
+    out: dict[str, VolumeProfile] = {}
+    for symbol, group in bars.groupby("symbol"):
+        profile = compute_volume_profile(
+            group["high"], group["low"], group["close"], group["volume"],
+            bins=settings.volume_profile_bins, value_area_pct=settings.volume_profile_value_area_pct,
+        )
+        if profile is not None:
+            out[str(symbol)] = profile
+    return out
+
+
 def _solidified_channel_distances(
     symbols: list[str], price_by_symbol: dict[str, float]
 ) -> tuple[dict[str, float], dict[str, float]]:
@@ -1224,27 +1271,41 @@ def _solidified_channel_distances(
     (support_distance_by_symbol, resistance_distance_by_symbol), each side
     resolved independently across _DONCHIAN_SOLIDIFICATION_WINDOWS: for a
     given symbol, the largest window whose level is still "in play" (price
-    hasn't already cleared it -- see _channel_distances) wins that side,
-    falling through to progressively smaller windows only when a larger
-    one has no usable level (too little history yet, or price already
-    through it). The two sides can end up anchored to different windows --
-    e.g. a 200-day resistance still overhead but a 20-day support already
-    broken -- since each is genuinely independent evidence.
+    hasn't already cleared it -- see _channel_distances) AND
+    volume-confirmed (see _volume_profile_by_symbol/
+    is_level_volume_confirmed -- real trading activity actually clustered
+    near this price, not just that price once touched it) wins that side,
+    falling through to progressively smaller windows when a larger one has
+    no usable level (too little history yet, price already through it, or
+    an untested spike a volume profile shows nobody defended). The two
+    sides can end up anchored to different windows -- e.g. a 200-day
+    resistance still overhead but a 20-day support already broken -- since
+    each is genuinely independent evidence.
 
     Reuses donchian_channel_levels/_channel_distances exactly as they
     already work for a single window; this just calls that pair once per
     window, largest first, narrowing to symbols still missing a resolved
-    side each time.
+    side each time. The volume profile itself is fetched once up front
+    (it doesn't vary by window) and reused across every iteration.
     """
     support_distance_by_symbol: dict[str, float] = {}
     resistance_distance_by_symbol: dict[str, float] = {}
+    profile_by_symbol = _volume_profile_by_symbol(symbols)
     for window in _DONCHIAN_SOLIDIFICATION_WINDOWS:
         pending = [s for s in symbols if s not in support_distance_by_symbol or s not in resistance_distance_by_symbol]
         if not pending:
             break
         levels = donchian_channel_levels(pending, window=window)
         for symbol in pending:
-            support_distance, resistance_distance = _channel_distances(price_by_symbol.get(symbol), levels.get(symbol))
+            level = levels.get(symbol)
+            support_distance, resistance_distance = _channel_distances(price_by_symbol.get(symbol), level)
+            if level is not None:
+                support_price, resistance_price = level
+                profile = profile_by_symbol.get(symbol)
+                if support_distance is not None and not is_level_volume_confirmed(support_price, profile):
+                    support_distance = None
+                if resistance_distance is not None and not is_level_volume_confirmed(resistance_price, profile):
+                    resistance_distance = None
             if symbol not in support_distance_by_symbol and support_distance is not None:
                 support_distance_by_symbol[symbol] = support_distance
             if symbol not in resistance_distance_by_symbol and resistance_distance is not None:
@@ -1584,10 +1645,18 @@ def run_screen_with_scores(
                 ]
             macro_sector_map = macro_sector_sentiment_by_symbol if settings.enable_macro_sector_block else {}
             latest_close_by_symbol = train_df.sort_values("ts").groupby("symbol")["close"].last().to_dict()
+            # Scoped to `eligible`, not every screened symbol -- same "skip
+            # real work when the key's unset" reasoning as the comment
+            # above, just as true of an intraday-bars fetch as the SHAP
+            # pass. A second, independent call from _solidified_channel_
+            # distances' own (mirrors donchian_channel_levels' identical
+            # display-vs-tightening duplication just above).
+            volume_profile_by_symbol = _volume_profile_by_symbol(list(eligible["symbol"]))
             llm_pool = _build_llm_candidate_pool(
                 eligible, ensemble, latest, raw_latest, feature_cols, vol_by_symbol,
                 latest_close_by_symbol, macro_sector_map, target_horizon_days,
                 atr_pct_by_symbol=atr_pct_by_symbol, channel_levels_by_symbol=channel_levels_by_symbol,
+                volume_profile_by_symbol=volume_profile_by_symbol,
             )
             llm_advice = get_llm_trade_advice(
                 llm_pool,
