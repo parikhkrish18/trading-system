@@ -1145,6 +1145,42 @@ def test_log_closure_builds_valid_phase_reasoning(monkeypatch):
     assert "sentiment turned negative" in phases[0]["lines"]
 
 
+def test_log_rejected_closure_records_the_real_unchanged_position(monkeypatch):
+    """
+    Regression test: a rejected contradiction close is NOT a flatten -- the
+    human said no (or ignored it), so the position is exactly as open as it
+    was. Before the fix, this row hardcoded executed_position=0.0
+    regardless, which falsely read as "flattened to zero" to
+    monitoring/dashboard/server.py's decisions-table round-trip pairing
+    (_decision_episode_boundaries/attach_actual_outcomes, which key off
+    executed_position == 0 alone with no reference to approval_status) --
+    silently consuming the symbol's real entry decision against a close
+    that never actually happened, so its real close later had no entry
+    left to pair with and never completed an episode.
+    """
+    captured = {}
+
+    class _FakeDF:
+        def to_sql(self, *a, **k):
+            captured["rows"] = a, k
+
+    monkeypatch.setattr(cm.pd, "DataFrame", lambda rows: (captured.setdefault("raw_rows", rows), _FakeDF())[1])
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+
+    result = cm.ContradictionResult(
+        symbol="AAPL",
+        side="long",
+        closed=False,
+        reasons=[{"signal": "news_sentiment", "value": -0.8, "news_count": 5, "detail": "sentiment turned negative"}],
+    )
+    cm._log_rejected_closure(result, mode="paper", approval_status="rejected", executed_position=10.0)
+
+    row = captured["raw_rows"][0]
+    assert row["executed_position"] == 10.0
+    assert row["target_position"] == 0.0
+    assert row["approval_status"] == "rejected"
+
+
 # --- the human gate on mid-week closes and reactivations ------------------
 
 
@@ -1223,7 +1259,10 @@ def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
 
     logged = []
-    monkeypatch.setattr(cm, "_log_rejected_closure", lambda result, mode, status: logged.append((result.symbol, status)))
+    monkeypatch.setattr(
+        cm, "_log_rejected_closure",
+        lambda result, mode, status, executed_position: logged.append((result.symbol, status, executed_position)),
+    )
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: pytest.fail("a rejected close must not log as a closure"))
 
     alerts = []
@@ -1235,7 +1274,12 @@ def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
     results = cm.run_contradiction_check(request_fn=_reject_all)
 
     assert broker.closed == []  # nothing submitted
-    assert logged == [("AAPL", "rejected")]
+    # executed_position is AAPL's real, unchanged position (10, from the
+    # broker fixture above) -- not a hardcoded 0.0, which would falsely
+    # read as a flatten to monitoring/dashboard/server.py's decisions-table
+    # round-trip pairing even though the close was rejected and the
+    # position is still fully open.
+    assert logged == [("AAPL", "rejected", 10)]
     # Reported in the single end-of-check message rather than its own alert.
     assert any("kept open" in m and "AAPL" in m for m in alerts)
     assert len(alerts) == 1, f"one summary expected, got {len(alerts)}: {alerts}"

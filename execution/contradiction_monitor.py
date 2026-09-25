@@ -404,11 +404,26 @@ def _log_closure(
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
 
-def _log_rejected_closure(result: ContradictionResult, mode: str, approval_status: str) -> None:
+def _log_rejected_closure(result: ContradictionResult, mode: str, approval_status: str, executed_position: float | None) -> None:
     """
     The variant row for a contradiction the human declined (or ignored) —
     the record must show the system FLAGGED this position even though the
     position is still open.
+
+    `executed_position` must be the real, current position (the caller's
+    own `positions` read, not a hardcoded 0.0): this row's own docstring
+    says the position stays open, but a hardcoded 0.0 here previously
+    contradicted that -- monitoring/dashboard/server.py's decisions-table
+    round-trip pairing (_decision_episode_boundaries/attach_actual_outcomes)
+    keys off executed_position == 0 alone, with no reference to
+    approval_status, to decide a position closed. A rejected closure's
+    phantom 0.0 got misread as a real flatten, consuming this symbol's real
+    entry decision against a close that never happened -- so when the
+    position's actual close came later (see _log_closure), there was no
+    entry left to pair it with and no episode ever completed: the real
+    close showed as its own unpaired row in Trade Log but never appeared
+    in Closed Trades at all. Same bug, same fix, as
+    execution/trading_loop.py::_log_decisions' rejected_close_symbols loop.
     """
     phase2 = reasoning.phase_contradiction(result.reasons)
     phase4 = {
@@ -433,7 +448,7 @@ def _log_rejected_closure(result: ContradictionResult, mode: str, approval_statu
         "forecast": None,
         "regime": None,
         "target_position": 0.0,
-        "executed_position": 0.0,
+        "executed_position": executed_position,
         "mode": mode,
         "reasoning": json.dumps(full_reasoning),
         "approval_status": approval_status,
@@ -890,7 +905,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         if result.symbol not in approved_symbols:
             result.closed = False  # the record must not claim a close that didn't happen
             logger.warning("Close of %s not approved (%s) — position stays open.", result.symbol, status or "rejected")
-            _log_rejected_closure(result, broker.mode, status or "rejected")
+            _log_rejected_closure(result, broker.mode, status or "rejected", positions.get(result.symbol))
             kept.append(result.symbol)
             continue
 
