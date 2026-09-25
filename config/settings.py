@@ -306,6 +306,23 @@ class Settings(BaseSettings):
     # the window models/screener.py's donchian_pct_20/donchian_breakout_20
     # features already use, so no separate backfill is needed for this.
     donchian_exit_window: int = Field(default=20, alias="DONCHIAN_EXIT_WINDOW")
+    # Volume-profile confirmation (models/screener.py's
+    # _solidified_channel_distances): a Donchian support/resistance level
+    # is real, tested price action, but says nothing about how much size
+    # actually traded there -- a level from a thin, undefended spike prints
+    # the exact same way as one the market fought over all week. Pulled
+    # from real intraday bars (data/ingest/intraday_bars.py, Alpaca
+    # minute-equivalent bars -- the only vendor already wired in this repo
+    # that has genuine sub-day price/volume, see features/quant/
+    # volume_profile.py), never from the daily bars in `prices`, which
+    # carry only one volume number per day with no within-day distribution.
+    volume_profile_lookback_days: int = Field(default=20, alias="VOLUME_PROFILE_LOOKBACK_DAYS")
+    volume_profile_bar_minutes: int = Field(default=15, alias="VOLUME_PROFILE_BAR_MINUTES")
+    volume_profile_bins: int = Field(default=50, alias="VOLUME_PROFILE_BINS")
+    # Standard convention (matches most charting platforms' default): the
+    # price band around the Point of Control holding this fraction of the
+    # lookback window's total volume.
+    volume_profile_value_area_pct: float = Field(default=0.70, alias="VOLUME_PROFILE_VALUE_AREA_PCT")
     exit_take_profit_max_sigmas: float = Field(default=2.0, alias="EXIT_TAKE_PROFIT_MAX_SIGMAS")
     exit_min_take_profit_pct: float = Field(default=0.03, alias="EXIT_MIN_TAKE_PROFIT_PCT")
     # Stop loss in horizon-sigmas. 1.5 is deliberately wider than one

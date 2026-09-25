@@ -1449,6 +1449,113 @@ def test_solidified_channel_distances_windows_checked_largest_first():
     assert _DONCHIAN_SOLIDIFICATION_WINDOWS == (200, 100, 50, 20)
 
 
+def test_solidified_channel_distances_falls_through_when_the_level_is_not_volume_confirmed(monkeypatch):
+    """
+    The 200-day resistance is technically in play (price hasn't cleared
+    it) but sits in a price zone the volume profile shows nobody actually
+    traded -- an untested spike, not real resistance -- so it must be
+    skipped in favor of the 20-day level, exactly like "no data" already
+    falls through.
+    """
+    import models.screener as scr
+
+    def fake_levels(symbols, window=None):
+        if window == 200:
+            return {"AAPL": (80.0, 120.0)}
+        if window == 20:
+            return {"AAPL": (90.0, 108.0)}
+        return {}
+
+    monkeypatch.setattr(scr, "donchian_channel_levels", fake_levels)
+    # Value area covers 90-110 -- the 200-day resistance (120) sits well
+    # outside it (unconfirmed); the 20-day resistance (108) sits inside.
+    monkeypatch.setattr(
+        scr, "_volume_profile_by_symbol",
+        lambda symbols: {"AAPL": scr.VolumeProfile(poc=100.0, val=90.0, vah=110.0)},
+    )
+
+    _support, resistance = _solidified_channel_distances(["AAPL"], {"AAPL": 100.0})
+
+    assert resistance["AAPL"] == pytest.approx((108.0 - 100.0) / 100.0)
+
+
+def test_solidified_channel_distances_accepts_a_volume_confirmed_level(monkeypatch):
+    import models.screener as scr
+
+    monkeypatch.setattr(
+        scr, "donchian_channel_levels",
+        lambda symbols, window=None: {"AAPL": (80.0, 120.0)} if window == 200 else {},
+    )
+    monkeypatch.setattr(
+        scr, "_volume_profile_by_symbol",
+        lambda symbols: {"AAPL": scr.VolumeProfile(poc=100.0, val=75.0, vah=125.0)},
+    )
+
+    support, resistance = _solidified_channel_distances(["AAPL"], {"AAPL": 100.0})
+
+    assert resistance["AAPL"] == pytest.approx(0.20)
+    assert support["AAPL"] == pytest.approx(0.20)
+
+
+def test_solidified_channel_distances_fails_open_when_no_profile_was_computed(monkeypatch):
+    """No intraday data available at all -- must fail open, not block every level."""
+    import models.screener as scr
+
+    monkeypatch.setattr(
+        scr, "donchian_channel_levels",
+        lambda symbols, window=None: {"AAPL": (80.0, 120.0)} if window == 200 else {},
+    )
+    monkeypatch.setattr(scr, "_volume_profile_by_symbol", lambda symbols: {})
+
+    support, resistance = _solidified_channel_distances(["AAPL"], {"AAPL": 100.0})
+
+    assert resistance["AAPL"] == pytest.approx(0.20)
+    assert support["AAPL"] == pytest.approx(0.20)
+
+
+# --------------------------------------------------------------------------
+# _volume_profile_by_symbol
+# --------------------------------------------------------------------------
+
+
+def test_volume_profile_by_symbol_is_empty_for_no_symbols():
+    import models.screener as scr
+
+    assert scr._volume_profile_by_symbol([]) == {}
+
+
+def test_volume_profile_by_symbol_is_empty_when_no_bars_come_back(monkeypatch):
+    import models.screener as scr
+
+    monkeypatch.setattr(
+        scr, "fetch_recent_minute_bars",
+        lambda symbols: pd.DataFrame(columns=["symbol", "ts", "high", "low", "close", "volume"]),
+    )
+
+    assert scr._volume_profile_by_symbol(["AAPL"]) == {}
+
+
+def test_volume_profile_by_symbol_computes_one_profile_per_symbol(monkeypatch):
+    import models.screener as scr
+
+    bars = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 5 + ["MSFT"] * 5,
+            "high": [99.0, 100.0, 101.0, 100.0, 99.0, 199.0, 200.0, 201.0, 200.0, 199.0],
+            "low": [98.0, 99.0, 100.0, 99.0, 98.0, 198.0, 199.0, 200.0, 199.0, 198.0],
+            "close": [98.5, 99.5, 100.5, 99.5, 98.5, 198.5, 199.5, 200.5, 199.5, 198.5],
+            "volume": [10.0, 20.0, 30.0, 40.0, 50.0, 10.0, 20.0, 30.0, 40.0, 50.0],
+        }
+    )
+    monkeypatch.setattr(scr, "fetch_recent_minute_bars", lambda symbols: bars)
+
+    profiles = scr._volume_profile_by_symbol(["AAPL", "MSFT"])
+
+    assert set(profiles) == {"AAPL", "MSFT"}
+    assert profiles["AAPL"].poc == pytest.approx(100.0, abs=1.5)
+    assert profiles["MSFT"].poc == pytest.approx(200.0, abs=1.5)
+
+
 def test_run_screen_computes_atr_pct_from_vol_atr_14_and_close(monkeypatch):
     """
     vol_atr_14 (a raw QUANT_FEATURES entry -- see features/build_features.py
@@ -1520,6 +1627,52 @@ def test_build_llm_candidate_pool_includes_donchian_levels_and_solidified_quant_
     assert row["donchian_resistance"] == pytest.approx(112.0)
     # resistance_distance = (112-100)/100 = 0.12, inside the ATR band [0.089, 0.179] -- solidifies the ceiling.
     assert row["quant_take_profit_pct"] == pytest.approx(0.12)
+
+
+def test_build_llm_candidate_pool_includes_volume_profile_and_confirmation_flags(monkeypatch):
+    import models.screener as scr
+
+    monkeypatch.setattr(scr.settings, "target_horizon_days", 5)
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
+    monkeypatch.setattr(scr, "_explain_features", lambda *a, **k: {})
+    monkeypatch.setattr(scr, "_load_recent_headlines", lambda *a, **k: {})
+
+    pool_df = pd.DataFrame({"symbol": ["A"], "predicted_return": [0.5], "conviction_score": [0.5]})
+    profile = scr.VolumeProfile(poc=100.0, val=95.0, vah=118.0)  # resistance (112) inside, support (90) outside
+    payload = scr._build_llm_candidate_pool(
+        pool_df, ensemble=None, latest_features=pd.DataFrame(), raw_features=pd.DataFrame(),
+        feature_cols=[], vol_by_symbol={"A": 0.01}, latest_close_by_symbol={"A": 100.0},
+        macro_sector_sentiment_by_symbol={}, horizon_days=5,
+        atr_pct_by_symbol={"A": 0.02}, channel_levels_by_symbol={"A": (90.0, 112.0)},
+        volume_profile_by_symbol={"A": profile},
+    )
+
+    row = payload[0]
+    assert row["volume_profile_poc"] == pytest.approx(100.0)
+    assert row["volume_profile_value_area_low"] == pytest.approx(95.0)
+    assert row["volume_profile_value_area_high"] == pytest.approx(118.0)
+    assert row["donchian_resistance_volume_confirmed"] is True
+    assert row["donchian_support_volume_confirmed"] is False
+
+
+def test_build_llm_candidate_pool_volume_confirmation_is_none_without_a_donchian_level(monkeypatch):
+    import models.screener as scr
+
+    monkeypatch.setattr(scr, "_load_fundamentals_context", lambda *a, **k: {})
+    monkeypatch.setattr(scr, "_explain_features", lambda *a, **k: {})
+    monkeypatch.setattr(scr, "_load_recent_headlines", lambda *a, **k: {})
+
+    pool_df = pd.DataFrame({"symbol": ["A"], "predicted_return": [0.5], "conviction_score": [0.5]})
+    payload = scr._build_llm_candidate_pool(
+        pool_df, ensemble=None, latest_features=pd.DataFrame(), raw_features=pd.DataFrame(),
+        feature_cols=[], vol_by_symbol={"A": 0.01}, latest_close_by_symbol={"A": 100.0},
+        macro_sector_sentiment_by_symbol={}, horizon_days=5,
+    )
+
+    row = payload[0]
+    assert row["donchian_support_volume_confirmed"] is None
+    assert row["donchian_resistance_volume_confirmed"] is None
+    assert row["volume_profile_poc"] is None
 
 
 def test_build_llm_candidate_pool_includes_signal_to_noise(monkeypatch):
