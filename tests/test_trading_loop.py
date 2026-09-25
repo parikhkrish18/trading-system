@@ -282,6 +282,125 @@ def test_log_decisions_records_a_closed_symbol_as_zero_even_when_the_broker_has_
     assert rows["OLD1"]["executed_position"] == 0.0
 
 
+def test_log_decisions_records_a_queued_open_as_its_intended_shares_not_none(monkeypatch):
+    """
+    Regression test: a fresh order submitted outside market hours (or any
+    other reason it hasn't filled yet) leaves the new symbol absent from
+    actual_positions -- `executed` here is exactly that dict, so BE (say)
+    has no key at all, not a 0.0 value, just like a real
+    broker.get_positions() read right after submission.
+
+    Before the fix, `executed.get(c.symbol)` with no default stored `None`
+    for executed_position on this row. monitoring/dashboard/server.py's
+    decisions-table round-trip pairing requires executed_position to be
+    non-null just to be considered an entry candidate at all (real_trade_rows
+    filters on it, _decision_episode_boundaries skips a NaN row outright) --
+    so a None here doesn't just read as an ambiguous outcome, it makes the
+    row invisible everywhere, forever: no entry ever exists to pair a later
+    close against, no matter what that close's own executed_position says.
+    This is exactly what happened to a real position (BE) whose order queued
+    after-hours. When reconciliation confirms the order is genuinely queued
+    (not rejected/diverged), this must record the real intended shares.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+    candidate = _candidate("BE", "long", 0.295, pred_return=0.007, agreement=0.7)
+
+    _real_log_decisions(
+        candidates=[candidate],
+        closing_symbols=[],
+        executed={},  # BE hasn't filled yet -- not a key here
+        intended_shares={"BE": 121.79},
+        feature_set_id="v4",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        queued_symbols=frozenset({"BE"}),
+    )
+
+    rows = {r["symbol"]: r for r in captured["rows"]}
+    assert rows["BE"]["executed_position"] == 121.79
+
+
+def test_log_decisions_leaves_a_non_queued_missing_execution_as_none(monkeypatch):
+    """
+    The queued_symbols fallback must not paper over a genuine failure: a
+    symbol reconciliation did NOT confirm as queued (rejected, diverged, or
+    simply not in the set) keeps its executed_position as None when the
+    broker read shows nothing -- upgrading every missing read to "looks
+    like it opened" would hide real order failures instead of reporting
+    them honestly.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+    candidate = _candidate("BROKEN", "long", 0.1)
+
+    _real_log_decisions(
+        candidates=[candidate],
+        closing_symbols=[],
+        executed={},
+        intended_shares={"BROKEN": 50.0},
+        feature_set_id="v4",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        queued_symbols=frozenset(),  # not queued -- e.g. rejected or genuinely unknown
+    )
+
+    rows = {r["symbol"]: r for r in captured["rows"]}
+    assert rows["BROKEN"]["executed_position"] is None
+
+
+def test_run_cycle_passes_queued_symbols_from_reconciliation_to_log_decisions(monkeypatch):
+    """
+    Wiring test: run_cycle must derive queued_symbols from reconciliation's
+    own outcome classification (execution/reconciliation.py), not
+    reinvent it, so a symbol only gets the intended-shares fallback when
+    reconciliation itself concluded the order is genuinely queued.
+    """
+
+    class _UnsettledBroker(_FakeBroker):
+        """Accepts the order (recorded in .submitted) but get_positions()
+        doesn't reflect it yet -- exactly what a real broker read looks
+        like right after submitting outside market hours."""
+
+        def submit_target_position(self, symbol, target_shares):
+            self.submitted.append((symbol, target_shares))
+            return {"symbol": symbol, "qty": target_shares}
+
+    broker = _UnsettledBroker()
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("BE", "long", 0.3)]))
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"BE": 100.0})
+
+    captured = {}
+    monkeypatch.setattr(trading_loop, "_log_decisions", lambda *a, **k: captured.update(k))
+
+    trading_loop.run_cycle("v3", ["BE"], request_fn=_approve_all)
+
+    # get_positions() still shows nothing for BE (unsettled), so intended
+    # vs. actual diverges beyond tolerance; no get_order on this broker
+    # means _order_states falls back to the submit-time response (no
+    # "status" key), and classify_order_status treats that as queued (see
+    # execution/reconciliation.py) rather than a failure.
+    assert captured["queued_symbols"] == frozenset({"BE"})
+
+
 def test_run_cycle_flattens_and_skips_trading_on_pretrade_breaker(monkeypatch):
     broker = _FakeBroker()
     monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)

@@ -39,7 +39,7 @@ from execution.approval_gate import ProposedTrade, request_approval, send_follow
 from execution.broker import get_broker
 from execution.client_fanout import replicate_to_clients
 from execution.hold_rules import evaluate_holds, load_exit_levels, load_missed_cycles, store_missed_cycles
-from execution.reconciliation import reconcile_positions, summarize
+from execution.reconciliation import QUEUED, reconcile_positions, summarize
 from features.quant.momentum import adx
 from models.regime.trend_chop_classifier import CHOP, RuleBasedRegime
 from models.screener import build_correlation_matrix, run_screen_with_scores
@@ -404,6 +404,7 @@ def _log_decisions(
     held_reasoning: dict[str, list[dict]] | None = None,
     held_levels_by_symbol: dict | None = None,
     held_predictions: dict[str, float] | None = None,
+    queued_symbols: frozenset[str] | None = None,
 ) -> None:
     """
     Logs one decisions row per symbol touched this cycle — new/adjusted
@@ -414,6 +415,22 @@ def _log_decisions(
     full 7-phase reasoning: phases 1/5/6/7 are cycle-level facts merged in
     here, phases 2/3/4 come from run_screen for real candidates (see
     monitoring/reasoning.py).
+
+    `queued_symbols`: symbols whose fresh order this cycle is still live at
+    the broker and waiting to fill (e.g. submitted outside market hours --
+    see execution/reconciliation.py) rather than genuinely failed. For one
+    of these, `executed` (actual_positions, read right after submission)
+    can still show nothing at all for a brand-new position, and
+    executed.get(c.symbol) with no default stores None -- monitoring/
+    dashboard/server.py's decisions-table round-trip pairing
+    (_decision_episode_boundaries/attach_actual_outcomes/real_trade_rows)
+    requires executed_position to be non-null just to be considered an
+    entry at all, so a None here makes this row invisible to Trade Log AND
+    Closed Trades, silently, forever: not just missing an outcome, but
+    never even recognised as an entry to pair a later close against. Only
+    for a symbol reconciliation confirmed is genuinely queued (not
+    rejected/diverged/unknown) does the candidates loop below fall back to
+    the real intended_shares instead of leaving this None.
 
     `skip_reasons`: {symbol: reason} for an APPROVED candidate that still
     never got an order (e.g. no price to size it with) — target_position on
@@ -464,9 +481,17 @@ def _log_decisions(
         phase6 = phase6_by_symbol.get(c.symbol) or reasoning.phase_reconciliation(c.symbol, shares, executed.get(c.symbol, 0.0), False)
         phase7 = reasoning.phase_ongoing_monitoring(closed=False)
         full_reasoning = reasoning.combine_phases(phase1, *(c.reasoning or []), phase5, phase6, phase7)
+        executed_position = executed.get(c.symbol)
+        if executed_position is None and c.symbol in (queued_symbols or frozenset()):
+            # The order is genuinely live at the broker, just not reflected
+            # in actual_positions yet -- record what it was actually
+            # submitted for (the same fallback _log_reactivation always
+            # uses, for the identical reason) rather than a None that would
+            # make this entry invisible to Trade Log/Closed Trades forever.
+            executed_position = intended_shares.get(c.symbol)
         rows.append(
             _row(
-                c.symbol, c.predicted_return, c.target_position_pct, executed.get(c.symbol),
+                c.symbol, c.predicted_return, c.target_position_pct, executed_position,
                 c.direction_agreement, full_reasoning, c.exit_levels,
             )
         )
@@ -890,6 +915,7 @@ def run_cycle(
         held_reasoning=held_reasoning,
         held_levels_by_symbol=prior_levels,
         held_predictions=predicted_return_by_symbol,
+        queued_symbols=frozenset(r.symbol for r in reconciliation if r.outcome == QUEUED),
     )
 
     # Hold state reflects what is ACTUALLY still open after execution: an
