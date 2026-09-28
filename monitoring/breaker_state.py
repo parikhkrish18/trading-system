@@ -41,7 +41,10 @@ def check_and_record_breakers(
 
     for symbol, value in positions_by_symbol.items():
         tagged.append(
-            (f"max_single_position:{symbol}", max_single_position_breaker(value, portfolio_value, max_single_position_pct))
+            (
+                f"max_single_position:{symbol}",
+                max_single_position_breaker(value, portfolio_value, max_single_position_pct, symbol=symbol),
+            )
         )
 
     tagged.extend(

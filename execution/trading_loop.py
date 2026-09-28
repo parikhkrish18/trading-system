@@ -56,7 +56,7 @@ _MODEL_VERSION = "ensemble_v1"
 
 @dataclasses.dataclass
 class CycleResult:
-    status: str  # "flattened_pre_trade" | "flattened_post_trade" | "no_candidates" | "dry_run" | "traded"
+    status: str  # "flattened_pre_trade" | "flattened_post_trade" | "trimmed_pre_trade" | "trimmed_post_trade" | "no_candidates" | "dry_run" | "traded"
     candidates_screened: int
     orders_placed: int
     reconciliation_summary: str | None
@@ -263,6 +263,71 @@ def _flatten_and_alert(broker, reason: str) -> None:
     broker.flatten_all()
     alert_circuit_breaker(reason)
     record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
+
+
+def _trim_target_shares(prices: dict[str, float], symbol: str, target_value: float) -> float:
+    """
+    A breaker's dollar target_value -> signed share count for
+    submit_target_position, using a fresh price read for just the symbols
+    being trimmed. No price available -> 0.0 (fully close), the same
+    conservative fallback run_cycle's own order-sizing loop uses when it
+    can't value a position — trimming to nothing is always a safe response
+    to a breach, unlike guessing a size from a stale or missing quote.
+    """
+    price = prices.get(symbol)
+    if not price:
+        logger.warning("No price for %s — trimming the breached position to zero instead.", symbol)
+        return 0.0
+    return target_value / price
+
+
+def _respond_to_breaker_triggers(broker, triggers: list) -> tuple[str, int]:
+    """
+    Decides full-flatten vs. targeted trim for one batch of triggered
+    breaker results (a single _run_breaker_check call), and carries it out.
+
+    Trims ONLY when every trigger in the batch names a concrete symbol and
+    target_value — risk/circuit_breakers.py's own fail-safe-to-flatten
+    default (see its module docstring). A single trigger missing either
+    (max_drawdown always, or any breaker's own fail-safe case) falls the
+    WHOLE response back to a full flatten: a portfolio-wide or "can't tell"
+    signal can't be satisfied by trimming individual symbols.
+
+    Two triggers naming the SAME symbol (e.g. max_single_position and
+    max_correlated_exposure both firing on one lone position, as literally
+    happened once in production) take the smaller-magnitude target_value —
+    the trim that satisfies every breached cap on that symbol at once, not
+    just whichever breaker happened to be checked last.
+    """
+    if any(t.symbol is None or t.target_value is None for t in triggers):
+        reason = "; ".join(t.reason for t in triggers)
+        _flatten_and_alert(broker, reason)
+        return "flattened", 0
+
+    target_value_by_symbol: dict[str, float] = {}
+    for t in triggers:
+        current = target_value_by_symbol.get(t.symbol)
+        if current is None or abs(t.target_value) < abs(current):
+            target_value_by_symbol[t.symbol] = t.target_value
+
+    prices = _latest_prices(list(target_value_by_symbol.keys()))
+    reason = "; ".join(t.reason for t in triggers)
+    logger.critical(
+        "Circuit breaker triggered: %s — trimming %s instead of a full flatten.",
+        reason, ", ".join(target_value_by_symbol),
+    )
+    orders_placed = 0
+    for symbol, target_value in target_value_by_symbol.items():
+        target_shares = _trim_target_shares(prices, symbol, target_value)
+        try:
+            order = broker.submit_target_position(symbol, target_shares)
+            if order is not None:
+                orders_placed += 1
+        except Exception:
+            logger.exception("Breaker trim order failed for %s — continuing with the rest of the batch.", symbol)
+    alert_circuit_breaker(reason)
+    record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
+    return "trimmed", orders_placed
 
 
 # --------------------------------------------------------------------------
@@ -594,9 +659,9 @@ def run_cycle(
     # _flatten_and_alert just below.
     phase1 = reasoning.phase_pretrade_risk(pre_trade_triggers)
     if pre_trade_triggers:
-        reasons = "; ".join(r.reason for r in pre_trade_triggers)
-        _flatten_and_alert(broker, reasons)
-        return CycleResult("flattened_pre_trade", 0, 0, None, broker.get_portfolio_value())
+        action, trim_orders = _respond_to_breaker_triggers(broker, pre_trade_triggers)
+        status = "trimmed_pre_trade" if action == "trimmed" else "flattened_pre_trade"
+        return CycleResult(status, 0, trim_orders, None, broker.get_portfolio_value())
 
     regime = _market_regime(engine)
     is_shortable_fn = broker.is_shortable if hasattr(broker, "is_shortable") else None
@@ -944,9 +1009,11 @@ def run_cycle(
 
     post_trade_triggers = _run_breaker_check(broker, engine)
     if post_trade_triggers:
-        reasons = "; ".join(r.reason for r in post_trade_triggers)
-        _flatten_and_alert(broker, reasons)
-        return CycleResult("flattened_post_trade", len(candidates), orders_placed, reconciliation_summary, broker.get_portfolio_value())
+        action, trim_orders = _respond_to_breaker_triggers(broker, post_trade_triggers)
+        status = "trimmed_post_trade" if action == "trimmed" else "flattened_post_trade"
+        return CycleResult(
+            status, len(candidates), orders_placed + trim_orders, reconciliation_summary, broker.get_portfolio_value()
+        )
 
     outcome_message = _cycle_outcome_message(
         reconciliation=reconciliation,

@@ -5,22 +5,63 @@ explicitly calls out risk/circuit_breakers.py and execution/broker_*.py
 as the two files where a bug does the most damage (Security section).
 
 Design intent: every check here returns a plain (triggered: bool, reason:
-str) pair. Nothing here places orders directly — execution/ decides what to
-do with a triggered breaker (e.g. flatten via get_broker()), keeping "did a
-limit get breached" separate from "what do we do about it".
+str, ...) result. Nothing here places orders directly — execution/ decides
+what to do with a triggered breaker, keeping "did a limit get breached"
+separate from "what do we do about it".
+
+A triggered result MAY also carry enough to size a targeted fix (symbol/
+target_value below) instead of the historical response, a full flatten of
+every open position. execution/trading_loop.py's own responder is the one
+that actually decides full-flatten vs. targeted trim, and it does so
+conservatively: ONLY when every triggered result names a concrete symbol
+and target_value does it trim; a single trigger missing either (e.g.
+max_drawdown, which is portfolio-wide with nothing to attribute to one
+symbol, or any breaker's own fail-safe case below) falls the WHOLE response
+back to a full flatten. That fail-safe-to-flatten default lives here, not
+just in trading_loop.py, because it's this module's job to never claim more
+precision than it actually has.
 """
 from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 
 logger = logging.getLogger(__name__)
+
+# A triggered breach that trims (rather than flattens) targets a level this
+# fraction BELOW its cap, not exactly at it -- ordinary price movement or
+# rounding on the very next check would otherwise flip the same breaker
+# right back to triggered before the trim even had a chance to hold.
+_TRIM_SAFETY_MARGIN = 0.05
 
 
 @dataclasses.dataclass
 class BreakerResult:
     triggered: bool
     reason: str = ""
+    # "max_drawdown" | "max_single_position" | "max_correlated_exposure" --
+    # "" on an untriggered result, where nothing else here is meaningful.
+    breaker_type: str = ""
+    # The symbol this breach is attributable to, when there is exactly one
+    # -- None for a portfolio-wide breach (max_drawdown) or a fail-safe
+    # trigger from input this module can't safely reason about (a
+    # non-positive portfolio_value, an unmeasurable equity curve).
+    symbol: str | None = None
+    target_value: float | None = None
+    # The dollar position value (same sign as the original position --
+    # negative for a short) `symbol` should be trimmed TO in order to clear
+    # this breach with _TRIM_SAFETY_MARGIN to spare, already computed here
+    # rather than left for the caller to re-derive. None whenever `symbol`
+    # is None (nothing to trim). Clamped at 0 rather than going negative --
+    # a cluster whose OTHER correlated members alone still exceed the cap
+    # even after this symbol is fully closed isn't this single trim's job
+    # to fix outright: closing it is still the most this one symbol can
+    # contribute, and the next breaker check (this cycle's post-trade pass,
+    # or next cycle's pre-trade one) re-evaluates whatever's left, now
+    # centered on the next largest contributor -- a self-correcting
+    # sequence of targeted trims rather than one trim needing to solve the
+    # whole cluster at once.
 
 
 def max_drawdown_breaker(equity_curve, max_drawdown_pct: float) -> BreakerResult:
@@ -40,6 +81,7 @@ def max_drawdown_breaker(equity_curve, max_drawdown_pct: float) -> BreakerResult
             True,
             f"equity_curve has {len(equity_curve)} data point(s) (need >= 2) — cannot verify "
             "drawdown is within limits, failing safe.",
+            breaker_type="max_drawdown",
         )
     peak = max(equity_curve)
     current = equity_curve[-1]
@@ -47,18 +89,26 @@ def max_drawdown_breaker(equity_curve, max_drawdown_pct: float) -> BreakerResult
         return BreakerResult(False)
     drawdown = (current / peak) - 1.0
     if drawdown < -abs(max_drawdown_pct):
-        return BreakerResult(True, f"Drawdown {drawdown:.2%} exceeds limit -{max_drawdown_pct:.2%}")
+        # No symbol/target_value: a drawdown is a portfolio-wide signal
+        # ("something is systematically wrong"), not attributable to any one
+        # position -- there's nothing sensible to trim, so this always
+        # falls execution/trading_loop.py's responder back to a full flatten.
+        return BreakerResult(
+            True, f"Drawdown {drawdown:.2%} exceeds limit -{max_drawdown_pct:.2%}", breaker_type="max_drawdown"
+        )
     return BreakerResult(False)
 
 
 def max_single_position_breaker(
-    position_value: float, portfolio_value: float, max_single_position_pct: float
+    position_value: float, portfolio_value: float, max_single_position_pct: float, symbol: str | None = None
 ) -> BreakerResult:
     """
     Fails safe (triggers) on a non-positive portfolio_value rather than
     passing silently — a broker reporting $0 or negative equity is a data
     problem, not evidence the position is fine, and the last line of
-    defense should never read "can't check" as "all clear".
+    defense should never read "can't check" as "all clear". That fail-safe
+    case leaves symbol/target_value unset even when `symbol` is given —
+    a portfolio_value this module can't trust can't size a safe trim either.
     """
     if portfolio_value <= 0:
         return BreakerResult(
@@ -66,11 +116,18 @@ def max_single_position_breaker(
             f"portfolio_value is non-positive (${portfolio_value:,.2f}) — cannot verify "
             f"position (${position_value:,.2f}) is within the {max_single_position_pct:.2%} "
             "limit, failing safe.",
+            breaker_type="max_single_position",
         )
     pct = abs(position_value) / portfolio_value
     if pct > max_single_position_pct:
+        target_value = None
+        if symbol is not None:
+            target_value = math.copysign(
+                max_single_position_pct * (1 - _TRIM_SAFETY_MARGIN) * portfolio_value, position_value
+            )
         return BreakerResult(
-            True, f"Position is {pct:.2%} of portfolio, exceeds limit {max_single_position_pct:.2%}"
+            True, f"Position is {pct:.2%} of portfolio, exceeds limit {max_single_position_pct:.2%}",
+            breaker_type="max_single_position", symbol=symbol, target_value=target_value,
         )
     return BreakerResult(False)
 
@@ -103,6 +160,7 @@ def max_correlated_exposure_breaker(
                 f"portfolio_value is non-positive (${portfolio_value:,.2f}) with "
                 f"{len(positions_by_symbol)} open position(s) — cannot verify correlated "
                 "exposure is within limits, failing safe.",
+                breaker_type="max_correlated_exposure",
             )
         ]
 
@@ -128,11 +186,23 @@ def max_correlated_exposure_breaker(
                 )
         pct = cluster_exposure / portfolio_value
         if pct > max_correlated_exposure_pct:
+            # Trim JUST this symbol, by the cluster's full dollar excess over
+            # a margin-padded cap -- the correlated others contributing to
+            # this same cluster are left untouched here (see BreakerResult's
+            # own docstring on why: this is one trim in what may need to be
+            # a self-correcting sequence across separately-triggered
+            # results, not a simultaneous multi-symbol solve). Clamped at 0,
+            # never negative -- closing this symbol entirely is the most
+            # this one trim can contribute either way.
+            capped_cluster_exposure = max_correlated_exposure_pct * (1 - _TRIM_SAFETY_MARGIN) * portfolio_value
+            excess = cluster_exposure - capped_cluster_exposure
+            target_value = math.copysign(max(abs(value) - excess, 0.0), value)
             results.append(
                 BreakerResult(
                     True,
                     f"{symbol}'s correlated cluster is {pct:.2%} of portfolio, "
                     f"exceeds limit {max_correlated_exposure_pct:.2%}",
+                    breaker_type="max_correlated_exposure", symbol=symbol, target_value=target_value,
                 )
             )
     return results
@@ -154,8 +224,8 @@ def run_all_breakers(
     if dd.triggered:
         triggered.append(dd)
 
-    for value in positions_by_symbol.values():
-        pos = max_single_position_breaker(value, portfolio_value, max_single_position_pct)
+    for symbol, value in positions_by_symbol.items():
+        pos = max_single_position_breaker(value, portfolio_value, max_single_position_pct, symbol=symbol)
         if pos.triggered:
             triggered.append(pos)
 

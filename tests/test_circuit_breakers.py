@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from risk.circuit_breakers import (
     max_correlated_exposure_breaker,
@@ -37,6 +38,31 @@ def test_max_single_position_breaker():
     assert not max_single_position_breaker(20_000, 100_000, max_single_position_pct=0.25).triggered
 
 
+def test_max_single_position_breaker_computes_a_trim_target_when_symbol_given():
+    """
+    With a symbol, a breach also carries a target_value to trim TO — 5%
+    below the cap (see _TRIM_SAFETY_MARGIN), same sign as the position.
+    """
+    result = max_single_position_breaker(30_000, 100_000, max_single_position_pct=0.25, symbol="AAPL")
+    assert result.triggered
+    assert result.breaker_type == "max_single_position"
+    assert result.symbol == "AAPL"
+    assert result.target_value == pytest.approx(23_750.0)  # 0.25 * 0.95 * 100_000
+
+
+def test_max_single_position_breaker_trim_target_keeps_a_short_negative():
+    result = max_single_position_breaker(-30_000, 100_000, max_single_position_pct=0.25, symbol="TSLA")
+    assert result.triggered
+    assert result.target_value == pytest.approx(-23_750.0)
+
+
+def test_max_single_position_breaker_no_symbol_leaves_target_value_unset():
+    result = max_single_position_breaker(30_000, 100_000, max_single_position_pct=0.25)
+    assert result.triggered
+    assert result.symbol is None
+    assert result.target_value is None
+
+
 def test_max_single_position_breaker_fails_safe_on_non_positive_portfolio_value():
     """Last line of defense: a $0 or negative portfolio_value can't verify anything, so it must not pass as 'fine'."""
     for portfolio_value in (0.0, -5_000.0):
@@ -52,6 +78,41 @@ def test_max_correlated_exposure_breaker_flags_cluster():
         positions, portfolio_value=100_000, correlation_matrix=corr, max_correlated_exposure_pct=0.50
     )
     assert len(results) == 2  # both symbols' clusters breach (60% > 50%)
+
+
+def test_max_correlated_exposure_breaker_computes_a_trim_target_per_symbol():
+    """
+    Each flagged symbol gets its OWN target_value: trim just that symbol by
+    the cluster's full dollar excess over a margin-padded cap, leaving the
+    other correlated member(s) untouched for this trim (see BreakerResult's
+    docstring on the self-correcting, one-symbol-at-a-time design).
+    """
+    corr = pd.DataFrame({"TQQQ": [1.0, 0.95], "UPRO": [0.95, 1.0]}, index=["TQQQ", "UPRO"])
+    positions = {"TQQQ": 30_000, "UPRO": 30_000}
+    results = max_correlated_exposure_breaker(
+        positions, portfolio_value=100_000, correlation_matrix=corr, max_correlated_exposure_pct=0.50
+    )
+    by_symbol = {r.symbol: r for r in results}
+    assert by_symbol["TQQQ"].breaker_type == "max_correlated_exposure"
+    # cluster_exposure 60_000, capped cluster 0.50 * 0.95 * 100_000 = 47_500,
+    # excess 12_500 -> trim TQQQ alone from 30_000 down to 17_500.
+    assert by_symbol["TQQQ"].target_value == pytest.approx(17_500.0)
+    assert by_symbol["UPRO"].target_value == pytest.approx(17_500.0)
+
+
+def test_max_correlated_exposure_breaker_clamps_target_value_at_zero():
+    """
+    When one symbol's own excess share would exceed its whole position, the
+    trim clamps at fully closing it rather than going negative (flipping a
+    long into a short it never asked for).
+    """
+    corr = pd.DataFrame({"TQQQ": [1.0, 0.95], "UPRO": [0.95, 1.0]}, index=["TQQQ", "UPRO"])
+    positions = {"TQQQ": 5_000, "UPRO": 55_000}
+    results = max_correlated_exposure_breaker(
+        positions, portfolio_value=100_000, correlation_matrix=corr, max_correlated_exposure_pct=0.50
+    )
+    tqqq = next(r for r in results if r.symbol == "TQQQ")
+    assert tqqq.target_value == pytest.approx(0.0)
 
 
 def test_max_correlated_exposure_breaker_no_flag_when_uncorrelated():
@@ -113,6 +174,28 @@ def test_run_all_breakers_treats_a_failed_input_check_the_same_as_a_real_breach(
     )
     assert len(triggered) == 1
     assert triggered[0].triggered
+
+
+def test_run_all_breakers_threads_the_symbol_into_max_single_position_triggers():
+    """
+    run_all_breakers must pass each symbol into max_single_position_breaker
+    so the returned trigger carries enough (symbol/target_value) for
+    execution/trading_loop.py to trim rather than flatten.
+    """
+    corr = pd.DataFrame({"TQQQ": [1.0]}, index=["TQQQ"])
+    triggered = run_all_breakers(
+        equity_curve=[100_000, 100_000, 100_000],
+        positions_by_symbol={"TQQQ": 30_000},
+        portfolio_value=100_000,
+        correlation_matrix=corr,
+        max_drawdown_pct=0.15,
+        max_single_position_pct=0.25,
+        max_correlated_exposure_pct=0.50,
+    )
+    assert len(triggered) == 1
+    assert triggered[0].breaker_type == "max_single_position"
+    assert triggered[0].symbol == "TQQQ"
+    assert triggered[0].target_value == pytest.approx(23_750.0)
 
 
 def test_run_all_breakers_aggregates_only_triggered():

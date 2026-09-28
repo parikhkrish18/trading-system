@@ -417,6 +417,106 @@ def test_run_cycle_flattens_and_skips_trading_on_pretrade_breaker(monkeypatch):
     assert screen_called == []  # never got to screening
 
 
+def test_run_cycle_trims_a_single_symbol_instead_of_flattening_on_pretrade_breaker(monkeypatch):
+    """
+    A trigger that names a concrete symbol/target_value trims just that
+    position via submit_target_position — the broker is never asked to
+    flatten everything for a breach that's attributable to one symbol.
+    """
+    broker = _FakeBroker(positions={"P": 800.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(
+        trading_loop, "_run_breaker_check",
+        lambda b, e: [BreakerResult(True, "single position breach", breaker_type="max_single_position", symbol="P", target_value=23_750.0)],
+    )
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"P": 100.0})
+
+    screen_called = []
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen(screen_called.append(1)))
+
+    result = trading_loop.run_cycle("v3", ["P"])
+
+    assert result.status == "trimmed_pre_trade"
+    assert not broker.flattened
+    assert broker.submitted == [("P", 237.5)]  # 23_750 / 100.0
+    assert result.orders_placed == 1
+    assert screen_called == []  # never got to screening
+
+
+def test_run_cycle_falls_back_to_flatten_when_a_trigger_lacks_a_symbol(monkeypatch):
+    """
+    A batch with a portfolio-wide trigger (max_drawdown, no symbol) alongside
+    a targeted one must still fall back to a full flatten — a drawdown
+    can't be fixed by trimming one position.
+    """
+    broker = _FakeBroker(positions={"P": 800.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(
+        trading_loop, "_run_breaker_check",
+        lambda b, e: [
+            BreakerResult(True, "drawdown breach", breaker_type="max_drawdown"),
+            BreakerResult(True, "single position breach", breaker_type="max_single_position", symbol="P", target_value=23_750.0),
+        ],
+    )
+
+    screen_called = []
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen(screen_called.append(1)))
+
+    result = trading_loop.run_cycle("v3", ["P"])
+
+    assert result.status == "flattened_pre_trade"
+    assert broker.flattened
+    assert broker.submitted == []
+
+
+def test_run_cycle_trim_takes_the_smaller_target_when_two_triggers_share_a_symbol(monkeypatch):
+    """
+    max_single_position and max_correlated_exposure both firing on the same
+    lone position (exactly what happened in production) must trim to
+    whichever target satisfies BOTH caps — the smaller magnitude.
+    """
+    broker = _FakeBroker(positions={"P": 800.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(
+        trading_loop, "_run_breaker_check",
+        lambda b, e: [
+            BreakerResult(True, "single position breach", breaker_type="max_single_position", symbol="P", target_value=30_000.0),
+            BreakerResult(True, "correlated exposure breach", breaker_type="max_correlated_exposure", symbol="P", target_value=17_500.0),
+        ],
+    )
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"P": 100.0})
+
+    screen_called = []
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen(screen_called.append(1)))
+
+    result = trading_loop.run_cycle("v3", ["P"])
+
+    assert result.status == "trimmed_pre_trade"
+    assert broker.submitted == [("P", 175.0)]  # 17_500 / 100.0, the smaller target
+
+
+def test_run_cycle_trim_falls_back_to_zero_shares_without_a_price(monkeypatch):
+    broker = _FakeBroker(positions={"P": 800.0})
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(
+        trading_loop, "_run_breaker_check",
+        lambda b, e: [BreakerResult(True, "single position breach", breaker_type="max_single_position", symbol="P", target_value=23_750.0)],
+    )
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {})
+
+    screen_called = []
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen(screen_called.append(1)))
+
+    result = trading_loop.run_cycle("v3", ["P"])
+
+    assert result.status == "trimmed_pre_trade"
+    assert broker.submitted == [("P", 0.0)]
+
+
 def test_run_cycle_dry_run_never_touches_broker(monkeypatch):
     broker = _FakeBroker()
     monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
@@ -636,6 +736,43 @@ def test_run_cycle_flattens_on_posttrade_breaker(monkeypatch):
 
     assert result.status == "flattened_post_trade"
     assert broker.flattened
+
+
+def test_run_cycle_trims_on_posttrade_breaker(monkeypatch):
+    """
+    A post-trade trigger that names a symbol trims that position rather than
+    flattening everything the cycle just bought, and the trim's own order
+    counts toward orders_placed alongside the cycle's trading orders.
+    """
+    broker = _FakeBroker()
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+
+    check_calls = []
+
+    def fake_check(b, e):
+        check_calls.append(1)
+        if len(check_calls) == 1:
+            return []
+        return [
+            BreakerResult(
+                True, "single position breach",
+                breaker_type="max_single_position", symbol="AAPL", target_value=5_000.0,
+            )
+        ]
+
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", fake_check)
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    monkeypatch.setattr(trading_loop, "run_screen_with_scores", lambda *a, **k: _screen([_candidate("AAPL", "long", 0.1)]))
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"AAPL": 100.0})
+
+    result = trading_loop.run_cycle("v3", ["AAPL"])
+
+    assert result.status == "trimmed_post_trade"
+    assert not broker.flattened
+    # 1 from the cycle's own opening order, 1 from the post-trade trim.
+    assert result.orders_placed == 2
+    assert broker.submitted[-1] == ("AAPL", 50.0)  # 5_000 / 100.0
 
 
 def test_run_cycle_never_passes_confirm_live(monkeypatch):
