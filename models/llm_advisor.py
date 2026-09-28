@@ -13,6 +13,14 @@ clamped to execution/exit_levels.py's existing volatility-derived bounds
 (exit_levels_advised) -- it can never set a position size or exit level
 outside what the system's existing risk settings already allow.
 
+TP/SL sizing itself is deliberately left to this LLM pass, not to a
+deterministic formula: quant_take_profit_pct/quant_stop_loss_pct on each
+candidate are only an approximate ATR-based band (see _build_system_prompt)
+-- picking the EXACT price within that band, anchored to a real Donchian
+level or the volume profile's point of control (whichever sits closer to
+current_price in the direction of that leg), is exactly the kind of
+judgment call this pass exists to make instead of the quant model.
+
 Its predicted_return_pct DOES replace the quant ensemble's own forecast
 for a picked symbol (see models/screener.py's _apply_llm_advice_to_scored)
 -- magnitude only, never direction: the candidate's side (long/short) was
@@ -182,15 +190,31 @@ def _build_system_prompt() -> str:
         "take-profit target on any candidate you pick, so it should be a "
         "real, considered estimate, not a rubber stamp of the input.\n\n"
         "Suggest take_profit_pct and stop_loss_pct (positive fractions of "
-        "entry price, e.g. 0.07 for 7%) for an entry at current_price -- "
-        "quant_take_profit_pct/quant_stop_loss_pct on each candidate show "
-        f"what the existing formula ({tp_min_mult:g}x-{tp_max_mult:g}x this "
-        "stock's own horizon-scaled ATR, solidified against its "
-        "donchian_support/donchian_resistance) would set for that stock as "
-        "a reference point; you may suggest something different if you "
-        "have good reason, but a similar magnitude is usually right -- a "
-        "target far outside that band on a normal setup usually means the "
-        "horizon is wrong for this stock, not that the target should be.\n\n"
+        "entry price) for an entry at current_price -- but do not just pick "
+        "a round, arbitrary percentage (a flat 5%, 8%, whatever looks "
+        "clean). quant_take_profit_pct/quant_stop_loss_pct show the "
+        f"existing formula's APPROXIMATE band ({tp_min_mult:g}x-{tp_max_mult:g}x "
+        "this stock's own horizon-scaled ATR) -- treat that as a rough "
+        "range this stock's move should fall within, not a number to hit "
+        "exactly. Within that range, find the actual price this stock is "
+        "likely to react at: whichever of its Donchian levels "
+        "(donchian_support/donchian_resistance, or a level from "
+        "donchian_levels) or its volume profile's point of control "
+        "(volume_profile_poc -- where real size actually transacted, not "
+        "just a price the stock briefly touched) sits CLOSEST to "
+        "current_price in the direction of that leg, then derive "
+        "take_profit_pct/stop_loss_pct from that exact price, calculated "
+        "precisely against current_price (to the cent), not rounded to a "
+        "clean-looking percentage. volume_profile_poc works the same way "
+        "a Donchian level does here: if it sits above current_price it's a "
+        "resistance-like level for a long's target (or a short's stop); if "
+        "it sits below, it's support-like for a long's stop (or a short's "
+        "target). Because it reflects where volume actually transacted "
+        "rather than just a printed high/low, prefer it over a Donchian "
+        "level sitting at a similar distance when the two disagree. If no "
+        "real level sits usefully close on a given side, fall back to the "
+        "quant_take_profit_pct/quant_stop_loss_pct reference for that leg "
+        "rather than inventing a number.\n\n"
         'Finally, recommend "picks": an ordered list of AT MOST max_picks '
         "symbols (fewer is fine if you're not genuinely confident in that "
         "many) -- the strongest trades to actually take this cycle, most "
