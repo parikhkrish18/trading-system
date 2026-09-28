@@ -34,6 +34,7 @@ import hashlib
 import html
 import logging
 import time
+from collections.abc import Callable
 
 import pandas as pd
 import requests
@@ -41,6 +42,7 @@ import requests
 from config.settings import settings
 from data.ingest.db import upsert_dataframe
 from data.ingest.universe import resolve_symbols
+from monitoring.alerts import make_progress_alert
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +103,12 @@ def _stable_id(finnhub_key: str, symbol: str) -> int:
     return int.from_bytes(digest[:8], byteorder="big", signed=False) >> 1  # fits signed bigint
 
 
-def fetch_company_news(symbols: list[str], since_hours: int, sleep_seconds: float = DEFAULT_SLEEP_SECONDS) -> pd.DataFrame:
+def fetch_company_news(
+    symbols: list[str],
+    since_hours: int,
+    sleep_seconds: float = DEFAULT_SLEEP_SECONDS,
+    on_progress: Callable[[int], None] | None = None,
+) -> pd.DataFrame:
     """
     Pull recent company news per symbol from Finnhub's /company-news.
     Returns columns: id, symbol, ts (tz-aware), headline, summary, source.
@@ -110,6 +117,11 @@ def fetch_company_news(symbols: list[str], since_hours: int, sleep_seconds: floa
     range wide enough to cover the window, and rows older than the real
     since_hours cutoff are filtered out afterward so a --since-hours 1 call
     doesn't return a whole day's backlog.
+
+    `on_progress`, when given, is called once per symbol processed (see
+    monitoring.alerts.make_progress_alert) -- ingest_finnhub wires a single
+    shared tracker across both this and fetch_sec_filings so the two
+    phases read as one continuous progress sequence.
     """
     if not finnhub_configured():
         logger.warning(
@@ -134,6 +146,8 @@ def fetch_company_news(symbols: list[str], since_hours: int, sleep_seconds: floa
             )
         except requests.RequestException:
             logger.warning("Failed to fetch company news for %s — skipping this symbol.", symbol, exc_info=True)
+            if on_progress is not None:
+                on_progress(1)
             continue
         for article in resp.json() or []:
             article_id = article.get("id")
@@ -153,6 +167,8 @@ def fetch_company_news(symbols: list[str], since_hours: int, sleep_seconds: floa
                     "source": "finnhub",
                 }
             )
+        if on_progress is not None:
+            on_progress(1)
 
     df = pd.DataFrame(rows, columns=_NEWS_COLUMNS)
     if not df.empty:
@@ -163,11 +179,18 @@ def fetch_company_news(symbols: list[str], since_hours: int, sleep_seconds: floa
     return df
 
 
-def fetch_sec_filings(symbols: list[str], since_hours: int, sleep_seconds: float = DEFAULT_SLEEP_SECONDS) -> pd.DataFrame:
+def fetch_sec_filings(
+    symbols: list[str],
+    since_hours: int,
+    sleep_seconds: float = DEFAULT_SLEEP_SECONDS,
+    on_progress: Callable[[int], None] | None = None,
+) -> pd.DataFrame:
     """
     Pull recent SEC filings per symbol from Finnhub's /stock/filings.
     Represented in the same [id, symbol, ts, headline, summary, source]
     shape as company news -- see this module's docstring for why.
+
+    `on_progress`: see fetch_company_news's docstring -- same contract.
     """
     if not finnhub_configured():
         logger.warning("FINNHUB_API_KEY is not set — skipping SEC filings for %s symbol(s).", len(symbols))
@@ -188,6 +211,8 @@ def fetch_sec_filings(symbols: list[str], since_hours: int, sleep_seconds: float
             )
         except requests.RequestException:
             logger.warning("Failed to fetch SEC filings for %s — skipping this symbol.", symbol, exc_info=True)
+            if on_progress is not None:
+                on_progress(1)
             continue
         for filing in resp.json() or []:
             access_number = filing.get("accessNumber")
@@ -210,6 +235,8 @@ def fetch_sec_filings(symbols: list[str], since_hours: int, sleep_seconds: float
                     "source": "finnhub_filing",
                 }
             )
+        if on_progress is not None:
+            on_progress(1)
 
     df = pd.DataFrame(rows, columns=_NEWS_COLUMNS)
     if not df.empty:
@@ -218,15 +245,25 @@ def fetch_sec_filings(symbols: list[str], since_hours: int, sleep_seconds: float
     return df
 
 
-def ingest_finnhub(symbols: list[str], since_hours: int = 24, sleep_seconds: float = DEFAULT_SLEEP_SECONDS) -> int:
+def ingest_finnhub(
+    symbols: list[str], since_hours: int = 24, sleep_seconds: float = DEFAULT_SLEEP_SECONDS, report_progress: bool = False
+) -> int:
     """
     Combined news + filings ingest -- same entry-point shape as the
     ingest_news it replaces (data/ingest/news.py, retired), so callers
     (scripts/run_weekly_cycle.py, execution/contradiction_monitor.py) swap
     in with no signature change.
+
+    `report_progress`: fire Telegram/Slack "X% done" updates as symbols are
+    processed, one shared sequence across both the news and filings passes
+    (2 x len(symbols) total units of work). Off by default --
+    execution/contradiction_monitor.py calls this hourly on just the
+    handful of currently-held symbols, where progress alerts would be
+    noise; only scripts/run_weekly_cycle.py's full-universe run opts in.
     """
-    news_df = fetch_company_news(symbols, since_hours, sleep_seconds=sleep_seconds)
-    filings_df = fetch_sec_filings(symbols, since_hours, sleep_seconds=sleep_seconds)
+    on_progress = make_progress_alert("news_ingest", total=2 * len(symbols)) if report_progress else None
+    news_df = fetch_company_news(symbols, since_hours, sleep_seconds=sleep_seconds, on_progress=on_progress)
+    filings_df = fetch_sec_filings(symbols, since_hours, sleep_seconds=sleep_seconds, on_progress=on_progress)
     df = pd.concat([news_df, filings_df], ignore_index=True) if not filings_df.empty else news_df
     if df.empty:
         return 0

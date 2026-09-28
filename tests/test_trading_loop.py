@@ -517,6 +517,48 @@ def test_run_cycle_trim_falls_back_to_zero_shares_without_a_price(monkeypatch):
     assert broker.submitted == [("P", 0.0)]
 
 
+def test_alert_confidence_checks_sends_the_right_per_check_counts(monkeypatch):
+    seen = []
+    monkeypatch.setattr(trading_loop, "send_slack_alert", lambda message, **k: seen.append(message))
+    scored = pd.DataFrame(
+        {
+            "symbol": ["A", "B", "C"],
+            "passed_atr_relative_bar": [True, True, False],
+            "passed_atr_absolute_bar": [True, False, False],
+        }
+    )
+
+    trading_loop._alert_confidence_checks(scored)
+
+    assert len(seen) == 1
+    assert "Check 1 (ATR-relative move) complete: 2/3 symbols passed" in seen[0]
+    assert "Check 2 (ATR-absolute floor) complete: 1/3 symbols passed" in seen[0]
+
+
+def test_alert_confidence_checks_skips_an_empty_scored_frame(monkeypatch):
+    seen = []
+    monkeypatch.setattr(trading_loop, "send_slack_alert", lambda message, **k: seen.append(message))
+
+    trading_loop._alert_confidence_checks(pd.DataFrame())
+
+    assert seen == []
+
+
+def test_alert_confidence_checks_skips_a_scored_frame_missing_the_check_columns(monkeypatch):
+    """
+    A synthetic `scored` a test hands run_cycle via a stubbed
+    run_screen_with_scores is under no obligation to carry every column the
+    real score_universe produces -- this must degrade quietly, not crash
+    the cycle over a missing progress alert.
+    """
+    seen = []
+    monkeypatch.setattr(trading_loop, "send_slack_alert", lambda message, **k: seen.append(message))
+
+    trading_loop._alert_confidence_checks(pd.DataFrame({"symbol": ["A"], "predicted_return": [0.01]}))
+
+    assert seen == []
+
+
 def test_run_cycle_dry_run_never_touches_broker(monkeypatch):
     broker = _FakeBroker()
     monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
@@ -533,6 +575,36 @@ def test_run_cycle_dry_run_never_touches_broker(monkeypatch):
     assert result.status == "dry_run"
     assert result.candidates_screened == 1
     assert broker.submitted == []
+
+
+def test_run_cycle_sends_the_confidence_check_alert_after_screening(monkeypatch):
+    broker = _FakeBroker()
+    monkeypatch.setattr(trading_loop, "get_broker", lambda: broker)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: None)
+    monkeypatch.setattr(trading_loop, "_run_breaker_check", lambda b, e: [])
+    monkeypatch.setattr(trading_loop, "_market_regime", lambda e: "trend")
+    scored = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "TSLA"],
+            "predicted_return": [0.05, 0.01],
+            "passed_atr_relative_bar": [True, False],
+            "passed_atr_absolute_bar": [True, True],
+        }
+    )
+    monkeypatch.setattr(
+        trading_loop, "run_screen_with_scores",
+        lambda *a, **k: _screen([_candidate("AAPL", "long", 0.1)], scored=scored),
+    )
+
+    seen = []
+    monkeypatch.setattr(trading_loop, "send_slack_alert", lambda message, **k: seen.append(message))
+
+    trading_loop.run_cycle("v3", ["AAPL", "TSLA"], dry_run=True)
+
+    check_messages = [m for m in seen if "Check 1" in m]
+    assert len(check_messages) == 1
+    assert "Check 1 (ATR-relative move) complete: 1/2 symbols passed" in check_messages[0]
+    assert "Check 2 (ATR-absolute floor) complete: 2/2 symbols passed" in check_messages[0]
 
 
 def test_run_cycle_no_candidates_returns_early(monkeypatch):

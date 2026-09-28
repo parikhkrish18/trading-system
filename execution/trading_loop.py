@@ -136,6 +136,42 @@ def _run_breaker_check(broker, engine) -> list:
     )
 
 
+def _alert_confidence_checks(scored: pd.DataFrame) -> None:
+    """
+    One Telegram/Slack update on how the confidence bar (models.screener.
+    score_universe) split the whole universe, right after screening — the
+    weekly cycle's own visibility into "how much of the universe cleared
+    each check", not just the final shortlist size. Two checks, both
+    counted out of the same denominator (every scored symbol) rather than
+    each other, since a symbol can fail either independently:
+
+    Check 1: the predicted move clears this stock's own ATR-relative floor.
+    Check 2: this stock's own ATR clears the absolute too-calm-to-trade floor.
+
+    Not sent for the hourly mid-week reactivation/rebalance paths (see
+    execution/contradiction_monitor.py, execution/full_book_rebalance.py) —
+    only run_cycle calls this, so it fires once a week, not on every
+    intra-week re-screen of a much smaller candidate pool.
+
+    Silently skipped (not just on an empty frame, but whenever either
+    column is missing) rather than raising — a synthetic `scored` a test
+    hands run_cycle via a stubbed run_screen_with_scores is under no
+    obligation to carry every column the real score_universe produces, and
+    a progress alert is never worth failing a cycle over.
+    """
+    if scored.empty or "passed_atr_relative_bar" not in scored.columns or "passed_atr_absolute_bar" not in scored.columns:
+        return
+    total = len(scored)
+    check1 = int(scored["passed_atr_relative_bar"].sum())
+    check2 = int(scored["passed_atr_absolute_bar"].sum())
+    send_slack_alert(
+        f"Screening checks complete for {total} symbols:\n"
+        f"Check 1 (ATR-relative move) complete: {check1}/{total} symbols passed\n"
+        f"Check 2 (ATR-absolute floor) complete: {check2}/{total} symbols passed",
+        severity="info",
+    )
+
+
 def current_pnl_by_symbol(broker) -> dict[str, tuple[float | None, float | None]]:
     """
     {symbol: (unrealized P&L %, unrealized P&L $)} for every open position,
@@ -677,6 +713,7 @@ def run_cycle(
     # backstop against real correlated exposure regardless.
     screen = run_screen_with_scores(feature_set_id, symbols, regime=regime, is_shortable_fn=is_shortable_fn)
     candidates = screen.candidates
+    _alert_confidence_checks(screen.scored)
 
     # Phases 2-4 (signals, forecast, selection/sizing) are built per-candidate
     # inside run_screen and stored on every decision row by _log_decisions.

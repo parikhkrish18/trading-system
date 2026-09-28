@@ -153,6 +153,52 @@ def test_score_universe_accepts_a_symbol_at_or_above_the_absolute_atr_floor(monk
     assert result.set_index("symbol").loc["AAPL", "confident"]
 
 
+def test_score_universe_passed_atr_relative_bar_and_passed_atr_absolute_bar_are_independent(monkeypatch):
+    """
+    A symbol can fail check 1 (the move is too small relative to its own
+    ATR) while passing check 2 (its ATR clears the absolute too-calm
+    floor), or vice versa -- confident is just their AND, but each column
+    reports its own check's verdict for trading_loop's per-check alert.
+    """
+    monkeypatch.setattr(settings, "screener_min_atr_pct", 0.006)
+    latest = pd.DataFrame(
+        {"symbol": ["FAILS_CHECK1_ONLY", "FAILS_CHECK2_ONLY"], "f1": [0.1, 0.1]}
+    )
+    ensemble = _FakeEnsemble(mean_prediction=[0.001, 0.05], direction_agreement=[1.0, 1.0])
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"],
+        # FAILS_CHECK1_ONLY: ample ATR (clears check 2) but a forecast far
+        # too small relative to it (fails check 1).
+        # FAILS_CHECK2_ONLY: a huge forecast (clears check 1 against its
+        # own tiny ATR) but an ATR below the absolute floor (fails check 2).
+        atr_pct_by_symbol={"FAILS_CHECK1_ONLY": 0.05, "FAILS_CHECK2_ONLY": 0.0001},
+        horizon_days=5,
+    )
+    by_symbol = result.set_index("symbol")
+
+    assert not by_symbol.loc["FAILS_CHECK1_ONLY", "passed_atr_relative_bar"]
+    assert by_symbol.loc["FAILS_CHECK1_ONLY", "passed_atr_absolute_bar"]
+    assert not by_symbol.loc["FAILS_CHECK1_ONLY", "confident"]
+
+    assert by_symbol.loc["FAILS_CHECK2_ONLY", "passed_atr_relative_bar"]
+    assert not by_symbol.loc["FAILS_CHECK2_ONLY", "passed_atr_absolute_bar"]
+    assert not by_symbol.loc["FAILS_CHECK2_ONLY", "confident"]
+
+
+def test_score_universe_confident_is_exactly_both_checks_passing():
+    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
+
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], atr_pct_by_symbol={"AAPL": 0.02}, horizon_days=5,
+    )
+    row = result.set_index("symbol").loc["AAPL"]
+
+    assert row["passed_atr_relative_bar"] and row["passed_atr_absolute_bar"]
+    assert row["confident"]
+
+
 def test_conviction_score_is_the_size_of_the_move_alone():
     """
     Ranking used to be agreement x |move|, which mixed a noise term into
@@ -176,7 +222,8 @@ def test_score_universe_empty_input_returns_empty_with_columns():
     assert result.empty
     assert list(result.columns) == [
         "symbol", "predicted_return", "direction_agreement", "signal_to_noise", "conviction_score",
-        "donchian_breakout_20", "trend_pullback_score", "confident",
+        "donchian_breakout_20", "trend_pullback_score",
+        "passed_atr_relative_bar", "passed_atr_absolute_bar", "confident",
     ]
 
 

@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 
 import pandas as pd
 from anthropic import Anthropic
 
 from config.settings import settings
 from data.ingest.db import get_engine
+from monitoring.alerts import make_progress_alert
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +171,7 @@ def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, tuple[floa
     }
 
 
-def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
+def score_sentiment(headlines: pd.DataFrame, on_progress: Callable[[int], None] | None = None) -> pd.DataFrame:
     """
     Input: dataframe with at least ['id', 'ts', 'symbol', 'headline'], plus
     an optional 'summary' column -- when absent, or NaN/empty on a given
@@ -179,6 +181,10 @@ def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
     'sentiment_relevant' (False when the vendor's symbol tag doesn't
     actually fit the story -- see data/schema/010_news_sentiment_relevance.sql)
     columns.
+
+    `on_progress`, when given, is called once per batch with how many rows
+    that batch covered (see monitoring.alerts.make_progress_alert) --
+    backfill_unscored_news wires this to a Telegram/Slack progress tick.
     """
     if headlines.empty:
         return headlines.assign(
@@ -218,6 +224,8 @@ def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
                     "attempt %d/%d.",
                     len(batch), list(batch["id"]), attempt, _MAX_SCORE_ATTEMPTS, exc_info=True,
                 )
+        if on_progress is not None:
+            on_progress(len(batch))
         if id_to_result is None:
             # Every attempt failed. Left uncaught, this used to raise
             # straight out of score_sentiment and take every OTHER batch in
@@ -245,7 +253,7 @@ def score_sentiment(headlines: pd.DataFrame) -> pd.DataFrame:
     return scored
 
 
-def backfill_unscored_news(batch_size: int = 500) -> int:
+def backfill_unscored_news(batch_size: int = 500, report_progress: bool = False) -> int:
     """
     Pull rows from news_events where sentiment IS NULL, score them, write back.
 
@@ -255,6 +263,13 @@ def backfill_unscored_news(batch_size: int = 500) -> int:
     today's headlines in the queue -- that would leave exactly the news
     everything downstream actually cares about stuck showing "unscored"
     indefinitely while Claude calls burn through old backlog first.
+
+    `report_progress`: fire Telegram/Slack "X% done" updates as batches are
+    scored (see monitoring.alerts.make_progress_alert). Off by default --
+    execution/contradiction_monitor.py calls this hourly on a small
+    backlog, where progress alerts would be noise; only
+    scripts/run_weekly_cycle.py's weekly run (up to batch_size rows,
+    minutes long) opts in.
     """
     engine = get_engine()
     query = """
@@ -267,7 +282,8 @@ def backfill_unscored_news(batch_size: int = 500) -> int:
     if df.empty:
         return 0
 
-    scored = score_sentiment(df)
+    on_progress = make_progress_alert("sentiment_backfill", total=len(df)) if report_progress else None
+    scored = score_sentiment(df, on_progress=on_progress)
     written = 0
     with engine.begin() as conn:
         for _, row in scored.iterrows():

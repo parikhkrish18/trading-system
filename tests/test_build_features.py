@@ -334,6 +334,58 @@ def test_build_and_store_lookback_years_is_configurable(monkeypatch):
     assert "interval '1 years'" in captured["queries"][0]
 
 
+def test_build_and_store_reports_progress_through_all_nine_stages_when_asked(monkeypatch):
+    monkeypatch.setattr(build_features, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        build_features.pd, "read_sql",
+        lambda query, engine, **kwargs: pd.DataFrame(
+            {
+                "symbol": ["AAPL"], "ts": pd.to_datetime(["2026-01-10"], utc=True),
+                "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1],
+            }
+        )
+        if "FROM prices" in query
+        else pd.DataFrame(),
+    )
+    monkeypatch.setattr(build_features, "upsert_dataframe", lambda df, table, conflict_cols: len(df))
+    seen = []
+    from monitoring import alerts
+
+    monkeypatch.setattr(alerts, "alert_pipeline_progress", lambda job_name, detail: seen.append((job_name, detail)))
+
+    build_and_store(["AAPL"], "v3", report_progress=True)
+
+    # 9 stages against a 10%-step tracker: every stage but the last crosses
+    # exactly one new 10%-threshold: the 9th (100%) crosses both 90% and 100%
+    # in the same tick, so 8 + 2 = 10 messages total.
+    assert len(seen) == 10
+    assert all(job == "build_features" for job, _ in seen)
+    assert seen[-1][1] == "100% done (9/9)"
+
+
+def test_build_and_store_report_progress_off_by_default(monkeypatch):
+    monkeypatch.setattr(build_features, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        build_features.pd, "read_sql",
+        lambda query, engine, **kwargs: pd.DataFrame(
+            {
+                "symbol": ["AAPL"], "ts": pd.to_datetime(["2026-01-10"], utc=True),
+                "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1],
+            }
+        )
+        if "FROM prices" in query
+        else pd.DataFrame(),
+    )
+    monkeypatch.setattr(build_features, "upsert_dataframe", lambda df, table, conflict_cols: len(df))
+
+    def exploding_progress_alert(*a, **k):
+        raise AssertionError("make_progress_alert should not be constructed when report_progress=False")
+
+    monkeypatch.setattr(build_features, "make_progress_alert", exploding_progress_alert)
+
+    build_and_store(["AAPL"], "v3")  # must not raise
+
+
 def test_build_and_store_wires_macro_sentiment_and_interaction_features(monkeypatch):
     """
     End-to-end: build_and_store must (1) query macro_news for

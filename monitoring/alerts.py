@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import requests
@@ -160,3 +161,37 @@ def alert_pipeline_progress(job_name: str, detail: str) -> None:
 
 def alert_risk_limit_exceeded(symbol: str, detail: str) -> None:
     send_slack_alert(f"Risk limit exceeded for {symbol}: {detail}", severity="warning")
+
+
+def make_progress_alert(job_name: str, total: int, step_pct: int = 10) -> Callable[[int], None]:
+    """
+    A progress ticker for a long-running pipeline phase (fundamentals/news
+    ingest, sentiment backfill, feature building) that otherwise goes
+    silent for minutes with nothing to show for it. Returns a callback —
+    call it once per unit of work completed (once per symbol, once per
+    scored batch, once per build stage — whatever `total` counts), passing
+    how many units that call represents (default 1).
+
+    Fires an alert_pipeline_progress "X% done" update the first time
+    cumulative progress crosses each new step_pct threshold, and never
+    twice for the same one — a batch that jumps several thresholds at once
+    (e.g. a single call advancing progress from 25% to 60%) still only
+    reports each threshold crossed exactly once, in order, rather than
+    skipping straight to the final one.
+
+    total <= 0 returns a no-op callback: nothing to divide by, and there is
+    no meaningful percentage of an empty job.
+    """
+    if total <= 0:
+        return lambda done=1: None
+
+    state = {"done": 0, "next_threshold": step_pct}
+
+    def _tick(done: int = 1) -> None:
+        state["done"] += done
+        pct = (state["done"] / total) * 100
+        while state["next_threshold"] <= 100 and pct >= state["next_threshold"]:
+            alert_pipeline_progress(job_name, f"{state['next_threshold']}% done ({state['done']}/{total})")
+            state["next_threshold"] += step_pct
+
+    return _tick

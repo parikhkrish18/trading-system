@@ -196,11 +196,57 @@ def test_fetch_fundamentals_dedupes_same_key_across_reports(monkeypatch):
     assert eps_rows.iloc[0]["value"] == 2.6  # keeps the later (revised) value
 
 
+def test_fetch_fundamentals_calls_on_progress_once_per_symbol(monkeypatch):
+    monkeypatch.setattr(
+        fundamentals, "finnhub_get",
+        lambda *a, **k: _FakeResponse({"data": [_finnhub_report("2026-06-30", eps=2.5)]}),
+    )
+    monkeypatch.setattr(fundamentals, "finnhub_configured", lambda: True)
+    ticks = []
+
+    fundamentals.fetch_fundamentals(["SPY", "MSFT", "AAPL"], sleep_seconds=0, on_progress=ticks.append)
+
+    assert ticks == [1, 1, 1]  # one tick per symbol, regardless of how many reports it had
+
+
+def test_fetch_fundamentals_calls_on_progress_even_when_a_symbol_errors(monkeypatch):
+    import requests
+
+    def fake_get(url, params=None, timeout=None):
+        if params["symbol"] == "BAD":
+            raise requests.exceptions.ConnectionError("read timed out")
+        return _FakeResponse({"data": []})
+
+    monkeypatch.setattr(fundamentals, "finnhub_get", fake_get)
+    monkeypatch.setattr(fundamentals, "finnhub_configured", lambda: True)
+    ticks = []
+
+    fundamentals.fetch_fundamentals(["SPY", "BAD"], sleep_seconds=0, on_progress=ticks.append)
+
+    assert ticks == [1, 1]  # progress still advances past the errored symbol
+
+
+def test_ingest_fundamentals_report_progress_off_by_default(monkeypatch):
+    """report_progress=False (the default) must never call make_progress_alert — a caller with a
+    handful of symbols (e.g. a future direct script run) shouldn't inherit progress alerts."""
+    monkeypatch.setattr(fundamentals, "fetch_fundamentals", lambda symbols, sleep_seconds=0, on_progress=None: pd.DataFrame(
+        columns=["symbol", "ts", "metric", "value", "source"]
+    ))
+    monkeypatch.setattr(fundamentals, "upsert_dataframe", lambda df, table, conflict_cols: len(df))
+
+    def exploding_progress_alert(*a, **k):
+        raise AssertionError("make_progress_alert should not be constructed when report_progress=False")
+
+    monkeypatch.setattr(fundamentals, "make_progress_alert", exploding_progress_alert)
+
+    fundamentals.ingest_fundamentals(["SPY"])  # must not raise
+
+
 def test_ingest_fundamentals_upserts_with_correct_conflict_cols(monkeypatch):
     monkeypatch.setattr(
         fundamentals,
         "fetch_fundamentals",
-        lambda symbols, sleep_seconds=0: pd.DataFrame(
+        lambda symbols, sleep_seconds=0, on_progress=None: pd.DataFrame(
             {
                 "symbol": ["SPY"],
                 "ts": pd.to_datetime(["2026-06-30"], utc=True),

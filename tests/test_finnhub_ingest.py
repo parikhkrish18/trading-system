@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from data.ingest import finnhub
 from data.ingest.db import get_engine, upsert_dataframe
+from monitoring import alerts
 
 
 class _FakeResponse:
@@ -248,7 +249,7 @@ def test_fetch_sec_filings_skips_a_row_missing_the_access_number(monkeypatch):
 def test_ingest_finnhub_combines_news_and_filings_with_null_sentiment(monkeypatch):
     monkeypatch.setattr(
         finnhub, "fetch_company_news",
-        lambda symbols, since_hours, sleep_seconds=0: pd.DataFrame(
+        lambda symbols, since_hours, sleep_seconds=0, on_progress=None: pd.DataFrame(
             {
                 "id": [1],
                 "symbol": ["SPY"],
@@ -261,7 +262,7 @@ def test_ingest_finnhub_combines_news_and_filings_with_null_sentiment(monkeypatc
     )
     monkeypatch.setattr(
         finnhub, "fetch_sec_filings",
-        lambda symbols, since_hours, sleep_seconds=0: pd.DataFrame(
+        lambda symbols, since_hours, sleep_seconds=0, on_progress=None: pd.DataFrame(
             {
                 "id": [2],
                 "symbol": ["SPY"],
@@ -292,6 +293,48 @@ def test_ingest_finnhub_combines_news_and_filings_with_null_sentiment(monkeypatc
     assert captured["df"]["sentiment"].isna().all()
     assert captured["df"]["surprise"].isna().all()
     assert set(captured["df"]["source"]) == {"finnhub", "finnhub_filing"}
+
+
+def test_fetch_company_news_and_filings_call_on_progress_once_per_symbol(monkeypatch):
+    monkeypatch.setattr(finnhub, "finnhub_get", lambda *a, **k: _FakeResponse([]))
+    monkeypatch.setattr(finnhub, "finnhub_configured", lambda: True)
+
+    news_ticks, filings_ticks = [], []
+    finnhub.fetch_company_news(["SPY", "QQQ"], since_hours=24, sleep_seconds=0, on_progress=news_ticks.append)
+    finnhub.fetch_sec_filings(["SPY", "QQQ"], since_hours=24, sleep_seconds=0, on_progress=filings_ticks.append)
+
+    assert news_ticks == [1, 1]
+    assert filings_ticks == [1, 1]
+
+
+def test_ingest_finnhub_report_progress_shares_one_tracker_across_both_phases(monkeypatch):
+    monkeypatch.setattr(finnhub, "finnhub_get", lambda *a, **k: _FakeResponse([]))
+    monkeypatch.setattr(finnhub, "finnhub_configured", lambda: True)
+    monkeypatch.setattr(finnhub, "upsert_dataframe", lambda *a, **k: 0)
+
+    seen = []
+    monkeypatch.setattr(alerts, "alert_pipeline_progress", lambda job_name, detail: seen.append((job_name, detail)))
+
+    finnhub.ingest_finnhub(["A", "B", "C", "D", "E"], since_hours=24, sleep_seconds=0, report_progress=True)
+
+    # 2 * 5 = 10 total units of work (news pass + filings pass); every 10%
+    # step should fire exactly once, all under the same job name.
+    assert len(seen) == 10
+    assert all(job == "news_ingest" for job, _ in seen)
+    assert [d.split("%")[0] for _, d in seen] == [str(p) for p in range(10, 101, 10)]
+
+
+def test_ingest_finnhub_report_progress_off_by_default(monkeypatch):
+    monkeypatch.setattr(finnhub, "finnhub_get", lambda *a, **k: _FakeResponse([]))
+    monkeypatch.setattr(finnhub, "finnhub_configured", lambda: True)
+    monkeypatch.setattr(finnhub, "upsert_dataframe", lambda *a, **k: 0)
+
+    def exploding_progress_alert(*a, **k):
+        raise AssertionError("make_progress_alert should not be constructed when report_progress=False")
+
+    monkeypatch.setattr(finnhub, "make_progress_alert", exploding_progress_alert)
+
+    finnhub.ingest_finnhub(["SPY"], since_hours=24, sleep_seconds=0)  # must not raise
 
 
 def test_ingest_finnhub_with_nothing_from_either_endpoint_does_not_call_upsert(monkeypatch):
