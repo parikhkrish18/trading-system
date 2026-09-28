@@ -10,6 +10,7 @@ import math
 
 import pytest
 
+from config.settings import settings
 from execution.exit_levels import ExitLevels, describe, exit_levels_advised, exit_levels_for, global_levels
 
 
@@ -218,19 +219,22 @@ def test_take_profit_is_bounded_by_atr_multiples_when_atr_is_available():
     its own horizon-scaled ATR, not the flat/sigma-based bounds.
     """
     # atr_pct=0.02, horizon=5 -> atr_horizon = 0.02 * sqrt(5) ~= 0.0447
-    # bounds: [2x, 4x] ~= [0.0894, 0.1789]
+    # bounds: [min_mult, max_mult] x atr_horizon
+    atr_horizon = 0.02 * math.sqrt(5)
+    min_bound = settings.exit_take_profit_min_atr_mult * atr_horizon
+    max_bound = settings.exit_take_profit_max_atr_mult * atr_horizon
     levels = exit_levels_for(predicted_return=0.15, daily_volatility=0.01, horizon_days=5, atr_pct=0.02)
-    assert 0.089 < levels.take_profit_pct < 0.179
+    assert min_bound < levels.take_profit_pct < max_bound
 
 
 def test_take_profit_floors_at_the_minimum_atr_multiple_even_for_a_tiny_forecast():
     levels = exit_levels_for(predicted_return=0.0001, daily_volatility=0.01, horizon_days=5, atr_pct=0.02)
-    assert levels.take_profit_pct == pytest.approx(2.0 * 0.02 * math.sqrt(5))
+    assert levels.take_profit_pct == pytest.approx(settings.exit_take_profit_min_atr_mult * 0.02 * math.sqrt(5))
 
 
 def test_take_profit_caps_at_the_maximum_atr_multiple_for_an_extreme_forecast():
     levels = exit_levels_for(predicted_return=0.90, daily_volatility=0.01, horizon_days=5, atr_pct=0.02)
-    assert levels.take_profit_pct == pytest.approx(4.0 * 0.02 * math.sqrt(5))
+    assert levels.take_profit_pct == pytest.approx(settings.exit_take_profit_max_atr_mult * 0.02 * math.sqrt(5))
 
 
 # --------------------------------------------------------------------------
@@ -318,12 +322,12 @@ def test_advised_clamps_the_llm_suggestion_into_the_atr_band_not_the_sigma_one()
     sigma-based ones -- otherwise a suggestion inside the sigma band but
     outside the (tighter or wider) ATR band would pass through unclamped.
     """
-    # ATR band (2x-4x of 0.02*sqrt(5)~=0.0447): [0.0894, 0.1789]
+    # ATR band (min_mult-max_mult of 0.02*sqrt(5)~=0.0447)
     levels = exit_levels_advised(
         predicted_return=0.15, daily_volatility=0.01, llm_take_profit_pct=0.50,
         llm_stop_loss_pct=None, horizon_days=5, atr_pct=0.02,
     )
-    assert levels.take_profit_pct == pytest.approx(4.0 * 0.02 * math.sqrt(5))
+    assert levels.take_profit_pct == pytest.approx(settings.exit_take_profit_max_atr_mult * 0.02 * math.sqrt(5))
 
 
 def test_advised_uses_the_llm_suggestion_within_the_atr_band_as_given():
@@ -353,7 +357,7 @@ def test_take_profit_tightens_toward_a_closer_resistance_on_a_long():
 
 
 def test_take_profit_never_widens_past_the_atr_ceiling_even_with_a_far_resistance():
-    atr_ceiling = 4.0 * 0.02 * math.sqrt(5)
+    atr_ceiling = settings.exit_take_profit_max_atr_mult * 0.02 * math.sqrt(5)
     levels = exit_levels_for(
         predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.02,
         resistance_distance_pct=10.0,  # miles away -- must not stretch the target out to it
@@ -362,7 +366,7 @@ def test_take_profit_never_widens_past_the_atr_ceiling_even_with_a_far_resistanc
 
 
 def test_take_profit_never_crushes_below_the_atr_floor_even_with_a_very_close_resistance():
-    atr_floor = 2.0 * 0.02 * math.sqrt(5)
+    atr_floor = settings.exit_take_profit_min_atr_mult * 0.02 * math.sqrt(5)
     levels = exit_levels_for(
         predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.02,
         resistance_distance_pct=0.001,  # resistance right on top of entry
@@ -372,7 +376,7 @@ def test_take_profit_never_crushes_below_the_atr_floor_even_with_a_very_close_re
 
 def test_a_resistance_the_price_has_already_cleared_does_not_tighten_anything():
     """distance_pct <= 0 means price is already through the level -- no ceiling left to speak of."""
-    atr_ceiling = 4.0 * 0.02 * math.sqrt(5)
+    atr_ceiling = settings.exit_take_profit_max_atr_mult * 0.02 * math.sqrt(5)
     levels = exit_levels_for(
         predicted_return=0.5, daily_volatility=0.01, horizon_days=5, atr_pct=0.02,
         resistance_distance_pct=0.0,

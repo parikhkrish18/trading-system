@@ -44,7 +44,6 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import JSONB
 
-from backtest.cost_model import round_trip_cost_fraction
 from config.settings import settings
 from data.ingest.db import get_engine, symbol_in_clause
 from data.ingest.intraday_bars import fetch_recent_minute_bars
@@ -64,13 +63,6 @@ from risk.sizing import scale_to_full_deployment, target_position_size
 logger = logging.getLogger(__name__)
 
 _MODEL_VERSION = "ensemble_v1"
-
-# A trade whose predicted move doesn't even cover getting in and out is a
-# guaranteed loser even when the prediction is right. min_abs_return
-# therefore floors at the estimated round-trip transaction cost (see
-# backtest/cost_model.py — the spread-only minimum without ADV data)
-# instead of the old 0.0, which passed literally any nonzero forecast.
-DEFAULT_MIN_ABS_RETURN = round_trip_cost_fraction()
 
 # signal_to_noise (models/forecast/ensemble.py) is +inf when every ensemble
 # member predicts the identical number -- capped here to a large-but-finite
@@ -147,7 +139,6 @@ def score_universe(
     ensemble: EnsembleForecastModel,
     latest_features: pd.DataFrame,
     feature_cols: list[str],
-    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
     raw_features: pd.DataFrame | None = None,
     atr_pct_by_symbol: dict[str, float] | None = None,
     horizon_days: int | None = None,
@@ -159,25 +150,34 @@ def score_universe(
     Returns: symbol, predicted_return, direction_agreement, conviction_score,
     donchian_breakout_20, trend_pullback_score, confident.
 
-    Three bars decide "confident":
+    Two bars decide "confident", and BOTH require this stock's own ATR
+    (atr_pct_by_symbol) -- a symbol with no measurable ATR at all (a new
+    listing, a gap in high/low history) has nothing to scale either bar
+    against and is never confident. There used to be a third, standalone
+    bar here (the predicted move merely had to clear the estimated
+    round-trip transaction cost, ~0.02% -- a prediction smaller than that
+    is a guaranteed loser even when its direction is right) that acted as
+    the fallback for exactly that no-ATR case. It was removed: once a
+    symbol clears bar 1 below, clearing that ~0.02% cost floor as well was
+    never in question (bar 1 alone already requires a move roughly
+    screener_min_return_atr_fraction x this stock's own ATR, which for any
+    stock volatile enough to clear bar 2's absolute floor is already
+    orders of magnitude above the cost floor) -- so it was dead weight
+    doing nothing except providing a permissive fallback for missing ATR
+    data, which is exactly the case bar 1/bar 2 exist to be strict about.
 
-    1. The predicted move must be bigger than what the round trip costs (a
-       prediction smaller than the cost of acting on it is a guaranteed
-       loser even when its direction is right) -- min_abs_return.
-    2. When this stock's own ATR is available (atr_pct_by_symbol), the
-       predicted move must also clear settings.screener_min_return_atr_fraction
-       of the same 2x-horizon-scaled-ATR floor execution/exit_levels.py sizes
-       its take-profit off -- otherwise a forecast can be so small relative
-       to that stock's own volatility that the take-profit it gets sized
-       with (2x-4x ATR) has no realistic path from where the model actually
-       thinks it's going. Missing ATR for a symbol falls back to bar 1 alone.
-    3. This stock's own ATR must clear settings.screener_min_atr_pct in
-       absolute terms, not just relative to its own forecast -- bar 2 above
+    1. The predicted move must clear settings.screener_min_return_atr_fraction
+       of the same horizon-scaled-ATR floor (exit_take_profit_min_atr_mult x
+       this stock's own ATR) execution/exit_levels.py sizes its take-profit
+       off -- otherwise a forecast can be so small relative to that stock's
+       own volatility that the take-profit it gets sized with has no
+       realistic path from where the model actually thinks it's going.
+    2. This stock's own ATR must clear settings.screener_min_atr_pct in
+       absolute terms, not just relative to its own forecast -- bar 1 above
        scales the required forecast to a stock's ATR, so an almost-motionless
        stock can still pass it on an almost-equally-tiny forecast. This bar
        rules out trading a stock that barely moves at all, whatever it
-       cleared above. Missing ATR neither filters nor requires clearing
-       this, same as bar 2.
+       cleared above.
 
     donchian_breakout_20 is computed and returned (still read from
     `raw_features` when given, see below) but no longer gates `confident` --
@@ -263,15 +263,14 @@ def score_universe(
     # most capital was partly decided by a number that means nothing.
     result["conviction_score"] = result["predicted_return"].abs()
 
-    # Bar 2: this stock's own ATR-relative floor, when its ATR is known.
-    # Half (by default) of the same 2x-horizon-scaled-ATR minimum
-    # execution/exit_levels.py sizes its take-profit floor off of -- a
-    # forecast has to at least be in the neighborhood of that floor for the
-    # take-profit it will be sized with to have a realistic path, without
-    # requiring the forecast to equal the floor outright (the take-profit
-    # is meant to be a ceiling the trade can run past its point forecast to
-    # reach). Symbols with no measurable ATR fall back to min_abs_return
-    # alone, same as before this bar existed.
+    # Bar 1: this stock's own ATR-relative floor. A fraction (half by
+    # default) of the same horizon-scaled-ATR minimum execution/exit_levels.py
+    # sizes its take-profit floor off of -- a forecast has to at least be in
+    # the neighborhood of that floor for the take-profit it will be sized
+    # with to have a realistic path, without requiring the forecast to equal
+    # the floor outright (the take-profit is meant to be a ceiling the trade
+    # can run past its point forecast to reach). A symbol with no measurable
+    # ATR has nothing to scale this against and can never clear it.
     atr_pct_series = result["symbol"].map(atr_pct_by_symbol or {})
     has_atr = atr_pct_series.notna() & (atr_pct_series > 0)
     horizon = horizon_days if horizon_days is not None else settings.target_horizon_days
@@ -281,23 +280,22 @@ def score_universe(
         * atr_pct_series
         * np.sqrt(max(horizon, 1))
     )
-    effective_min_return = np.where(has_atr, np.maximum(min_abs_return, atr_floor), min_abs_return)
 
-    # Bar 3: a stock too calm to trade at all, whatever the forecast says.
-    # Bar 2 above only scales the required forecast to this stock's OWN
+    # Bar 2: a stock too calm to trade at all, whatever the forecast says.
+    # Bar 1 above only scales the required forecast to this stock's OWN
     # ATR -- a stock with almost no ATR can still clear it on an almost
     # equally tiny forecast, since both shrink together. Hit live: TECH
-    # cleared bar 2 and got picked with a 2% take-profit against a 5%
-    # stop-loss, because its ATR was so small that even 2x-ATR (the
-    # take-profit floor) barely cleared 2% -- a target with no meaningful
+    # cleared bar 1 and got picked with a 2% take-profit against a 5%
+    # stop-loss, because its ATR was so small that even the ATR-multiple
+    # take-profit floor barely cleared 2% -- a target with no meaningful
     # room to run, sized off a stock that barely moves. settings.
     # screener_min_atr_pct is an ABSOLUTE floor on the ATR itself, not
     # scaled to anything: below it, a symbol is never confident regardless
-    # of its forecast. Same graceful fallback as bar 2 -- a symbol with no
-    # measurable ATR is neither filtered nor required to clear this.
-    too_calm = has_atr & (atr_pct_series < settings.screener_min_atr_pct)
+    # of its forecast. Same as bar 1 -- a symbol with no measurable ATR can
+    # never clear this either.
+    too_calm = atr_pct_series < settings.screener_min_atr_pct
 
-    result["confident"] = (result["predicted_return"].abs() >= effective_min_return) & ~too_calm
+    result["confident"] = has_atr & (result["predicted_return"].abs() >= atr_floor) & ~too_calm
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
 
@@ -725,8 +723,9 @@ def select_concentrated_trades(
     market with a diversified book.
 
     Takes the top `max_positions` confident candidates by conviction (or
-    fewer if fewer clear the confidence bar — see DEFAULT_MIN_ABS_RETURN;
-    this never forces a weaker candidate in just to hit a target count).
+    fewer if fewer clear the confidence bar — see score_universe's own
+    docstring; this never forces a weaker candidate in just to hit a target
+    count).
     The split across however many legs that ends up being is weighted by
     each pick's relative conviction_score, bounded by
     _bounded_conviction_weights so no leg swallows the book and none gets
@@ -1478,7 +1477,6 @@ def run_screen(
     symbols: list[str],
     target_horizon_days: int | None = None,
     n_ensemble_models: int = 5,
-    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
     total_deploy_pct: float = 1.0,
@@ -1491,7 +1489,6 @@ def run_screen(
         symbols,
         target_horizon_days=target_horizon_days,
         n_ensemble_models=n_ensemble_models,
-        min_abs_return=min_abs_return,
         regime=regime,
         is_shortable_fn=is_shortable_fn,
         total_deploy_pct=total_deploy_pct,
@@ -1505,7 +1502,6 @@ def run_screen_with_scores(
     symbols: list[str],
     target_horizon_days: int | None = None,
     n_ensemble_models: int = 5,
-    min_abs_return: float = DEFAULT_MIN_ABS_RETURN,
     regime: str = TREND,
     is_shortable_fn: Callable[[str], bool] | None = None,
     total_deploy_pct: float = 1.0,
@@ -1603,7 +1599,7 @@ def run_screen_with_scores(
                 atr_pct_by_symbol[symbol] = float(atr_val) / price_by_symbol[symbol]
 
     scored = score_universe(
-        ensemble, latest, feature_cols, min_abs_return, raw_features=raw_latest,
+        ensemble, latest, feature_cols, raw_features=raw_latest,
         atr_pct_by_symbol=atr_pct_by_symbol, horizon_days=target_horizon_days,
     )
     # Diagnostic, not a decision: a quiet cycle with a thin or empty
@@ -1952,11 +1948,6 @@ def main() -> None:
         help=f"Forward-return horizon in trading days (default: TARGET_HORIZON_DAYS = {settings.target_horizon_days}).",
     )
     parser.add_argument("--n-ensemble-models", type=int, default=5)
-    parser.add_argument(
-        "--min-abs-return", type=float, default=DEFAULT_MIN_ABS_RETURN,
-        help="Minimum |predicted return| to shortlist. Defaults to the estimated round-trip "
-             "transaction cost — a prediction below the cost of trading it is a guaranteed loser.",
-    )
     parser.add_argument("--log", action="store_true", help="Write the shortlist to the decisions table.")
     args = parser.parse_args()
 
@@ -1966,7 +1957,6 @@ def main() -> None:
         symbols,
         target_horizon_days=args.target_horizon_days,
         n_ensemble_models=args.n_ensemble_models,
-        min_abs_return=args.min_abs_return,
     )
 
     if not candidates:

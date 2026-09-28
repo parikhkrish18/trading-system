@@ -1,7 +1,7 @@
 """
 The honest-evaluation pieces of models/train.py: the purge gap that stops
 training labels from overlapping the test window, the per-fold spread
-report, and the transaction-cost hurdle shared with the screener.
+report, and the transaction-cost model used for cost-adjusted fold metrics.
 """
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import pandas as pd
 import pytest
 
 from backtest.cost_model import round_trip_cost_fraction
-from models.screener import DEFAULT_MIN_ABS_RETURN
 from models.train import headline_verdict, make_expanding_folds, purged_train_cutoff, spread_summary
 
 
@@ -100,12 +99,6 @@ def test_commission_is_included_per_share():
     free = round_trip_cost_fraction(price=100.0, commission_per_share=0.0)
     paid = round_trip_cost_fraction(price=100.0, commission_per_share=0.01)
     assert paid == pytest.approx(free + 2 * 0.01 / 100.0)
-
-
-def test_screener_min_abs_return_defaults_to_the_cost_hurdle():
-    """The screener and the eval harness must agree on what a trade costs."""
-    assert DEFAULT_MIN_ABS_RETURN == pytest.approx(round_trip_cost_fraction())
-    assert DEFAULT_MIN_ABS_RETURN > 0.0
 
 
 # --------------------------------------------------------------------------

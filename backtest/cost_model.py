@@ -46,9 +46,8 @@ def round_trip_cost_fraction(
     deliberately the *minimum* honest estimate; pass real ADV/shares to get
     the impact-inclusive number.
 
-    Used by models/train.py (cost-adjusted fold metrics) and
-    models/screener.py (min_abs_return default) so the evaluation harness
-    and the live screener agree on what a trade costs.
+    Used by models/train.py for cost-adjusted fold metrics -- the
+    evaluation harness's own read on what a trade costs.
     """
     per_side_fraction = slippage_bps(trade_shares, avg_daily_volume, base_spread_bps, impact_coefficient) / 10_000
     commission_fraction = commission_per_share / price if price > 0 else 0.0

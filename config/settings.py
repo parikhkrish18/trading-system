@@ -258,7 +258,7 @@ class Settings(BaseSettings):
     # for both a utility and a biotech.
     #
     # Take profit is the predicted move itself, bounded to a multiple of
-    # this stock's own ATR (2x-4x by default) when ATR is available for it
+    # this stock's own ATR (1x-4x by default) when ATR is available for it
     # — sized for the weekly/biweekly swing this system targets, not a
     # flat percentage that's wrong for both a calm stock and a volatile
     # one. exit_take_profit_max_sigmas/exit_min_take_profit_pct remain the
@@ -267,19 +267,20 @@ class Settings(BaseSettings):
     # history) — never below what a round trip costs either way (closing
     # into a guaranteed loss), never above this many horizon-sigmas (a
     # target the stock has no history of reaching).
-    exit_take_profit_min_atr_mult: float = Field(default=2.0, alias="EXIT_TAKE_PROFIT_MIN_ATR_MULT")
+    exit_take_profit_min_atr_mult: float = Field(default=1.0, alias="EXIT_TAKE_PROFIT_MIN_ATR_MULT")
     exit_take_profit_max_atr_mult: float = Field(default=4.0, alias="EXIT_TAKE_PROFIT_MAX_ATR_MULT")
-    # models/screener.py's selection floor used to be JUST the round-trip
-    # cost floor (~0.02%) -- a predicted move barely bigger than trading
-    # costs could still get picked and sized for a take-profit at
-    # exit_take_profit_min_atr_mult x horizon-scaled ATR (2x by default),
-    # a target with no realistic path from a forecast that small. This
-    # requires the forecast to already be at least this FRACTION of that
-    # same 2x-ATR floor -- half of it by default, not the whole thing:
-    # take-profit is meant to be a ceiling the trade can run past its point
-    # forecast to reach, not a restatement of it. Still only applies when
-    # this stock's own ATR is available; the cost floor alone is the bar
-    # otherwise, same as before this existed.
+    # models/screener.py's confidence bar: a predicted move that's too small
+    # relative to this stock's OWN ATR would get picked and sized for a
+    # take-profit at exit_take_profit_min_atr_mult x horizon-scaled ATR (1x
+    # by default), a target with no realistic path from a forecast that
+    # small. This requires the forecast to already be at least this
+    # FRACTION of that same ATR floor -- half of it by default, not the
+    # whole thing: take-profit is meant to be a ceiling the trade can run
+    # past its point forecast to reach, not a restatement of it. A symbol
+    # with no measurable ATR at all can never clear this (there's nothing
+    # to scale the forecast against), and is never confident -- see
+    # score_universe's own docstring for why a flat-percentage fallback for
+    # that case (the old, separate round-trip-cost bar) was removed.
     screener_min_return_atr_fraction: float = Field(default=0.5, alias="SCREENER_MIN_RETURN_ATR_FRACTION")
     # A DIFFERENT bar from the fraction above -- that one scales the
     # required forecast to THIS stock's own ATR, so a barely-moving stock
@@ -294,9 +295,8 @@ class Settings(BaseSettings):
     # under 0.5% of price) cleared the scaled bar above on a tiny forecast
     # and got a 2% take-profit against a 5% stop-loss -- see
     # execution/exit_levels.py's exit_min_reward_risk_ratio for the other
-    # half of that same fix. Same graceful fallback as the fraction above:
-    # a symbol with no measurable ATR is neither filtered nor required to
-    # clear this.
+    # half of that same fix. Same as the fraction above: a symbol with no
+    # measurable ATR can never clear this either, and is never confident.
     screener_min_atr_pct: float = Field(default=0.006, alias="SCREENER_MIN_ATR_PCT")
     # Both take-profit AND stop-loss are additionally tightened toward the
     # nearest real Donchian support/resistance level within this many
@@ -452,7 +452,7 @@ class Settings(BaseSettings):
     # names held at once, never fewer than min_concentrated_positions UNLESS
     # fewer than that many actually clear the confidence bar that cycle — the
     # minimum is a target the screen tries to reach, never a reason to force
-    # a trade with no real edge (see DEFAULT_MIN_ABS_RETURN in
+    # a trade with no real edge (see score_universe's confidence bar in
     # models/screener.py). execution/contradiction_monitor.py's mid-week
     # reactivation targets this same range: if an emergency close drops the
     # book below the max, it re-screens immediately to top back up rather

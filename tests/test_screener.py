@@ -60,35 +60,18 @@ class _FakeEnsemble:
         return self._contributions.loc[X.index]
 
 
-def test_score_universe_confidence_is_only_the_cost_hurdle():
-    """
-    One bar: is the predicted move bigger than what trading it costs. The
-    agreement bar is gone — it admitted ~96% of predictions and the rows it
-    called confident were no more accurate than the rest.
-    """
-    latest = pd.DataFrame({"symbol": ["AAPL", "TSLA", "MMM"], "f1": [0.1, 0.2, 0.3]})
-    ensemble = _FakeEnsemble(mean_prediction=[0.05, -0.03, 0.01], direction_agreement=[1.0, 0.6, 0.9])
-
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02)
-
-    by_symbol = result.set_index("symbol")
-    assert by_symbol.loc["AAPL", "confident"]  # |return| 0.05 >= 0.02
-    assert by_symbol.loc["TSLA", "confident"]  # 0.6 agreement no longer disqualifies a 3% move
-    assert not by_symbol.loc["MMM", "confident"]  # |return| 0.01 < 0.02
-
-
 def test_score_universe_atr_relative_floor_rejects_a_move_too_small_for_its_own_target():
     """
-    A forecast can clear the cost hurdle yet still be far too small for the
-    take-profit it would be sized with (execution/exit_levels.py's own 2x
-    horizon-scaled-ATR floor) to have a realistic path -- this stock's own
-    ATR should raise its bar above the flat cost hurdle.
+    A forecast can be nonzero yet still be far too small for the take-profit
+    it would be sized with (execution/exit_levels.py's own ATR-multiple
+    horizon-scaled floor) to have a realistic path -- this stock's own ATR
+    sets its bar, not a flat threshold.
     """
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
-    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])  # 1% move, clears the cost hurdle alone
+    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])  # 1% move
 
     result = score_universe(
-        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        ensemble, latest, feature_cols=["f1"],
         atr_pct_by_symbol={"AAPL": 0.02}, horizon_days=5,
     )
 
@@ -102,7 +85,7 @@ def test_score_universe_atr_relative_floor_accepts_a_move_that_clears_it():
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])  # 5% move
 
     result = score_universe(
-        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        ensemble, latest, feature_cols=["f1"],
         atr_pct_by_symbol={"AAPL": 0.02}, horizon_days=5,
     )
 
@@ -111,54 +94,49 @@ def test_score_universe_atr_relative_floor_accepts_a_move_that_clears_it():
     assert result.set_index("symbol").loc["AAPL", "confident"]
 
 
-def test_score_universe_atr_relative_floor_never_undercuts_the_cost_hurdle():
-    """A tiny ATR must not LOWER the bar below the round-trip cost floor."""
+def test_score_universe_missing_atr_is_never_confident():
+    """
+    No ATR on record for this symbol (a new listing, a data gap) -- there's
+    nothing to scale either bar against, so it can never be confident. The
+    old fallback (a flat, ATR-independent round-trip-cost hurdle) was
+    removed: once a symbol clears the ATR-relative floor, that ~0.02% cost
+    floor was never actually in question (see score_universe's own
+    docstring), so it was dead weight whose only real effect was quietly
+    admitting exactly the no-ATR case this system should be strict about.
+    """
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
-    ensemble = _FakeEnsemble(mean_prediction=[0.001], direction_agreement=[1.0])  # 0.1% move
+    ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])  # a large move, would clear any flat floor
 
     result = score_universe(
-        ensemble, latest, feature_cols=["f1"], min_abs_return=0.02,  # 2% cost hurdle, well above any tiny ATR floor
-        atr_pct_by_symbol={"AAPL": 0.0001}, horizon_days=5,
+        ensemble, latest, feature_cols=["f1"],
+        atr_pct_by_symbol={}, horizon_days=5,
     )
 
     assert not result.set_index("symbol").loc["AAPL", "confident"]
 
 
-def test_score_universe_missing_atr_falls_back_to_the_cost_hurdle_alone():
-    """No ATR on record for this symbol (new listing, a data gap) -- bar 1 alone decides, same as before this bar existed."""
-    latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
-    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])
-
-    result = score_universe(
-        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
-        atr_pct_by_symbol={}, horizon_days=5,
-    )
-
-    assert result.set_index("symbol").loc["AAPL", "confident"]  # 1% clears the 0.02% cost hurdle, no ATR bar to also clear
-
-
 def test_score_universe_rejects_a_symbol_too_calm_to_trade_regardless_of_forecast(monkeypatch):
     """
     Hit live: TECH's ATR was small enough that even a forecast scaled to
-    match it (bar 2, the RELATIVE floor) still cleared the bar, and got
-    picked with a 2% take-profit no one should hold a position for. Bar 3
+    match it (bar 1, the RELATIVE floor) still cleared the bar, and got
+    picked with a 2% take-profit no one should hold a position for. Bar 2
     is an ABSOLUTE floor on the ATR itself -- below settings.screener_min_atr_pct,
     a symbol is never confident, no matter how the forecast compares to
     its own (tiny) ATR.
     """
     monkeypatch.setattr(settings, "screener_min_atr_pct", 0.006)
     latest = pd.DataFrame({"symbol": ["TECH"], "f1": [0.1]})
-    # Forecast deliberately scaled to clear bar 2 (the relative floor) --
-    # this is the exact case bar 2 alone would wrongly admit.
+    # Forecast deliberately scaled to clear bar 1 (the relative floor) --
+    # this is the exact case bar 1 alone would wrongly admit.
     ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])
 
     result = score_universe(
-        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        ensemble, latest, feature_cols=["f1"],
         atr_pct_by_symbol={"TECH": 0.002}, horizon_days=5,  # 0.2% ATR -- well under the 0.6% floor
     )
 
     relative_floor = settings.exit_take_profit_min_atr_mult * settings.screener_min_return_atr_fraction * 0.002 * math.sqrt(5)
-    assert 0.01 > relative_floor  # sanity: bar 2 alone would have passed this
+    assert 0.01 > relative_floor  # sanity: bar 1 alone would have passed this
     assert not result.set_index("symbol").loc["TECH", "confident"]
 
 
@@ -168,24 +146,11 @@ def test_score_universe_accepts_a_symbol_at_or_above_the_absolute_atr_floor(monk
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
 
     result = score_universe(
-        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
+        ensemble, latest, feature_cols=["f1"],
         atr_pct_by_symbol={"AAPL": 0.02}, horizon_days=5,  # 2% ATR, well above the 0.6% floor
     )
 
     assert result.set_index("symbol").loc["AAPL", "confident"]
-
-
-def test_score_universe_missing_atr_is_not_subject_to_the_absolute_atr_floor():
-    """Same graceful fallback as bar 2 -- a symbol with no measurable ATR is neither filtered nor required to clear this."""
-    latest = pd.DataFrame({"symbol": ["NEWCO"], "f1": [0.1]})
-    ensemble = _FakeEnsemble(mean_prediction=[0.01], direction_agreement=[1.0])
-
-    result = score_universe(
-        ensemble, latest, feature_cols=["f1"], min_abs_return=0.0002,
-        atr_pct_by_symbol={}, horizon_days=5,
-    )
-
-    assert result.set_index("symbol").loc["NEWCO", "confident"]
 
 
 def test_conviction_score_is_the_size_of_the_move_alone():
@@ -196,7 +161,7 @@ def test_conviction_score_is_the_size_of_the_move_alone():
     latest = pd.DataFrame({"symbol": ["BIG", "SMALL"], "f1": [0.1, 0.2]})
     ensemble = _FakeEnsemble(mean_prediction=[0.05, 0.01], direction_agreement=[0.6, 1.0])
 
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.0)
+    result = score_universe(ensemble, latest, feature_cols=["f1"])
 
     by_symbol = result.set_index("symbol")
     assert by_symbol.loc["BIG", "conviction_score"] == pytest.approx(0.05)
@@ -224,7 +189,7 @@ def test_score_universe_caps_signal_to_noise_at_a_json_safe_sentinel():
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], std_prediction=[0.0])
 
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02)
+    result = score_universe(ensemble, latest, feature_cols=["f1"])
 
     assert result["signal_to_noise"].iloc[0] == pytest.approx(_SIGNAL_TO_NOISE_CAP)
     assert math.isfinite(result["signal_to_noise"].iloc[0])
@@ -234,17 +199,20 @@ def test_score_universe_signal_to_noise_passes_through_uncapped_values():
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0], std_prediction=[0.02])
 
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02)
+    result = score_universe(ensemble, latest, feature_cols=["f1"])
 
     assert result["signal_to_noise"].iloc[0] == pytest.approx(2.5)  # 0.05 / 0.02
 
 
-def test_score_universe_without_a_breakout_column_falls_back_to_cost_hurdle_only():
+def test_score_universe_without_a_breakout_column_still_scores_confidence():
     """A feature set built before donchian_breakout_20 existed has no such column at all."""
     latest = pd.DataFrame({"symbol": ["AAPL"], "f1": [0.1]})
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
 
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02)
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"],
+        atr_pct_by_symbol={"AAPL": 0.02}, horizon_days=5,
+    )
 
     assert result.set_index("symbol").loc["AAPL", "confident"]
 
@@ -256,17 +224,20 @@ def test_score_universe_breakout_no_longer_gates_confidence():
     earlier hard AND-gate (a bullish call required an actual fresh 20-day
     high the same day) was removed: that coincidence is rare enough that
     it could zero out the entire universe's candidate pool. A predicted
-    move that clears the cost/ATR bar is confident whether today's
-    breakout agrees, disagrees, or didn't happen at all.
+    move that clears the ATR bar is confident whether today's breakout
+    agrees, disagrees, or didn't happen at all.
     """
     latest = pd.DataFrame({"symbol": ["AAPL", "MSFT", "GOOG"], "f1": [0.1, 0.2, 0.3]})
     ensemble = _FakeEnsemble(mean_prediction=[0.05, 0.05, 0.05], direction_agreement=[1.0, 1.0, 1.0])
     # AAPL: breakout agrees (+1, predicted up). MSFT: breakout disagrees
     # (-1, predicted up). GOOG: no breakout at all today (0). All three
-    # clear the cost hurdle and must all be confident.
+    # clear the ATR bar and must all be confident.
     raw = pd.DataFrame({"symbol": ["AAPL", "MSFT", "GOOG"], "donchian_breakout_20": [1.0, -1.0, 0.0]})
 
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02, raw_features=raw)
+    result = score_universe(
+        ensemble, latest, feature_cols=["f1"], raw_features=raw,
+        atr_pct_by_symbol={"AAPL": 0.02, "MSFT": 0.02, "GOOG": 0.02}, horizon_days=5,
+    )
 
     by_symbol = result.set_index("symbol")
     assert by_symbol.loc["AAPL", "confident"]
@@ -295,7 +266,7 @@ def test_score_universe_reads_the_raw_breakout_not_the_zscored_one():
     ensemble = _FakeEnsemble(mean_prediction=[0.05], direction_agreement=[1.0])
     raw = pd.DataFrame({"symbol": ["AAPL"], "donchian_breakout_20": [-1.0]})
 
-    result = score_universe(ensemble, latest, feature_cols=["f1"], min_abs_return=0.02, raw_features=raw)
+    result = score_universe(ensemble, latest, feature_cols=["f1"], raw_features=raw)
 
     assert result.set_index("symbol").loc["AAPL", "donchian_breakout_20"] == -1.0
 
