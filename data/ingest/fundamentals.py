@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from collections.abc import Callable
 
 import pandas as pd
 import requests
@@ -35,6 +36,7 @@ import requests
 from data.ingest.db import upsert_dataframe
 from data.ingest.finnhub import DEFAULT_SLEEP_SECONDS, finnhub_configured, finnhub_get
 from data.ingest.universe import resolve_symbols
+from monitoring.alerts import make_progress_alert
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +95,9 @@ def _extract_metrics(report: dict) -> dict[str, float]:
     return found
 
 
-def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_SECONDS) -> pd.DataFrame:
+def fetch_fundamentals(
+    symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_SECONDS, on_progress: Callable[[int], None] | None = None
+) -> pd.DataFrame:
     """
     Pull as-reported quarterly/annual financials per symbol from Finnhub and
     reshape into long format. Returns columns: symbol, ts (tz-aware), metric,
@@ -103,6 +107,11 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
     data/ingest/finnhub.py's own pacing — matters once --universe is
     scanning hundreds of names; a single-digit --symbols list can pass
     sleep_seconds=0.
+
+    `on_progress`, when given, is called once per symbol processed (see
+    monitoring.alerts.make_progress_alert) — ingest_fundamentals wires this
+    to a Telegram/Slack progress tick; a caller with no interest in
+    progress reporting (tests, a direct script run) simply omits it.
     """
     if not finnhub_configured():
         logger.warning(
@@ -120,6 +129,8 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
             resp = finnhub_get(FINNHUB_FINANCIALS_URL, {"symbol": symbol})
         except requests.RequestException:
             logger.warning("Failed to fetch fundamentals for %s — skipping this symbol.", symbol, exc_info=True)
+            if on_progress is not None:
+                on_progress(1)
             continue
         reports = resp.json().get("data", [])
 
@@ -145,6 +156,8 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
                 rows.append(
                     {"symbol": symbol, "ts": filed_date, "metric": metric, "value": value, "source": "finnhub"}
                 )
+        if on_progress is not None:
+            on_progress(1)
 
     df = pd.DataFrame(rows, columns=["symbol", "ts", "metric", "value", "source"])
     if not df.empty:
@@ -159,8 +172,19 @@ def fetch_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_
     return df
 
 
-def ingest_fundamentals(symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_SECONDS) -> int:
-    df = fetch_fundamentals(symbols, sleep_seconds=sleep_seconds)
+def ingest_fundamentals(
+    symbols: list[str], sleep_seconds: float = DEFAULT_SLEEP_SECONDS, report_progress: bool = False
+) -> int:
+    """
+    `report_progress`: fire Telegram/Slack "X% done" updates as symbols are
+    processed (see monitoring.alerts.make_progress_alert). Off by default;
+    scripts/run_weekly_cycle.py's full-universe run (hundreds of symbols,
+    minutes long) opts in explicitly rather than making it automatic here,
+    so a future small-batch caller doesn't inherit noisy progress alerts
+    for a job that finishes in seconds.
+    """
+    on_progress = make_progress_alert("fundamentals_ingest", total=len(symbols)) if report_progress else None
+    df = fetch_fundamentals(symbols, sleep_seconds=sleep_seconds, on_progress=on_progress)
     return upsert_dataframe(df, table="fundamentals", conflict_cols=["symbol", "ts", "metric"])
 
 

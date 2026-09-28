@@ -119,6 +119,78 @@ def test_alert_pipeline_progress_sends_info_severity(slack_configured, telegram_
 
 
 # --------------------------------------------------------------------------
+# make_progress_alert
+# --------------------------------------------------------------------------
+
+
+def _capture_progress(monkeypatch):
+    seen = []
+    monkeypatch.setattr(alerts, "alert_pipeline_progress", lambda job_name, detail: seen.append((job_name, detail)))
+    return seen
+
+
+def test_make_progress_alert_fires_once_per_threshold_crossed(monkeypatch):
+    seen = _capture_progress(monkeypatch)
+    tick = alerts.make_progress_alert("fundamentals_ingest", total=10)
+
+    for _ in range(10):
+        tick()
+
+    # One alert per 10% step, 10 total, none repeated.
+    assert [d for _, d in seen] == [
+        f"{pct}% done ({done}/10)" for pct, done in zip(range(10, 101, 10), range(1, 11), strict=True)
+    ]
+    assert all(job == "fundamentals_ingest" for job, _ in seen)
+
+
+def test_make_progress_alert_never_fires_the_same_threshold_twice(monkeypatch):
+    seen = _capture_progress(monkeypatch)
+    tick = alerts.make_progress_alert("news_ingest", total=3)
+
+    tick()  # 33% -> crosses the 10%, 20%, 30% thresholds at once
+    tick()
+    tick()
+
+    percentages = [d.split("%")[0] for _, d in seen]
+    assert percentages == sorted(set(percentages), key=int)  # no threshold repeated, strictly increasing
+
+
+def test_make_progress_alert_handles_a_batch_that_advances_by_more_than_one(monkeypatch):
+    seen = _capture_progress(monkeypatch)
+    tick = alerts.make_progress_alert("sentiment_backfill", total=100)
+
+    tick(45)  # crosses the 10/20/30/40% thresholds in one call, done=45 each time
+    tick(10)  # crosses 50%, done=55
+
+    assert [d for _, d in seen] == [
+        "10% done (45/100)", "20% done (45/100)", "30% done (45/100)", "40% done (45/100)", "50% done (55/100)",
+    ]
+
+
+def test_make_progress_alert_total_zero_is_a_silent_no_op(monkeypatch):
+    seen = _capture_progress(monkeypatch)
+    tick = alerts.make_progress_alert("build_features", total=0)
+
+    tick()
+    tick(5)
+
+    assert seen == []
+
+
+def test_make_progress_alert_never_exceeds_100_percent(monkeypatch):
+    seen = _capture_progress(monkeypatch)
+    tick = alerts.make_progress_alert("fundamentals_ingest", total=5)
+
+    for _ in range(5):
+        tick()
+    tick()  # a 6th tick past total must not manufacture a >100% threshold
+
+    percentages = [int(d.split("%")[0]) for _, d in seen]
+    assert percentages == [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    assert max(percentages) <= 100
+
+
+# --------------------------------------------------------------------------
 # configure_file_logging
 # --------------------------------------------------------------------------
 

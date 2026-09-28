@@ -148,7 +148,10 @@ def score_universe(
     'symbol' column plus all of `feature_cols` (missing ones are fine —
     LightGBM handles NaN features natively).
     Returns: symbol, predicted_return, direction_agreement, conviction_score,
-    donchian_breakout_20, trend_pullback_score, confident.
+    donchian_breakout_20, trend_pullback_score, passed_atr_relative_bar,
+    passed_atr_absolute_bar, confident. The two passed_* columns are each
+    bar below on its own (see run_screen_with_scores, which alerts their
+    pass counts per cycle) -- `confident` is just their AND.
 
     Two bars decide "confident", and BOTH require this stock's own ATR
     (atr_pct_by_symbol) -- a symbol with no measurable ATR at all (a new
@@ -218,7 +221,8 @@ def score_universe(
     empty = pd.DataFrame(
         columns=[
             "symbol", "predicted_return", "direction_agreement", "signal_to_noise", "conviction_score",
-            "donchian_breakout_20", "trend_pullback_score", "confident",
+            "donchian_breakout_20", "trend_pullback_score",
+            "passed_atr_relative_bar", "passed_atr_absolute_bar", "confident",
         ]
     )
     if latest_features.empty:
@@ -295,7 +299,9 @@ def score_universe(
     # never clear this either.
     too_calm = atr_pct_series < settings.screener_min_atr_pct
 
-    result["confident"] = has_atr & (result["predicted_return"].abs() >= atr_floor) & ~too_calm
+    result["passed_atr_relative_bar"] = has_atr & (result["predicted_return"].abs() >= atr_floor)
+    result["passed_atr_absolute_bar"] = has_atr & ~too_calm
+    result["confident"] = result["passed_atr_relative_bar"] & result["passed_atr_absolute_bar"]
     return result.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
 

@@ -183,15 +183,21 @@ def main() -> None:
     today = dt.datetime.now(tz=dt.UTC).date()
     price_start = today.replace(year=today.year - args.backfill_years) if args.backfill_years else today - dt.timedelta(days=7)
     run_job("price_ingest", ingest_prices, [*symbols, _REGIME_PROXY], price_start, today, "yfinance")
-    run_job("fundamentals_ingest", ingest_fundamentals, symbols)
+    # report_progress=True on these four: the longest phases in the cycle,
+    # each running minutes over the full universe with nothing else to show
+    # for it in between — see monitoring.alerts.make_progress_alert. Off by
+    # default in each of these functions since execution/contradiction_monitor.py
+    # also calls several of them hourly on a handful of symbols, where the
+    # same alerts would just be noise.
+    run_job("fundamentals_ingest", ingest_fundamentals, symbols, report_progress=True)
     # MACRO_PROXY_SYMBOLS (broad-market + sector ETFs): never part of the
     # tradeable universe, but features/qualitative/macro_sentiment.py needs
     # their news deliberately pulled, not just incidentally co-tagged onto
     # some other symbol's story.
-    run_job("news_ingest", ingest_finnhub, [*symbols, *MACRO_PROXY_SYMBOLS], args.since_hours)
-    run_job("sentiment_backfill", backfill_unscored_news, 5000)
+    run_job("news_ingest", ingest_finnhub, [*symbols, *MACRO_PROXY_SYMBOLS], args.since_hours, report_progress=True)
+    run_job("sentiment_backfill", backfill_unscored_news, 5000, report_progress=True)
     run_job("macro_calendar_refresh", refresh_macro_calendar)
-    run_job("build_features", build_and_store, symbols, args.feature_set_id)
+    run_job("build_features", build_and_store, symbols, args.feature_set_id, report_progress=True)
 
     result = run_job("trading_cycle", run_guarded_trading_cycle, args.feature_set_id, symbols, args.dry_run)
     logger.info("Weekly cycle result: %s", result)

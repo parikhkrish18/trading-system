@@ -29,6 +29,7 @@ from features.quant.donchian import donchian_breakout, donchian_pct, higher_low_
 from features.quant.mean_reversion import bollinger_pct_b, rsi, zscore
 from features.quant.momentum import adx, rolling_return, trend_pullback_score
 from features.quant.volatility import atr, realized_vol, vol_of_vol
+from monitoring.alerts import make_progress_alert
 
 # Macro categories tracked in the macro_calendar table (see
 # data/ingest/macro_calendar.py) — one countdown feature per category.
@@ -324,7 +325,27 @@ def fundamentals_prior_context(
 FEATURE_LOOKBACK_YEARS = 3
 
 
-def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int = FEATURE_LOOKBACK_YEARS) -> int:
+_BUILD_STAGES = 9  # see build_and_store's progress ticks below — bump this if a stage is added/removed
+
+
+def build_and_store(
+    symbols: list[str], feature_set_id: str, lookback_years: int = FEATURE_LOOKBACK_YEARS, report_progress: bool = False
+) -> int:
+    """
+    `report_progress`: fire Telegram/Slack "X% done" updates as this
+    function moves through its stages (data reads, each feature-frame
+    build, storage — see monitoring.alerts.make_progress_alert). There's no
+    natural per-symbol loop here (everything below is one vectorized pandas
+    pipeline over the whole universe at once), so progress is reported per
+    stage rather than per symbol. Off by default; scripts/run_weekly_cycle.py's
+    full-universe run opts in.
+    """
+    on_progress = make_progress_alert("build_features", total=_BUILD_STAGES) if report_progress else None
+
+    def _tick() -> None:
+        if on_progress is not None:
+            on_progress(1)
+
     engine = get_engine()
     symbol_list = symbol_in_clause(symbols)
     prices = pd.read_sql(
@@ -363,18 +384,30 @@ def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int
             engine,
         ).itertuples(index=False, name=None)
     )
+    _tick()  # 1/9: every input table read
 
     qualitative_features = build_qualitative_features(prices, news)
+    _tick()  # 2/9
     macro_features = build_macro_sentiment_features(prices, macro_news, sector_by_symbol)
+    _tick()  # 3/9
+    quant_features = build_quant_features(prices)
+    _tick()  # 4/9
+    event_risk_features = build_event_risk_features(prices, macro_calendar)
+    _tick()  # 5/9
+    fundamentals_features = build_fundamentals_features(prices, fundamentals)
+    _tick()  # 6/9
+    macro_interaction_features = build_macro_interaction_features(macro_features, qualitative_features)
+    _tick()  # 7/9
+
     feature_frames = [
         frame
         for frame in (
-            build_quant_features(prices),
+            quant_features,
             qualitative_features,
-            build_event_risk_features(prices, macro_calendar),
-            build_fundamentals_features(prices, fundamentals),
+            event_risk_features,
+            fundamentals_features,
             macro_features,
-            build_macro_interaction_features(macro_features, qualitative_features),
+            macro_interaction_features,
         )
         if not frame.empty
     ]
@@ -384,8 +417,10 @@ def build_and_store(symbols: list[str], feature_set_id: str, lookback_years: int
     )
     features["feature_set_id"] = feature_set_id
     features = features.dropna(subset=["value"])
+    _tick()  # 8/9
 
     n = upsert_dataframe(features, table="features", conflict_cols=["symbol", "ts", "feature_set_id", "feature_name"])
+    _tick()  # 9/9
     return n
 
 

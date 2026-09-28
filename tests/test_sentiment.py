@@ -313,6 +313,48 @@ def test_score_sentiment_batches_in_groups_of_batch_size(monkeypatch):
     assert calls == [2, 1]
 
 
+def test_score_sentiment_calls_on_progress_once_per_batch_with_the_batch_size(monkeypatch):
+    def respond(messages):
+        items = json.loads(messages[0]["content"])
+        return json.dumps([{"id": item["id"], "sentiment": 0.0} for item in items])
+
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(respond))
+    monkeypatch.setattr(sentiment, "_BATCH_SIZE", 2)
+
+    headlines = pd.DataFrame(
+        {
+            "id": [1, 2, 3],
+            "ts": pd.to_datetime(["2026-07-27"] * 3, utc=True),
+            "symbol": ["SPY"] * 3,
+            "headline": ["h1", "h2", "h3"],
+        }
+    )
+    ticks = []
+    sentiment.score_sentiment(headlines, on_progress=ticks.append)
+
+    assert ticks == [2, 1]  # batch of 2, then the remaining 1
+
+
+def test_score_sentiment_calls_on_progress_even_when_a_batch_fails_to_parse(monkeypatch):
+    """Progress must still advance past a batch that never got scored, so the
+    tracker doesn't stall forever on a permanently-unparseable batch."""
+    monkeypatch.setattr(sentiment, "Anthropic", lambda api_key: _FakeAnthropic(lambda messages: "not json"))
+    monkeypatch.setattr(sentiment, "_MAX_SCORE_ATTEMPTS", 1)
+
+    headlines = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "ts": pd.to_datetime(["2026-07-27"] * 2, utc=True),
+            "symbol": ["SPY"] * 2,
+            "headline": ["h1", "h2"],
+        }
+    )
+    ticks = []
+    sentiment.score_sentiment(headlines, on_progress=ticks.append)
+
+    assert ticks == [2]
+
+
 def test_score_sentiment_survives_a_batch_whose_response_is_not_valid_json(monkeypatch):
     """
     Regression test, hit live: one batch's response failing to parse at all
@@ -411,6 +453,75 @@ def test_score_sentiment_gives_up_on_a_batch_after_max_attempts(monkeypatch):
 
     assert attempts["count"] == sentiment._MAX_SCORE_ATTEMPTS
     assert pd.isna(scored.iloc[0]["sentiment"])
+
+
+class _FakeConn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def exec_driver_sql(self, *args, **kwargs):
+        pass
+
+
+class _FakeEngine:
+    def begin(self):
+        return _FakeConn()
+
+
+def _fake_unscored_rows() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "id": [1, 2],
+            "ts": pd.to_datetime(["2026-07-27T12:00:00Z", "2026-07-27T13:00:00Z"], utc=True),
+            "symbol": ["SPY", "SPY"],
+            "headline": ["h1", "h2"],
+            "summary": ["", ""],
+        }
+    )
+
+
+def _fake_score_sentiment_capturing(captured: dict):
+    def _fake(headlines, on_progress=None):
+        captured["on_progress"] = on_progress
+        out = headlines.copy()
+        out["sentiment"] = 0.5
+        out["sentiment_reason"] = "fine"
+        out["sentiment_relevant"] = True
+        return out
+
+    return _fake
+
+
+def test_backfill_unscored_news_wires_a_real_progress_tracker_when_asked(monkeypatch):
+    """
+    No real DB needed here -- get_engine/pd.read_sql/score_sentiment are all
+    faked, isolating just the report_progress -> on_progress wiring this
+    function is responsible for.
+    """
+    monkeypatch.setattr(sentiment, "get_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(sentiment.pd, "read_sql", lambda *a, **k: _fake_unscored_rows())
+    captured = {}
+    monkeypatch.setattr(sentiment, "score_sentiment", _fake_score_sentiment_capturing(captured))
+
+    n = sentiment.backfill_unscored_news(batch_size=500, report_progress=True)
+
+    assert n == 2
+    assert captured["on_progress"] is not None
+
+
+def test_backfill_unscored_news_report_progress_off_by_default(monkeypatch):
+    monkeypatch.setattr(sentiment, "get_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(sentiment.pd, "read_sql", lambda *a, **k: _fake_unscored_rows())
+    captured = {}
+    monkeypatch.setattr(sentiment, "score_sentiment", _fake_score_sentiment_capturing(captured))
+
+    n = sentiment.backfill_unscored_news(batch_size=500)
+
+    assert n == 2
+    assert captured["on_progress"] is None
 
 
 def test_backfill_unscored_news_writes_the_good_batches_when_one_batch_fails_to_parse(monkeypatch):
