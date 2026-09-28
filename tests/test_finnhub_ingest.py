@@ -382,7 +382,7 @@ def test_ingest_finnhub_preserves_an_already_scored_sentiment_on_re_ingest(monke
 
     monkeypatch.setattr(
         finnhub, "fetch_company_news",
-        lambda symbols, since_hours, sleep_seconds=0: pd.DataFrame(
+        lambda symbols, since_hours, sleep_seconds=0, on_progress=None: pd.DataFrame(
             {
                 "id": [article_id],
                 "symbol": ["ZZZTEST"],
