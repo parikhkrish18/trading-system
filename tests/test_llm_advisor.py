@@ -39,6 +39,23 @@ class _FakeAnthropic:
         self.messages = _FakeMessages(response_fn)
 
 
+def test_system_prompt_instructs_pinpointing_exact_exit_prices_off_poc_and_donchian():
+    """
+    TP/SL sizing is this LLM pass's job, not a deterministic formula: the
+    prompt must tell Claude to treat quant_take_profit_pct/quant_stop_loss_pct
+    as only an approximate ATR-based band, then pick the EXACT price within
+    it off whichever real level (a Donchian support/resistance, or the
+    volume profile's point of control) sits closest -- not a round,
+    arbitrary percentage (see models/llm_advisor.py's module docstring and
+    _build_system_prompt).
+    """
+    prompt = llm_advisor._build_system_prompt().lower()
+    assert "volume_profile_poc" in prompt
+    assert "point of control" in prompt
+    assert "to the cent" in prompt
+    assert "round, arbitrary percentage" in prompt
+
+
 def _candidate(symbol="AAPL", **overrides):
     base = {
         "symbol": symbol,
