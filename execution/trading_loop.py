@@ -52,6 +52,13 @@ from risk.sizing import allocate_by_conviction
 logger = logging.getLogger(__name__)
 
 _MODEL_VERSION = "ensemble_v1"
+# Placeholder feature_set_id/model_version for a decisions row logged from a
+# circuit-breaker response, not a weekly screen -- mirrors
+# execution/contradiction_monitor.py's own _FEATURE_SET_ID =
+# "contradiction_monitor" for the identical reason: this row records a real
+# executed action but isn't tied to any weekly model run.
+_CIRCUIT_BREAKER_FEATURE_SET_ID = "circuit_breaker"
+_CIRCUIT_BREAKER_MODEL_VERSION = "rule_based_v1"
 
 
 @dataclasses.dataclass
@@ -294,9 +301,72 @@ def _store_hold_state(engine, counts: dict[str, int], levels: dict | None = None
         logger.warning("Could not persist hold state — miss counters will restart from the last stored values.")
 
 
+def _log_circuit_breaker_action(symbol: str, executed_position: float, reason: str, mode: str) -> None:
+    """
+    Records a decisions row for a circuit-breaker flatten or trim -- the
+    same round-trip-pairing contract every other close/resize in this
+    system relies on (see monitoring/dashboard/server.py's
+    _decision_episode_boundaries and monitoring/trade_log.py's
+    real_trade_rows/attach_actual_outcomes, both of which key off a
+    decisions row existing with executed_position set, nothing else).
+
+    Before this existed, _flatten_and_alert and the trim loop below placed
+    the order and alerted but never wrote here: a position the circuit
+    breaker flattened had no closing decision row at all, so it never
+    paired into a completed round trip and silently never appeared in
+    Closed Trades (Trade Log still showed its entry, reading "pending"
+    forever). Hit live: the P flatten on 2026-09-28.
+
+    `executed_position == 0` is a full close (target_position 0.0, same
+    convention as every other close in this file); a nonzero value is a
+    trim that resized but didn't close the position, so target_position is
+    left None -- the same "no fresh target this cycle" value already used
+    for a held position with nothing new to report (see _log_decisions'
+    held_decisions loop). Never allowed to raise past the caller: a failed
+    log write must not be mistaken for a failed order, and must never
+    block the alert/equity-snapshot calls right after it.
+    """
+    action = "closed" if executed_position == 0 else "adjusted"
+    phase4 = {
+        "phase": 4,
+        "title": "Candidate Selection & Sizing",
+        "summary": f"{symbol} {action} by a circuit breaker — not a weekly screen decision.",
+        "lines": [
+            f"Circuit breaker triggered: {reason}",
+            "This was an automatic risk-engine action, not a fresh screen or forecast.",
+        ],
+    }
+    phase5 = reasoning.phase_execution(symbol, action, executed_position, "market")
+    phase7 = reasoning.phase_ongoing_monitoring(closed=(executed_position == 0))
+    full_reasoning = reasoning.combine_phases(phase4, phase5, phase7)
+
+    row = {
+        "ts": dt.datetime.now(tz=dt.UTC),
+        "symbol": symbol,
+        "feature_set_id": _CIRCUIT_BREAKER_FEATURE_SET_ID,
+        "model_version": _CIRCUIT_BREAKER_MODEL_VERSION,
+        "forecast": None,
+        "regime": None,
+        "target_position": 0.0 if executed_position == 0 else None,
+        "executed_position": executed_position,
+        "mode": mode,
+        "reasoning": json.dumps(full_reasoning),
+        # "auto": no human gate exists for a circuit breaker -- this is an
+        # unconditional system action, not a proposal someone approved.
+        "approval_status": "auto",
+    }
+    try:
+        pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
+    except Exception:
+        logger.exception("Could not log the circuit-breaker decision row for %s — the order above still went through.", symbol)
+
+
 def _flatten_and_alert(broker, reason: str) -> None:
     logger.critical("Circuit breaker triggered: %s — flattening all positions.", reason)
+    positions_before = {s: q for s, q in broker.get_positions().items() if q != 0}
     broker.flatten_all()
+    for symbol in positions_before:
+        _log_circuit_breaker_action(symbol, 0.0, reason, broker.mode)
     alert_circuit_breaker(reason)
     record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
 
@@ -361,6 +431,8 @@ def _respond_to_breaker_triggers(broker, triggers: list) -> tuple[str, int]:
                 orders_placed += 1
         except Exception:
             logger.exception("Breaker trim order failed for %s — continuing with the rest of the batch.", symbol)
+            continue
+        _log_circuit_breaker_action(symbol, target_shares, reason, broker.mode)
     alert_circuit_breaker(reason)
     record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
     return "trimmed", orders_placed

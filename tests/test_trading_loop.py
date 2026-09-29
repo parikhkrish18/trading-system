@@ -517,6 +517,109 @@ def test_run_cycle_trim_falls_back_to_zero_shares_without_a_price(monkeypatch):
     assert broker.submitted == [("P", 0.0)]
 
 
+def test_log_circuit_breaker_action_records_a_closing_decision_row(monkeypatch):
+    """
+    The bug this closes: a position the circuit breaker flattened never got
+    a decisions row at all, so monitoring/dashboard/server.py's round-trip
+    pairing never saw it close -- it stayed "pending" forever and never
+    appeared in Closed Trades.
+    """
+    captured = {}
+
+    def fake_to_sql(self, table, con, if_exists=None, index=None, dtype=None):
+        captured["df"] = self
+        captured["table"] = table
+
+    monkeypatch.setattr(pd.DataFrame, "to_sql", fake_to_sql)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+
+    trading_loop._log_circuit_breaker_action("P", 0.0, "drawdown breach", "paper")
+
+    assert captured["table"] == "decisions"
+    row = captured["df"].iloc[0]
+    assert row["symbol"] == "P"
+    assert row["executed_position"] == 0.0
+    assert row["target_position"] == 0.0  # a full close, same convention as every other close
+    assert row["mode"] == "paper"
+    assert row["approval_status"] == "auto"  # no human gate exists for a circuit breaker
+    assert row["feature_set_id"] == trading_loop._CIRCUIT_BREAKER_FEATURE_SET_ID
+
+
+def test_log_circuit_breaker_action_trim_leaves_target_position_unset(monkeypatch):
+    """
+    A trim resizes rather than closes -- target_position stays None (the
+    same "no fresh target this cycle" value _log_decisions already uses for
+    a held position), not 0.0, so this row doesn't misread as a close.
+    """
+    captured = {}
+
+    def fake_to_sql(self, table, con, if_exists=None, index=None, dtype=None):
+        captured["df"] = self
+
+    monkeypatch.setattr(pd.DataFrame, "to_sql", fake_to_sql)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+
+    trading_loop._log_circuit_breaker_action("P", 175.0, "correlated exposure breach", "paper")
+
+    row = captured["df"].iloc[0]
+    assert row["executed_position"] == 175.0
+    assert row["target_position"] is None
+
+
+def test_log_circuit_breaker_action_swallows_a_db_failure(monkeypatch):
+    """A failed log write must never look like a failed order — it's caught, not raised."""
+    def exploding_to_sql(self, table, con, if_exists=None, index=None, dtype=None):
+        raise RuntimeError("db is down")
+
+    monkeypatch.setattr(pd.DataFrame, "to_sql", exploding_to_sql)
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+
+    trading_loop._log_circuit_breaker_action("P", 0.0, "drawdown breach", "paper")  # must not raise
+
+
+def test_flatten_and_alert_logs_a_closing_row_for_every_held_symbol(monkeypatch):
+    broker = _FakeBroker(positions={"P": 800.0, "Q": -50.0})
+    logged = []
+    monkeypatch.setattr(
+        trading_loop, "_log_circuit_breaker_action",
+        lambda symbol, executed_position, reason, mode: logged.append((symbol, executed_position, reason, mode)),
+    )
+
+    trading_loop._flatten_and_alert(broker, "drawdown breach")
+
+    assert broker.flattened
+    assert sorted(logged) == [("P", 0.0, "drawdown breach", "paper"), ("Q", 0.0, "drawdown breach", "paper")]
+
+
+def test_flatten_and_alert_logs_nothing_for_an_already_flat_book(monkeypatch):
+    broker = _FakeBroker()  # no positions
+    logged = []
+    monkeypatch.setattr(
+        trading_loop, "_log_circuit_breaker_action",
+        lambda *a: logged.append(a),
+    )
+
+    trading_loop._flatten_and_alert(broker, "drawdown breach")
+
+    assert logged == []
+
+
+def test_respond_to_breaker_triggers_trim_logs_a_resize_row(monkeypatch):
+    broker = _FakeBroker(positions={"P": 800.0})
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"P": 100.0})
+    logged = []
+    monkeypatch.setattr(
+        trading_loop, "_log_circuit_breaker_action",
+        lambda symbol, executed_position, reason, mode: logged.append((symbol, executed_position, reason, mode)),
+    )
+
+    trading_loop._respond_to_breaker_triggers(
+        broker, [BreakerResult(True, "single position breach", breaker_type="max_single_position", symbol="P", target_value=23_750.0)]
+    )
+
+    assert logged == [("P", 237.5, "single position breach", "paper")]
+
+
 def test_alert_confidence_checks_sends_the_right_per_check_counts(monkeypatch):
     seen = []
     monkeypatch.setattr(trading_loop, "send_slack_alert", lambda message, **k: seen.append(message))
