@@ -603,7 +603,13 @@ def _log_decisions(
     never even recognised as an entry to pair a later close against. Only
     for a symbol reconciliation confirmed is genuinely queued (not
     rejected/diverged/unknown) does the candidates loop below fall back to
-    the real intended_shares instead of leaving this None.
+    the real intended_shares instead of leaving this None. The
+    closing_symbols loop further down makes the mirror-image fix for a
+    close: there `executed` isn't None but the OLD nonzero position
+    (actual_positions read before the close order had time to fill), and a
+    queued close falls back to 0.0 (its real intended close) instead of
+    that stale value -- see the comment there for why logging the stale
+    value instead silently merges this close with an unrelated later one.
 
     `skip_reasons`: {symbol: reason} for an APPROVED candidate that still
     never got an order (e.g. no price to size it with) — target_position on
@@ -685,7 +691,24 @@ def _log_decisions(
         # and the trade silently never appeared in the Closed Trades table.
         # 0.0 is unambiguous here: this symbol is in closing_symbols, i.e. a
         # close was just approved and submitted for it.
-        rows.append(_row(symbol, None, 0.0, executed.get(symbol, 0.0), None, full_reasoning))
+        executed_position = executed.get(symbol, 0.0)
+        if executed_position != 0 and symbol in (queued_symbols or frozenset()):
+            # The close order is genuinely live at the broker, just not
+            # reflected in actual_positions yet (same settlement race the
+            # candidates loop above handles) -- actual_positions was read
+            # too soon after submission and still shows the OLD pre-close
+            # quantity, not 0. Logging that stale nonzero here, instead of
+            # the 0.0 this symbol was actually closed to, makes
+            # _decision_episode_boundaries read this row as a mid-episode
+            # RESIZE rather than the close it actually is -- the entry
+            # never gets paired here, so the position silently merges into
+            # whatever the NEXT close on this symbol happens to be,
+            # misattributing both round trips' P&L. Hit live: P's short
+            # close on 2026-09-24 (decision #32, logged executed_position
+            # -100 instead of 0, which pulled its LATER, unrelated long
+            # round trip's close into the same botched episode).
+            executed_position = 0.0
+        rows.append(_row(symbol, None, 0.0, executed_position, None, full_reasoning))
 
     for c in rejected_candidates:
         status = statuses.get(c.symbol, "rejected")

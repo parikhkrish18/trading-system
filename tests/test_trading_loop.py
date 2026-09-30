@@ -363,6 +363,76 @@ def test_log_decisions_leaves_a_non_queued_missing_execution_as_none(monkeypatch
     assert rows["BROKEN"]["executed_position"] is None
 
 
+def test_log_decisions_closing_symbol_still_queued_logs_zero_not_the_stale_position(monkeypatch):
+    """
+    Mirror-image of the queued-open fallback above, but for a close. Hit
+    live: P's short close on 2026-09-24 (decision #32) logged
+    executed_position=-100 (the pre-close position actual_positions still
+    showed 5 seconds after the close order went in — the order didn't fill
+    for almost two hours) instead of 0.0, the close that was actually
+    submitted. monitoring/dashboard/server.py's round-trip pairing reads a
+    nonzero executed_position as "still open, just resized", so that entry
+    never paired with this close — its NEXT, unrelated close on the same
+    symbol got pulled into the same episode instead, merging two separate
+    round trips' P&L into one.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+
+    _real_log_decisions(
+        candidates=[],
+        closing_symbols=["P"],
+        executed={"P": -100.0},  # stale pre-close read — the close order hadn't filled yet
+        intended_shares={"P": 0.0},
+        feature_set_id="v4",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        queued_symbols=frozenset({"P"}),
+    )
+
+    rows = {r["symbol"]: r for r in captured["rows"]}
+    assert rows["P"]["executed_position"] == 0.0
+
+
+def test_log_decisions_closing_symbol_not_queued_keeps_the_real_diverged_position(monkeypatch):
+    """
+    The queued-close fallback must not paper over a genuine failure: a
+    close reconciliation did NOT confirm as queued (rejected, diverged) —
+    the row keeps the real, actual position, honestly reporting the close
+    didn't take rather than claiming success that never happened.
+    """
+    captured = {}
+    monkeypatch.setattr(trading_loop, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        pd.DataFrame, "to_sql", lambda self, *a, **k: captured.setdefault("rows", self.to_dict("records"))
+    )
+    phase1 = reasoning.phase_pretrade_risk([])
+
+    _real_log_decisions(
+        candidates=[],
+        closing_symbols=["BROKEN"],
+        executed={"BROKEN": -100.0},
+        intended_shares={"BROKEN": 0.0},
+        feature_set_id="v4",
+        mode="paper",
+        regime="trend",
+        phase1=phase1,
+        phase6_by_symbol={},
+        order_type="market",
+        queued_symbols=frozenset(),  # not queued -- e.g. rejected or genuinely diverged
+    )
+
+    rows = {r["symbol"]: r for r in captured["rows"]}
+    assert rows["BROKEN"]["executed_position"] == -100.0
+
+
 def test_run_cycle_passes_queued_symbols_from_reconciliation_to_log_decisions(monkeypatch):
     """
     Wiring test: run_cycle must derive queued_symbols from reconciliation's
