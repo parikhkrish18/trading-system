@@ -680,6 +680,19 @@ def get_true_report_card(limit: int = 365) -> dict:
     }
 
 
+# A running position built up from several partial fills (a resize blended
+# into entry_qty/exit_qty across multiple additions and subtractions) all
+# but never lands on an exact 0.0 in IEEE 754 floating point -- hit live: a
+# real close-to-flat came out as position_qty == 1.1368683772161603e-13,
+# not 0.0. Comparing that against a literal 0 read as "still open" forever,
+# so the episode this fill actually completed never got appended, and any
+# fills after it silently kept accumulating onto a phantom sub-millionth-
+# of-a-share position instead of starting the next episode. No real fill
+# is ever this small, so a plain absolute tolerance is exact enough to
+# treat as "closed" without risking conflating it with a genuine leftover.
+_QTY_EPSILON = 1e-6
+
+
 def _reconstruct_symbol_episodes(fills: pd.DataFrame) -> list[dict]:
     """
     Walks one symbol's Alpaca fills (columns: side, qty, price, filled_at),
@@ -691,6 +704,10 @@ def _reconstruct_symbol_episodes(fills: pd.DataFrame) -> list[dict]:
     isolation. A single fill that flips the position straight through flat
     (closes the old side and opens the new one at once) closes out the old
     episode and starts a fresh one from that same fill's price.
+
+    "Flat" is judged within _QTY_EPSILON of zero, not literal equality --
+    see its own comment for why an exact 0.0 comparison silently dropped a
+    real, completed episode.
     """
     episodes: list[dict] = []
     position_qty = 0.0
@@ -709,7 +726,7 @@ def _reconstruct_symbol_episodes(fills: pd.DataFrame) -> list[dict]:
         signed_qty = fill["qty"] if fill["side"] == "buy" else -fill["qty"]
         price, ts = float(fill["price"]), fill["filled_at"]
 
-        if position_qty == 0:
+        if abs(position_qty) < _QTY_EPSILON:
             _open(ts, price, signed_qty)
             continue
 
@@ -725,7 +742,7 @@ def _reconstruct_symbol_episodes(fills: pd.DataFrame) -> list[dict]:
         leftover_qty = abs(signed_qty) - closing_qty
         position_qty += signed_qty
 
-        if position_qty == 0 or leftover_qty > 0:
+        if abs(position_qty) < _QTY_EPSILON or leftover_qty > _QTY_EPSILON:
             entry_price = entry_notional / entry_qty
             exit_price = exit_notional / exit_qty
             pnl = (exit_price - entry_price) * exit_qty * (1 if side == "long" else -1)
@@ -741,7 +758,7 @@ def _reconstruct_symbol_episodes(fills: pd.DataFrame) -> list[dict]:
                     "realized_pnl_pct": (exit_price / entry_price - 1) * (1 if side == "long" else -1),
                 }
             )
-            if leftover_qty > 0:
+            if leftover_qty > _QTY_EPSILON:
                 _open(ts, price, leftover_qty if signed_qty > 0 else -leftover_qty)
             else:
                 position_qty = 0.0

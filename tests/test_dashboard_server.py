@@ -519,6 +519,37 @@ def test_reconstruct_symbol_episodes_flip_through_flat_closes_one_and_opens_anot
     assert short_leg["realized_pnl"] == pytest.approx((110.0 - 105.0) * 15.0)
 
 
+def test_reconstruct_symbol_episodes_closes_even_when_floating_point_never_hits_exact_zero():
+    """
+    Regression test, hit live: a position built up across several partial
+    fills (two resizes, then a full close) accumulated enough floating-
+    point rounding error that position_qty landed on
+    1.1368683772161603e-13 after the final closing fill, not exactly 0.0.
+    Comparing that against a literal `== 0` read the position as still
+    open forever -- the episode that fill actually completed never got
+    appended, so a real, profitable round trip silently vanished from
+    Closed Trades. These are P's actual real fills from 2026-09-24 to
+    2026-09-28 that hit this live.
+    """
+    fills = pd.DataFrame(
+        [
+            _fill("P", "buy", 737.3324, 126.75, pd.Timestamp("2026-09-24T17:30:48.603135Z")),
+            _fill("P", "sell", 6.9313, 125.25, pd.Timestamp("2026-09-24T18:35:04.25862Z")),
+            _fill("P", "sell", 4.8275, 122.10, pd.Timestamp("2026-09-25T13:30:59.136254Z")),
+            _fill("P", "buy", 5.5384, 125.57, pd.Timestamp("2026-09-25T19:24:43.038071Z")),
+            _fill("P", "sell", 731.112, 129.287019, pd.Timestamp("2026-09-28T13:34:54.639974Z")),
+        ]
+    )
+    episodes = server._reconstruct_symbol_episodes(fills)
+    assert len(episodes) == 1
+    ep = episodes[0]
+    assert ep["side"] == "long"
+    assert ep["shares"] == pytest.approx(742.8708)
+    assert ep["entry_price"] == pytest.approx(126.74120262635171)
+    assert ep["exit_price"] == pytest.approx(129.20264749957596)
+    assert ep["realized_pnl"] == pytest.approx(1828.54, abs=0.01)
+
+
 # ---------- _decision_episode_boundaries: which round trips happened, per the algo's own decisions ----------
 
 
