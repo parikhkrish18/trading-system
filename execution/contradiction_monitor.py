@@ -132,28 +132,33 @@ _MIN_REACTIVATION_FRACTION = 0.05
 # guards Telegram's single-consumer getUpdates poll, a different resource).
 _CONTRADICTION_LOCK_KEY = 903218
 
-# Force-kill safety margin. Railway's cronSchedule for this service fires a
-# brand-new container every hour with no "skip if still running" check and
-# no graceful shutdown signal first -- confirmed live: a run that was still
-# inside _attempt_reactivation's ensemble retrain when the next hourly mark
-# came around just stopped mid-log, with no exit message and no
-# "Stopping Container" line, right as the next hour's "Starting Container"
-# appeared. advisory_lock (above) only guards against two PYTHON PROCESSES
-# racing for the same DB lock -- it can't protect against the platform
-# killing the container out from under one of them, and a run that never
-# finishes never gets to release anything or log why, so every over-budget
-# hour was silently thrown away complete rather than deferred.
+# Wall-clock budget so a run never creeps up against the next hourly cron
+# slot. Railway's cron does NOT overlap or kill a still-running execution --
+# per docs.railway.com/cron-jobs#service-execution-requirements, if the
+# previous execution is still Active when the next one is due, Railway just
+# SKIPS that next firing outright (no new container, nothing logged for
+# that hour at all). advisory_lock (above) only guards the case this module
+# was written for -- two Python processes racing for the same DB lock -- but
+# it does nothing to prevent this platform-level skip, and a skip is silent:
+# there is no warning that an hour's contradiction check, stop-loss/
+# take-profit check, and circuit-breaker check simply never ran.
+#
+# Confirmed live: one run's deploy log went from the sentiment-backfill
+# warnings straight to total silence for the better part of an hour (deep in
+# _attempt_reactivation's ensemble retrain, which logs nothing while
+# training), finishing only narrowly before the next hourly mark. A retrain
+# that finished even a little later would have caused Railway to skip that
+# whole next hour's check.
 #
 # The one step here that can run long is _attempt_reactivation's fresh
 # ensemble retrain (score_universe trains n_ensemble_models from scratch on
 # the full active universe's history every call, deliberately never cached
 # -- see full_book_rebalance.py's module docstring for why a stale cached
 # pool was tried and removed). Budgeting this run's wall-clock time and
-# skipping just that retrain once the budget is spent means the process
-# still finishes, logs why, and releases the advisory lock well before the
-# next cron fire could kill it -- worst case, one hour's reactivation is
-# deferred to the next pass, instead of the whole pass (including any
-# contradiction closes it already decided on) vanishing unfinished.
+# skipping just that retrain once the budget is spent keeps every run
+# safely clear of the next hourly slot, so it can never trigger Railway's
+# skip -- worst case, one hour's reactivation is deferred to the next pass,
+# instead of an entire hour of monitoring silently not happening at all.
 _MAX_RUN_SECONDS = 45 * 60
 
 
@@ -586,15 +591,17 @@ def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None
     real post-exit path gets the stronger whole-book semantics.
 
     `deadline`: a time.monotonic() cutoff (see _MAX_RUN_SECONDS) past which
-    this skips its ensemble retrain rather than risk still running it when
-    Railway's next hourly cron fire kills the container outright. None (the
-    default, e.g. direct tooling callers) means no budget -- never skip.
+    this skips its ensemble retrain rather than risk finishing so close to
+    the next hourly cron slot that Railway silently skips that next firing
+    (see _MAX_RUN_SECONDS). None (the default, e.g. direct tooling callers)
+    means no budget -- never skip.
     """
     if deadline is not None and time.monotonic() > deadline:
         logger.warning(
             "Skipping reactivation's ensemble retrain — this run is past its %d-minute time "
-            "budget and Railway's hourly cron would otherwise kill the container mid-retrain. "
-            "Any freed capital stays in cash; this is retried next hour.",
+            "budget. Finishing this late risks Railway silently skipping the next hourly "
+            "check entirely (see _MAX_RUN_SECONDS); any freed capital stays in cash for now, "
+            "retried next hour.",
             _MAX_RUN_SECONDS // 60,
         )
         return
@@ -791,8 +798,8 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     """The actual check, run under run_contradiction_check's advisory lock — see its docstring."""
     # See _MAX_RUN_SECONDS: this run's wall-clock budget, so a still-running
-    # reactivation retrain is skipped rather than risk Railway's next hourly
-    # cron fire killing the container mid-run.
+    # reactivation retrain is skipped rather than risk finishing so close to
+    # the next hourly cron slot that Railway silently skips that next firing.
     run_deadline = time.monotonic() + _MAX_RUN_SECONDS
     broker = get_broker()  # never passes confirm_live=True — paper-only by construction
     engine = get_engine()

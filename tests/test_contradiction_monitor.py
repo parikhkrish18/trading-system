@@ -973,13 +973,16 @@ def test_attempt_reactivation_skips_when_freed_fraction_too_small(monkeypatch):
 
 def test_attempt_reactivation_skips_the_retrain_once_past_its_deadline(monkeypatch):
     """
-    Regression test: Railway's hourly cron kills this service's container
-    outright at the next scheduled fire, with no "skip if still running"
-    check and no graceful shutdown first -- confirmed live from a run that
-    just stopped mid-log with no exit message while still inside this
-    retrain. A `deadline` already in the past must skip run_screen (the
-    expensive step) entirely rather than risk still being in it when the
-    next hour's cron kills the container -- see _MAX_RUN_SECONDS.
+    Regression test: Railway's cron already skips a new firing outright if
+    the previous execution is still Active -- but a run that finishes late
+    enough to still be Active at the next hourly mark causes that ENTIRE
+    next hour's check (contradiction, stop-loss/take-profit, circuit
+    breaker) to be silently skipped, not just the reactivation part.
+    Confirmed live: a run went silent for the better part of an hour deep in
+    this retrain, finishing only narrowly before the next hourly slot. A
+    `deadline` already in the past must skip run_screen (the expensive,
+    unlogged step) entirely, so every run stays safely clear of that
+    slot -- see _MAX_RUN_SECONDS.
     """
     broker = _FakeBroker({}, portfolio_value=100_000.0)  # nothing held -> 100% freed, would otherwise screen
     run_screen_calls = []
