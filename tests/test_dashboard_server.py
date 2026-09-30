@@ -689,6 +689,49 @@ def test_closed_trades_ignores_a_stale_unrelated_fill_outside_the_match_window(m
     assert trade["exit_price"] == pytest.approx(55.30)
 
 
+def test_closed_trades_two_same_day_round_trips_stay_correctly_split(monkeypatch, client):
+    """
+    Regression test, hit live: two real round trips on the same symbol
+    landing within _FILL_MATCH_WINDOW of each other (P's short-close-then-
+    long-open on 2026-09-24, four hours apart) used to each get their own
+    +-6h fill window computed from just THAT boundary's own entry/close --
+    those two windows overlapped, so the second boundary's window also
+    caught the first boundary's closing fill, fed a contaminated fill slice
+    into _reconstruct_symbol_episodes, and came out with the wrong entry
+    price/qty/pnl for the second (larger, profitable) trade instead of the
+    real numbers.
+    """
+    decisions = [
+        _decision(1, "P", "2026-09-23T19:28:56Z", -100.0),  # short opened
+        _decision(2, "P", "2026-09-24T11:50:28Z", 0.0),  # short closed
+        _decision(3, "P", "2026-09-24T17:30:47Z", 700.0),  # long opened, same afternoon
+        _decision(4, "P", "2026-09-28T12:05:33Z", 0.0),  # long closed
+    ]
+    fills = [
+        _fill("P", "sell", 100.0, 109.83, "2026-09-23T19:28:58Z"),
+        _fill("P", "buy", 100.0, 117.965, "2026-09-24T13:32:06Z"),
+        _fill("P", "buy", 700.0, 126.75, "2026-09-24T17:30:48Z"),
+        _fill("P", "sell", 700.0, 129.0, "2026-09-28T13:34:54Z"),
+    ]
+    _mock_closed_trades_sources(monkeypatch, decisions, fills)
+
+    resp = client.get("/api/trades/closed")
+    body = resp.json()
+    assert len(body) == 2
+
+    by_side = {t["side"]: t for t in body}
+    short_trade = by_side["short"]
+    assert short_trade["entry_price"] == pytest.approx(109.83)
+    assert short_trade["exit_price"] == pytest.approx(117.965)
+    assert short_trade["realized_pnl"] == pytest.approx((109.83 - 117.965) * 100.0)
+
+    long_trade = by_side["long"]
+    assert long_trade["shares"] == 700.0
+    assert long_trade["entry_price"] == pytest.approx(126.75)  # not contaminated by the short's closing fill
+    assert long_trade["exit_price"] == pytest.approx(129.0)
+    assert long_trade["realized_pnl"] == pytest.approx((129.0 - 126.75) * 700.0)
+
+
 def test_closed_trades_broker_without_fill_history_returns_empty(monkeypatch, client):
     """IBKR (or any broker lacking get_filled_orders) degrades to an empty list rather than a 500."""
 

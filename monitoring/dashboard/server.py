@@ -810,9 +810,7 @@ def _load_closed_episodes() -> list[dict]:
     Every realized round-trip: WHICH trades happened and roughly when comes
     from the decisions table (_decision_episode_boundaries, the algo's own
     record) -- the actual price/qty/pnl is then FINALIZED from Alpaca's own
-    filled-order history (execution/broker_alpaca.py::get_filled_orders),
-    scoped to a tight window (_FILL_MATCH_WINDOW) around each boundary's own
-    entry/close timestamps.
+    filled-order history (execution/broker_alpaca.py::get_filled_orders).
 
     Deliberately NOT a blind, unscoped walk across this account's entire
     order history matched by chronological sequence alone: Alpaca's full
@@ -821,14 +819,39 @@ def _load_closed_episodes() -> list[dict]:
     "whatever came next" for that symbol, with no reference to what the
     algo itself actually did and when, risked blending a real round trip's
     exit with a stale, unrelated order's price. Anchoring to the decisions
-    table's own (symbol, date) first and only then asking Alpaca to
-    confirm/finalize within that window rules that out.
+    table's own symbols first, and reconstructing only from fills that fall
+    somewhere within THAT symbol's own decisions history (see window_start/
+    window_end below), rules that out.
+
+    Reconstructs once PER SYMBOL, from every fill across ALL of that
+    symbol's boundaries combined, rather than once per individual boundary
+    scoped to a tight ±_FILL_MATCH_WINDOW around just its own entry/close.
+    The latter used to be this function's design, and it silently produced
+    wrong numbers whenever two round trips on the same symbol landed within
+    _FILL_MATCH_WINDOW of each other (a same-day close-then-reopen, a
+    circuit-breaker flatten shortly after a contradiction close): each
+    boundary's own window bled into its neighbor's fills, so
+    _reconstruct_symbol_episodes saw a partial, contaminated slice instead
+    of the real sequence and produced a merged, wrong-priced episode for
+    one boundary while silently dropping the trailing, never-closed
+    leftover from the other. Hit live: P's short-close-then-long-open on
+    2026-09-24 landed 4 hours apart, well inside the old 6h window, and the
+    long round trip's own numbers came out wrong as a result.
+    _reconstruct_symbol_episodes's own flat -> nonzero -> flat position walk
+    already finds the correct episode splits from the fills alone, with no
+    need for time-based pre-slicing; the only reason to scope by symbol at
+    all is to avoid reconstructing across symbols that share no relationship
+    whatsoever.
 
     Every returned episode carries entry_id/close_id (the decisions.id of
     the trade that opened/closed it) -- internal, stripped before this data
     reaches JSON (see get_closed_trades), but is what lets
     monitoring.trade_log.attach_actual_outcomes match a Trade Log row to
-    its episode exactly, rather than guessing by position in a list.
+    its episode exactly, rather than guessing by position in a list. Each
+    reconstructed episode is labeled with whichever of that symbol's
+    decision boundaries has the closest entry_ts -- normally an exact
+    correspondence, since decisions and fills agree on what happened, just
+    not always down to the second.
 
     Returns [] (never raises) for a broker that can't even be constructed
     (e.g. BROKER=ibkr with no TWS/IB Gateway reachable), one without fill
@@ -860,34 +883,41 @@ def _load_closed_episodes() -> list[dict]:
     fills_df = pd.DataFrame(fills)
     fills_df["filled_at"] = pd.to_datetime(fills_df["filled_at"], utc=True)
 
+    boundaries_by_symbol: dict[str, list[dict]] = {}
+    for b in boundaries:
+        boundaries_by_symbol.setdefault(b["symbol"], []).append(b)
+
     episodes: list[dict] = []
-    for boundary in boundaries:
+    for symbol, symbol_boundaries in boundaries_by_symbol.items():
+        # One combined window spanning every boundary this symbol has, not
+        # one per boundary -- see this function's own docstring for why a
+        # per-boundary window silently produced wrong numbers.
+        window_start = min(b["entry_ts"] for b in symbol_boundaries) - _FILL_MATCH_WINDOW
+        window_end = max(b["close_ts"] for b in symbol_boundaries) + _FILL_MATCH_WINDOW
         window = fills_df[
-            (fills_df["symbol"] == boundary["symbol"])
-            & (fills_df["filled_at"] >= boundary["entry_ts"] - _FILL_MATCH_WINDOW)
-            & (fills_df["filled_at"] <= boundary["close_ts"] + _FILL_MATCH_WINDOW)
+            (fills_df["symbol"] == symbol)
+            & (fills_df["filled_at"] >= window_start)
+            & (fills_df["filled_at"] <= window_end)
         ].sort_values("filled_at")
         if window.empty:
             logger.warning(
-                "No Alpaca fills found for %s within %s of decisions #%d/#%d — skipping, cannot verify.",
-                boundary["symbol"], _FILL_MATCH_WINDOW, boundary["entry_id"], boundary["close_id"],
+                "No Alpaca fills found for %s within %s of its decisions boundaries — skipping, cannot verify.",
+                symbol, _FILL_MATCH_WINDOW,
             )
             continue
 
         matched = _reconstruct_symbol_episodes(window)
-        # The window is bounded on both ends by this specific round trip's
-        # own decision timestamps, so it normally holds exactly one
-        # complete episode -- but ALL of them are kept, not just the
-        # closest match, in case the window happens to catch a genuine
-        # flip-through-flat (one Alpaca fill closing the old side and
-        # opening a new one -- see _reconstruct_symbol_episodes) that this
-        # system's own decisions log as a single resize rather than a
-        # separate close+reopen: dropping either leg would silently lose a
-        # real, realized round trip rather than just misattribute it.
-        episodes.extend(
-            {"symbol": boundary["symbol"], "entry_id": boundary["entry_id"], "close_id": boundary["close_id"], **ep}
-            for ep in matched
-        )
+        # ALL reconstructed episodes are kept, not just as many as there are
+        # boundaries -- a genuine flip-through-flat (one Alpaca fill closing
+        # the old side and opening a new one) that this system's own
+        # decisions log as a single resize rather than a separate
+        # close+reopen would otherwise silently lose a real, realized round
+        # trip. Each one is labeled with whichever boundary's entry_ts is
+        # closest -- an exact correspondence in the normal case, just not
+        # always down to the second.
+        for ep in matched:
+            best = min(symbol_boundaries, key=lambda b: abs((b["entry_ts"] - ep["entry_ts"]).total_seconds()))
+            episodes.append({"symbol": symbol, "entry_id": best["entry_id"], "close_id": best["close_id"], **ep})
 
     return episodes
 
