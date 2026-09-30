@@ -174,13 +174,14 @@ def test_no_open_positions_is_a_clean_noop(monkeypatch):
     assert results == []
 
 
-def test_no_open_positions_attempts_to_redeploy_idle_capital(monkeypatch):
+def test_no_open_positions_does_not_attempt_reactivation(monkeypatch):
     """
-    Regression test: a fully flat book (e.g. right after a circuit-breaker
-    flatten) used to return before ever reaching _attempt_reactivation, so
-    the account stayed in cash until the next weekly cycle even though
-    _freed_capital_fraction already returns 1.0 for an empty book and the
-    full-book rebalance path handles zero current positions fine on its own.
+    Regression test: redeploying idle/freed capital moved to its own,
+    separately scheduled execution/reactivation_monitor.py -- see that
+    module's docstring and run_contradiction_check's docstring for why (the
+    ensemble retrain it triggers routinely takes 40-50+ minutes, too long
+    to safely fit inside this hourly cadence). A fully flat book must NOT
+    trigger _attempt_reactivation from this hourly path anymore.
     """
     broker = _FakeBroker({})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
@@ -190,10 +191,7 @@ def test_no_open_positions_attempts_to_redeploy_idle_capital(monkeypatch):
 
     cm.run_contradiction_check()
 
-    assert len(calls) == 1
-    args, kwargs = calls[0]
-    assert args[0] is broker
-    assert kwargs["excluded_symbols"] == set()
+    assert calls == []
 
 
 # --- hourly equity snapshot (dashboard equity/drawdown chart resolution) ----
@@ -676,7 +674,14 @@ def test_second_opinion_overrule_keeps_the_position_out_of_the_close_proposal(mo
     assert results[0].closed is False
 
 
-def test_closure_triggers_reactivation_attempt(monkeypatch):
+def test_closure_does_not_trigger_inline_reactivation(monkeypatch):
+    """
+    Regression test: a contradiction close used to immediately trigger
+    _attempt_reactivation in this same hourly pass. That moved to its own,
+    separately scheduled execution/reactivation_monitor.py (see
+    run_contradiction_check's docstring) -- capital a close here just freed
+    now waits for that job's next pass instead.
+    """
     broker = _FakeBroker({"AAPL": 10})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
@@ -691,19 +696,11 @@ def test_closure_triggers_reactivation_attempt(monkeypatch):
 
     cm.run_contradiction_check()
 
-    assert reactivation_calls == [1]
+    assert reactivation_calls == []
 
 
-def test_no_closure_still_checks_reactivation_with_nothing_excluded(monkeypatch):
-    """
-    Regression test: this used to skip _attempt_reactivation entirely when
-    nothing closed this cycle. That left a rebalance deferred by an EARLIER
-    cycle (e.g. the excluded symbol was still settling at the broker) with
-    nothing to ever retry it -- freed capital could sit in cash
-    indefinitely. Now every cycle still checks (cheaply -- see
-    rebalance_after_exit's freed_fraction gate), just with nothing excluded
-    when this cycle itself closed nothing.
-    """
+def test_quiet_cycle_does_not_attempt_reactivation(monkeypatch):
+    """A cycle with nothing to close must not attempt reactivation either -- see test_closure_does_not_trigger_inline_reactivation."""
     broker = _FakeBroker({"AAPL": 10})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
@@ -717,7 +714,7 @@ def test_no_closure_still_checks_reactivation_with_nothing_excluded(monkeypatch)
 
     cm.run_contradiction_check()
 
-    assert reactivation_calls == [set()]
+    assert reactivation_calls == []
 
 
 def test_agreeing_signals_leave_the_position_open(monkeypatch):
@@ -969,49 +966,6 @@ def test_attempt_reactivation_skips_when_freed_fraction_too_small(monkeypatch):
     cm._attempt_reactivation(broker, engine=object())
 
     assert run_screen_calls == []
-
-
-def test_attempt_reactivation_skips_the_retrain_once_past_its_deadline(monkeypatch):
-    """
-    Regression test: Railway's cron already skips a new firing outright if
-    the previous execution is still Active -- but a run that finishes late
-    enough to still be Active at the next hourly mark causes that ENTIRE
-    next hour's check (contradiction, stop-loss/take-profit, circuit
-    breaker) to be silently skipped, not just the reactivation part.
-    Confirmed live: a run went silent for the better part of an hour deep in
-    this retrain, finishing only narrowly before the next hourly slot. A
-    `deadline` already in the past must skip run_screen (the expensive,
-    unlogged step) entirely, so every run stays safely clear of that
-    slot -- see _MAX_RUN_SECONDS.
-    """
-    broker = _FakeBroker({}, portfolio_value=100_000.0)  # nothing held -> 100% freed, would otherwise screen
-    run_screen_calls = []
-    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: run_screen_calls.append(1))
-
-    cm._attempt_reactivation(broker, engine=object(), deadline=cm.time.monotonic() - 1)
-
-    assert run_screen_calls == []
-
-
-def test_attempt_reactivation_runs_normally_before_its_deadline(monkeypatch):
-    """A deadline safely in the future must not change anything about a normal run."""
-    from models.screener import TradeCandidate
-
-    broker = _FakeBroker({}, portfolio_value=100_000.0)
-    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL"])
-    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["AAPL"], "close": [50.0]}))
-
-    candidate = TradeCandidate(
-        symbol="AAPL", side="long", predicted_return=0.03, direction_agreement=0.9,
-        conviction_score=0.027, target_position_pct=0.6,
-        reasoning=[{"phase": 4, "title": "Candidate Selection & Sizing", "summary": "AAPL: long, 60.0% of capital.", "lines": ["some line"]}],
-    )
-    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: [candidate])
-    monkeypatch.setattr(cm, "_log_reactivation", lambda *a, **k: None)
-
-    cm._attempt_reactivation(broker, engine=object(), deadline=cm.time.monotonic() + 3600)
-
-    assert broker.closed == ["AAPL"]
 
 
 def test_attempt_reactivation_opens_a_confident_candidate(monkeypatch):
@@ -1327,10 +1281,9 @@ def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
     assert any("kept open" in m and "AAPL" in m for m in alerts)
     assert len(alerts) == 1, f"one summary expected, got {len(alerts)}: {alerts}"
     assert not results[0].closed  # the record reflects what actually happened
-    # Still called every cycle (so a still-idle freed-capital balance from an
-    # EARLIER cycle keeps getting a chance) -- just with nothing excluded,
-    # since this cycle itself closed nothing.
-    assert reactivation_calls == [set()]
+    # Reactivation is execution/reactivation_monitor.py's own job now, not
+    # this hourly pass's -- see run_contradiction_check's docstring.
+    assert reactivation_calls == []
 
 
 def test_reactivation_opens_are_gated_with_their_own_proposal(monkeypatch):
