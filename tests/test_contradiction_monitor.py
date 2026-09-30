@@ -971,6 +971,46 @@ def test_attempt_reactivation_skips_when_freed_fraction_too_small(monkeypatch):
     assert run_screen_calls == []
 
 
+def test_attempt_reactivation_skips_the_retrain_once_past_its_deadline(monkeypatch):
+    """
+    Regression test: Railway's hourly cron kills this service's container
+    outright at the next scheduled fire, with no "skip if still running"
+    check and no graceful shutdown first -- confirmed live from a run that
+    just stopped mid-log with no exit message while still inside this
+    retrain. A `deadline` already in the past must skip run_screen (the
+    expensive step) entirely rather than risk still being in it when the
+    next hour's cron kills the container -- see _MAX_RUN_SECONDS.
+    """
+    broker = _FakeBroker({}, portfolio_value=100_000.0)  # nothing held -> 100% freed, would otherwise screen
+    run_screen_calls = []
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: run_screen_calls.append(1))
+
+    cm._attempt_reactivation(broker, engine=object(), deadline=cm.time.monotonic() - 1)
+
+    assert run_screen_calls == []
+
+
+def test_attempt_reactivation_runs_normally_before_its_deadline(monkeypatch):
+    """A deadline safely in the future must not change anything about a normal run."""
+    from models.screener import TradeCandidate
+
+    broker = _FakeBroker({}, portfolio_value=100_000.0)
+    monkeypatch.setattr(cm, "load_active_universe", lambda: ["AAPL"])
+    monkeypatch.setattr(cm.pd, "read_sql", lambda *a, **k: pd.DataFrame({"symbol": ["AAPL"], "close": [50.0]}))
+
+    candidate = TradeCandidate(
+        symbol="AAPL", side="long", predicted_return=0.03, direction_agreement=0.9,
+        conviction_score=0.027, target_position_pct=0.6,
+        reasoning=[{"phase": 4, "title": "Candidate Selection & Sizing", "summary": "AAPL: long, 60.0% of capital.", "lines": ["some line"]}],
+    )
+    monkeypatch.setattr(cm, "run_screen", lambda *a, **k: [candidate])
+    monkeypatch.setattr(cm, "_log_reactivation", lambda *a, **k: None)
+
+    cm._attempt_reactivation(broker, engine=object(), deadline=cm.time.monotonic() + 3600)
+
+    assert broker.closed == ["AAPL"]
+
+
 def test_attempt_reactivation_opens_a_confident_candidate(monkeypatch):
     from models.screener import TradeCandidate
 

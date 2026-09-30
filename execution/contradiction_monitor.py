@@ -45,6 +45,7 @@ import dataclasses
 import datetime as dt
 import json
 import logging
+import time
 
 import pandas as pd
 from sqlalchemy.dialects.postgresql import JSONB
@@ -130,6 +131,30 @@ _MIN_REACTIVATION_FRACTION = 0.05
 # same positions. Distinct from approval_gate.APPROVAL_LOCK_KEY (that one
 # guards Telegram's single-consumer getUpdates poll, a different resource).
 _CONTRADICTION_LOCK_KEY = 903218
+
+# Force-kill safety margin. Railway's cronSchedule for this service fires a
+# brand-new container every hour with no "skip if still running" check and
+# no graceful shutdown signal first -- confirmed live: a run that was still
+# inside _attempt_reactivation's ensemble retrain when the next hourly mark
+# came around just stopped mid-log, with no exit message and no
+# "Stopping Container" line, right as the next hour's "Starting Container"
+# appeared. advisory_lock (above) only guards against two PYTHON PROCESSES
+# racing for the same DB lock -- it can't protect against the platform
+# killing the container out from under one of them, and a run that never
+# finishes never gets to release anything or log why, so every over-budget
+# hour was silently thrown away complete rather than deferred.
+#
+# The one step here that can run long is _attempt_reactivation's fresh
+# ensemble retrain (score_universe trains n_ensemble_models from scratch on
+# the full active universe's history every call, deliberately never cached
+# -- see full_book_rebalance.py's module docstring for why a stale cached
+# pool was tried and removed). Budgeting this run's wall-clock time and
+# skipping just that retrain once the budget is spent means the process
+# still finishes, logs why, and releases the advisory lock well before the
+# next cron fire could kill it -- worst case, one hour's reactivation is
+# deferred to the next pass, instead of the whole pass (including any
+# contradiction closes it already decided on) vanishing unfinished.
+_MAX_RUN_SECONDS = 45 * 60
 
 
 @dataclasses.dataclass
@@ -549,7 +574,7 @@ def _log_reactivation(
     pd.DataFrame([row]).to_sql("decisions", get_engine(), if_exists="append", index=False, dtype={"reasoning": JSONB})
 
 
-def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None) -> None:
+def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None, deadline: float | None = None) -> None:
     """
     After a confirmed mid-cycle exit, production calls this with the symbols
     that just closed. That path delegates to the whole-book optimizer so
@@ -559,7 +584,21 @@ def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None
     Calls without `excluded_symbols` retain the historical slice-only path.
     That keeps direct tooling/backward-compatible callers stable while the
     real post-exit path gets the stronger whole-book semantics.
+
+    `deadline`: a time.monotonic() cutoff (see _MAX_RUN_SECONDS) past which
+    this skips its ensemble retrain rather than risk still running it when
+    Railway's next hourly cron fire kills the container outright. None (the
+    default, e.g. direct tooling callers) means no budget -- never skip.
     """
+    if deadline is not None and time.monotonic() > deadline:
+        logger.warning(
+            "Skipping reactivation's ensemble retrain — this run is past its %d-minute time "
+            "budget and Railway's hourly cron would otherwise kill the container mid-retrain. "
+            "Any freed capital stays in cash; this is retried next hour.",
+            _MAX_RUN_SECONDS // 60,
+        )
+        return
+
     if excluded_symbols is not None:
         from execution.full_book_rebalance import rebalance_after_exit
 
@@ -751,6 +790,10 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 
 def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     """The actual check, run under run_contradiction_check's advisory lock — see its docstring."""
+    # See _MAX_RUN_SECONDS: this run's wall-clock budget, so a still-running
+    # reactivation retrain is skipped rather than risk Railway's next hourly
+    # cron fire killing the container mid-run.
+    run_deadline = time.monotonic() + _MAX_RUN_SECONDS
     broker = get_broker()  # never passes confirm_live=True — paper-only by construction
     engine = get_engine()
 
@@ -805,7 +848,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         # returns 1.0 for an empty book and the full-book rebalance path
         # handles zero current_positions/excluded_symbols fine on its own.
         logger.info("No open positions — attempting to redeploy idle capital.")
-        _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set())
+        _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set(), deadline=run_deadline)
         return []
 
     symbols = list(positions.keys())
@@ -865,7 +908,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         # A quiet cycle -- nothing to close -- still deserves a shot at
         # redeploying any capital an EARLIER cycle froze in cash (see the
         # matching call, and its comment, at the end of this function).
-        _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set())
+        _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set(), deadline=run_deadline)
         return results
 
     gate = request_fn if request_fn is not None else request_approval
@@ -962,6 +1005,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         engine,
         request_fn=request_fn,
         excluded_symbols=set(closed),
+        deadline=run_deadline,
     )
 
     return results
