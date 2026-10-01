@@ -15,11 +15,16 @@ until the next weekly checkpoint just because the calendar hadn't come
 around yet.
 
 Close-only for the contradiction check itself -- reversing requires a fresh
-conviction call, which is exactly what a screen does. But after a close
-frees up capital, this module immediately re-screens (same 80% confidence
-bar, same selection logic as the weekly cycle) to redeploy it right away
-rather than leaving it in cash until next week -- see _attempt_reactivation.
-The strategy doesn't change, it just doesn't have to wait for Monday.
+conviction call, which is exactly what a screen does. Redeploying capital a
+close here just freed is execution/reactivation_monitor.py's job, on its
+own, less frequent schedule -- not this module's, even though the
+re-screen it runs uses this module's own _attempt_reactivation and shares
+the same confidence bar and selection logic as the weekly cycle. Split out
+because that re-screen's ensemble retrain routinely takes 40-50+ minutes
+with no way to bound or interrupt it partway through -- too long to risk
+inside this module's hourly cadence (see run_contradiction_check's
+docstring for the full story). The strategy doesn't change, it just
+doesn't redeploy in the very same pass that freed it anymore.
 
 Safety boundary, same as trading_loop.py: only ever calls get_broker()
 without confirm_live=True, so it can never fire a live order on the MASTER
@@ -126,9 +131,11 @@ _MIN_REACTIVATION_FRACTION = 0.05
 
 # One fixed key for "an hourly contradiction-check pass is running" — a slow
 # news backfill call can push one run past the next hourly trigger, and two
-# overlapping passes would double-submit closes/reactivations against the
-# same positions. Distinct from approval_gate.APPROVAL_LOCK_KEY (that one
-# guards Telegram's single-consumer getUpdates poll, a different resource).
+# overlapping passes would double-submit closes against the same positions.
+# Distinct from approval_gate.APPROVAL_LOCK_KEY (that one guards Telegram's
+# single-consumer getUpdates poll, a different resource) and from
+# reactivation_monitor.py's own _REACTIVATION_LOCK_KEY (see that module for
+# why reactivation isn't attempted from this hourly pass at all anymore).
 _CONTRADICTION_LOCK_KEY = 903218
 
 
@@ -551,14 +558,23 @@ def _log_reactivation(
 
 def _attempt_reactivation(broker, engine, request_fn=None, excluded_symbols=None) -> None:
     """
-    After a confirmed mid-cycle exit, production calls this with the symbols
-    that just closed. That path delegates to the whole-book optimizer so
-    surviving positions can grow, shrink, or be displaced rather than an
-    empty slot merely being refilled.
+    Called from execution/reactivation_monitor.py's own, separately
+    scheduled pass -- never from this module's hourly contradiction check
+    (see that module's docstring for why: the ensemble retrain this
+    triggers routinely takes 40-50+ minutes with no way to bound or
+    interrupt it partway through, which is too long to safely fit inside an
+    hourly cadence without risking Railway silently skipping the next
+    firing -- see docs.railway.com/cron-jobs#service-execution-requirements).
+    Left in this module, rather than moved wholesale into
+    reactivation_monitor.py, because it's the natural extension of this
+    module's other decision-logging/allocation helpers (_log_reactivation,
+    _freed_capital_fraction, etc.) that already live here.
 
-    Calls without `excluded_symbols` retain the historical slice-only path.
-    That keeps direct tooling/backward-compatible callers stable while the
-    real post-exit path gets the stronger whole-book semantics.
+    With `excluded_symbols` given (production's only real caller today),
+    this delegates to the whole-book optimizer so surviving positions can
+    grow, shrink, or be displaced rather than an empty slot merely being
+    refilled. Calls without it retain the historical slice-only path, kept
+    for direct tooling/backward-compatible callers.
     """
     if excluded_symbols is not None:
         from execution.full_book_rebalance import rebalance_after_exit
@@ -724,14 +740,23 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     side it's held on, then asks a human (one batched proposal message)
     before closing anything that tripped a threshold. Approved closes are
     submitted and logged; rejected ones are logged as flagged-but-kept and
-    alerted. Every pass then attempts to redeploy any freed capital
-    (_attempt_reactivation, itself gated the same way) rather than leaving it
-    idle until next week -- called every cycle, not just one that closed
-    something itself, since a prior cycle's attempt can defer (the closed
-    symbol was still settling at the broker) with nothing else to retry it
-    otherwise; rebalance_after_exit's own freed_fraction gate makes this a
-    cheap no-op the rest of the time. No-ops cleanly if nothing is held or
-    nothing contradicts.
+    alerted. No-ops cleanly if nothing is held or nothing contradicts.
+
+    Deliberately does NOT attempt to redeploy any capital a close here just
+    freed -- that used to happen inline (_attempt_reactivation), but its
+    ensemble retrain routinely takes 40-50+ minutes with no way to bound or
+    interrupt it partway through, which risked this hourly pass still being
+    Active when the next hourly cron mark came around. Railway's cron
+    doesn't overlap or kill a still-running execution -- it silently SKIPS
+    the next firing outright when the previous one is still Active (see
+    docs.railway.com/cron-jobs#service-execution-requirements) -- so a slow
+    retrain here could cause an entire hour of contradiction/stop-loss/
+    circuit-breaker monitoring to quietly not run at all. Reactivation now
+    runs on its own, more generous schedule from
+    execution/reactivation_monitor.py instead; freed capital sits in cash
+    until that job's next pass rather than being redeployed in this same
+    one -- an accepted trade-off for keeping this hourly check fast and
+    reliable.
 
     Runs under advisory_lock(_CONTRADICTION_LOCK_KEY): this fires hourly, and
     a slow pass (e.g. the news backfill call below) can run long enough to
@@ -798,14 +823,10 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 
     positions = {s: q for s, q in broker.get_positions().items() if q != 0}
     if not positions:
-        # A fully flat book (e.g. right after a circuit-breaker flatten) had
-        # nothing here to redeploy it: this returned before ever reaching
-        # _attempt_reactivation below, so the book stayed in cash until the
-        # next weekly cycle even though _freed_capital_fraction already
-        # returns 1.0 for an empty book and the full-book rebalance path
-        # handles zero current_positions/excluded_symbols fine on its own.
-        logger.info("No open positions — attempting to redeploy idle capital.")
-        _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set())
+        # Redeploying idle capital is execution/reactivation_monitor.py's
+        # job now, on its own separately scheduled pass -- not this one. See
+        # that module's docstring for why.
+        logger.info("No open positions — nothing to check this pass.")
         return []
 
     symbols = list(positions.keys())
@@ -862,10 +883,9 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         flagged = [r for r in flagged if r.closed]
 
     if not flagged:
-        # A quiet cycle -- nothing to close -- still deserves a shot at
-        # redeploying any capital an EARLIER cycle froze in cash (see the
-        # matching call, and its comment, at the end of this function).
-        _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set())
+        # A quiet cycle -- nothing to close. Redeploying any capital an
+        # earlier cycle froze in cash is reactivation_monitor.py's job now,
+        # on its own separately scheduled pass -- not this one.
         return results
 
     gate = request_fn if request_fn is not None else request_approval
@@ -949,21 +969,10 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         send_slack_alert(outcome_message, severity="warning")
         send_followup(outcome_message)  # Telegram's post-trade update — see approval_gate module docstring
 
-    # Not gated on closed_any: a rebalance deferred by an earlier cycle (the
-    # excluded symbol was still settling, or the check simply lost the race
-    # against a slow fill) previously had no other trigger to retry it --
-    # nothing else ever called this once that cycle's own attempt returned,
-    # so freed capital could sit in cash indefinitely until some unrelated
-    # symbol happened to close later. Calling this every cycle is cheap when
-    # there is nothing to do: rebalance_after_exit's own freed_fraction gate
-    # (and, this cycle, an empty excluded_symbols) makes it a quick no-op.
-    _attempt_reactivation(
-        broker,
-        engine,
-        request_fn=request_fn,
-        excluded_symbols=set(closed),
-    )
-
+    # Capital freed by a close above (if any) is redeployed by
+    # execution/reactivation_monitor.py's own next scheduled pass, not this
+    # one -- see that module's docstring for why. It stays in cash until
+    # then; that's a deliberate trade-off for a reliable hourly check.
     return results
 
 

@@ -1,6 +1,6 @@
 # Running this system on Railway
 
-Three services, one image. All three are deployed from the same repo and
+Four services, one image. All four are deployed from the same repo and
 the same Dockerfile (`monitoring/dashboard/Dockerfile`, selected by
 `railway.toml` at the repo root); they differ only in their start command
 and schedule. One image means the process that placed an order is
@@ -11,6 +11,7 @@ byte-for-byte the process the dashboard reports on.
 | `dashboard` | *(leave blank — the image's own `CMD`)* | none, always on | On failure |
 | `weekly-cycle` | `python -m scripts.run_weekly_cycle --feature-set-id v4` | `0 8 * * 1` | Never |
 | `contradiction-monitor` | `python -m execution.contradiction_monitor` | `0 14-20 * * 1-5` | Never |
+| `reactivation-monitor` | `python -m execution.reactivation_monitor` | `31 13,15,17,19 * * 1-5` | Never |
 
 Cron times are **UTC** — Railway has no timezone setting.
 
@@ -65,6 +66,29 @@ That's a pre-existing gap in contradiction-monitor's own schedule, not
 something this change touches — worth knowing about if a position that
 should have been closed late in a winter trading day wasn't caught until
 the next hourly check.
+
+`31 13,15,17,19 * * 1-5` (reactivation-monitor) fires every two hours,
+offset 31 minutes past the hour like contradiction-monitor. Split into its
+own service deliberately: redeploying capital freed by a contradiction
+close used to happen inline, in the same hourly contradiction-monitor
+pass, but that re-screen's ensemble retrain (models/screener.py's
+run_screen, deliberately never cached) routinely takes 40-50+ minutes with
+no way to bound or interrupt it partway through. Running it inside the
+hourly pass risked that pass still being *Active* when the next hourly
+cron mark came around — and Railway's cron does not overlap or kill a
+still-running execution; it silently *skips* the next firing outright when
+the previous one is still Active (see "Service execution requirements" at
+<https://docs.railway.com/cron-jobs>). That meant a slow retrain could
+cause an entire hour of contradiction/stop-loss/circuit-breaker monitoring
+to quietly not run at all. Two hours between firings leaves comfortable
+margin over even a slow retrain, so this job's own next firing is never at
+risk of being skipped the same way — and even if one fire were skipped, it
+would just be redeploying idle capital, not a safety check. Capital freed
+by a contradiction close now waits for this job's own next pass, not the
+same hourly cycle that closed it, before being redeployed — an accepted
+trade-off for keeping contradiction-monitor's hourly check fast and
+reliable. See `execution/reactivation_monitor.py`'s module docstring for
+the full story.
 
 The scheduled services must have their restart policy set to **Never**. A
 cron job is supposed to exit; "On failure" would restart the weekly cycle
