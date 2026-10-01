@@ -1,10 +1,14 @@
 # Running this system on Railway
 
-Four services, one image. All four are deployed from the same repo and
-the same Dockerfile (`monitoring/dashboard/Dockerfile`, selected by
-`railway.toml` at the repo root); they differ only in their start command
-and schedule. One image means the process that placed an order is
-byte-for-byte the process the dashboard reports on.
+Six services, same repo. Most are deployed from the same Dockerfile
+(`monitoring/dashboard/Dockerfile`, selected by `railway.toml` at the repo
+root) so the process that placed an order is byte-for-byte the process the
+dashboard reports on; two (`news-stream`, `sentiment-worker`) run on
+Railway's own Railpack auto-detection instead, since neither touches
+LightGBM/`models/screener.py` — the only reason this project needs a
+Dockerfile at all (see "Why a Dockerfile and not Railway's automatic
+detection" below). Within either group, services differ only in their
+start command and schedule.
 
 | Service | Start command | Schedule | Restart policy |
 |---|---|---|---|
@@ -12,6 +16,8 @@ byte-for-byte the process the dashboard reports on.
 | `weekly-cycle` | `python -m scripts.run_weekly_cycle --feature-set-id v4` | `0 8 * * 1` | Never |
 | `contradiction-monitor` | `python -m execution.contradiction_monitor` | `0 14-20 * * 1-5` | Never |
 | `reactivation-monitor` | `python -m execution.reactivation_monitor` | `31 13,15,17,19 * * 1-5` | Never |
+| `news-stream` | `python -m data.ingest.news_stream --universe` | none, always on (Railpack) | On failure |
+| `sentiment-worker` | `python -m features.qualitative.sentiment_worker` | none, always on (Railpack) | On failure |
 
 Cron times are **UTC** — Railway has no timezone setting.
 
@@ -89,6 +95,22 @@ same hourly cycle that closed it, before being redeployed — an accepted
 trade-off for keeping contradiction-monitor's hourly check fast and
 reliable. See `execution/reactivation_monitor.py`'s module docstring for
 the full story.
+
+`sentiment-worker` is the other half of getting contradiction-monitor's
+hourly pass fast: it used to also call `backfill_unscored_news()` inline
+every hour (batches of 20 headlines through Claude), which is most of
+what made that hourly pass slow in the first place. Split into its own
+always-on process instead of a cron job, since it's triggered by
+*volume*, not a *schedule* — it scores a batch the moment 20 headlines
+are pending, or whatever's pending once the oldest of it has waited 5
+minutes, whichever comes first (see
+`features/qualitative/sentiment_worker.py`'s module docstring for the
+full reasoning, including why it deliberately isn't a flat "poll every N
+seconds" loop: that would burn a full Claude call scoring just one or two
+headlines, over and over, during any quiet stretch). `weekly-cycle` keeps
+its own `backfill_unscored_news()` call as a correctness safety net for
+the weekly screen's features — with this worker running, that call
+becomes a fast no-op in the normal case rather than something to remove.
 
 The scheduled services must have their restart policy set to **Never**. A
 cron job is supposed to exit; "On failure" would restart the weekly cycle

@@ -74,7 +74,6 @@ from execution.trading_loop import (
     current_pnl_by_symbol,
 )
 from features.qualitative.macro_sentiment import SECTOR_ETF_BY_GICS_SECTOR
-from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
 from models.screener import _load_recent_headlines, run_screen
 from monitoring import reasoning
@@ -832,9 +831,13 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
     symbols = list(positions.keys())
     try:
         ingest_finnhub(symbols, since_hours=_SENTIMENT_LOOKBACK_HOURS)
-        backfill_unscored_news()
     except Exception:
         logger.exception("News refresh failed — checking against whatever sentiment is already in the DB.")
+    # Sentiment scoring itself is features/qualitative/sentiment_worker.py's
+    # job now, on its own continuous, much-shorter cycle -- not this hourly
+    # pass's. This used to call backfill_unscored_news() inline, which is
+    # exactly what made this pass stack up 20-30 Claude calls and run long;
+    # see that module's docstring for the full story.
 
     # Computed once, up front, so every position's stop/target check (inside
     # _check_position below) reads the same P&L and the same levels it was
