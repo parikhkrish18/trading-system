@@ -48,7 +48,7 @@ import time
 import pandas as pd
 
 from data.ingest.db import get_engine
-from execution.approval_gate import advisory_lock
+from execution.approval_gate import advisory_lock, send_followup
 from features.qualitative.sentiment import backfill_unscored_news
 from monitoring.alerts import configure_file_logging
 
@@ -97,6 +97,15 @@ def run_once(engine=None) -> int:
     Scores one pending batch if either trigger (see module docstring) has
     fired, else no-ops. Returns how many rows were scored (0 if neither
     trigger fired or nothing is pending).
+
+    Sends one Telegram line per batch actually scored -- the "it's doing
+    stuff" signal this otherwise silent, always-on process would have no
+    other way to give. In steady state that's naturally spaced out (one
+    batch roughly every time 20 headlines accumulate, or every
+    _MAX_WAIT_SECONDS during a quiet stretch); the one case this messages
+    more often than that is catching up a real backlog (a cold start, a
+    gap after a restart) -- several batches in quick succession there,
+    which is itself useful to see rather than noise to suppress.
     """
     engine = engine or get_engine()
     count, oldest_age = _pending_unscored(engine)
@@ -104,7 +113,10 @@ def run_once(engine=None) -> int:
         return 0
     if count < _BATCH_SIZE and (oldest_age is None or oldest_age < _MAX_WAIT_SECONDS):
         return 0
-    return backfill_unscored_news(batch_size=_BATCH_SIZE)
+    scored = backfill_unscored_news(batch_size=_BATCH_SIZE)
+    if scored:
+        send_followup(f"📰 Scored {scored} headline(s).")
+    return scored
 
 
 def run_forever(poll_interval: float = _POLL_INTERVAL_SECONDS) -> None:

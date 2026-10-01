@@ -367,7 +367,8 @@ def _flatten_and_alert(broker, reason: str) -> None:
     broker.flatten_all()
     for symbol in positions_before:
         _log_circuit_breaker_action(symbol, 0.0, reason, broker.mode)
-    alert_circuit_breaker(reason)
+    alert_circuit_breaker(reason)  # Slack only (monitoring/alerts.py) -- the single most urgent event this system has must also reach the phone.
+    send_followup(f"🚨 Circuit breaker triggered: {reason} — all positions flattened.")
     record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
 
 
@@ -433,7 +434,8 @@ def _respond_to_breaker_triggers(broker, triggers: list) -> tuple[str, int]:
             logger.exception("Breaker trim order failed for %s — continuing with the rest of the batch.", symbol)
             continue
         _log_circuit_breaker_action(symbol, target_shares, reason, broker.mode)
-    alert_circuit_breaker(reason)
+    alert_circuit_breaker(reason)  # Slack only -- see _flatten_and_alert's matching note on why this also needs Telegram.
+    send_followup(f"⚠️ Circuit breaker triggered: {reason} — trimmed {', '.join(target_value_by_symbol)}.")
     record_equity_snapshot(broker.get_portfolio_value(), mode=broker.mode)
     return "trimmed", orders_placed
 

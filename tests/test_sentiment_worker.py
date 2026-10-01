@@ -21,6 +21,12 @@ def _lock_free_by_default(monkeypatch):
     monkeypatch.setattr(sw, "advisory_lock", _free_lock)
 
 
+@pytest.fixture(autouse=True)
+def _no_followups(monkeypatch):
+    """This file is about the batching logic, not Telegram wiring (see the dedicated status test below)."""
+    monkeypatch.setattr(sw, "send_followup", lambda *a, **k: None)
+
+
 def _pending_df(count: int, oldest_age_s: float | None):
     return pd.DataFrame({"n": [count], "oldest_age_s": [oldest_age_s]})
 
@@ -74,6 +80,28 @@ def test_run_once_flushes_a_partial_batch_once_the_oldest_row_is_overdue(monkeyp
 
     assert scored == 3
     assert calls == [{"batch_size": sw._BATCH_SIZE}]
+
+
+def test_run_once_sends_a_telegram_status_only_when_it_actually_scored_something(monkeypatch):
+    monkeypatch.setattr(sw.pd, "read_sql", lambda *a, **k: _pending_df(sw._BATCH_SIZE, oldest_age_s=1.0))
+    monkeypatch.setattr(sw, "backfill_unscored_news", lambda **k: 20)
+    followups = []
+    monkeypatch.setattr(sw, "send_followup", lambda msg: followups.append(msg))
+
+    sw.run_once(engine=object())
+
+    assert len(followups) == 1
+    assert "20" in followups[0]
+
+
+def test_run_once_sends_no_telegram_status_on_a_no_op_tick(monkeypatch):
+    monkeypatch.setattr(sw.pd, "read_sql", lambda *a, **k: _pending_df(0, None))
+    followups = []
+    monkeypatch.setattr(sw, "send_followup", lambda msg: followups.append(msg))
+
+    sw.run_once(engine=object())
+
+    assert followups == []
 
 
 def test_run_forever_does_not_sleep_right_after_a_full_batch(monkeypatch):

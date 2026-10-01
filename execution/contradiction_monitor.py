@@ -769,6 +769,7 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
                 "Another contradiction-check pass is already running (advisory lock held) — "
                 "skipping this run rather than double-processing. It will run again next hour."
             )
+            send_followup("⏭️ Contradiction check skipped — a previous pass was still running. Will try again next hour.")
             return []
         return _run_contradiction_check(request_fn)
 
@@ -780,6 +781,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 
     if hasattr(broker, "client") and not broker.client.get_clock().is_open:
         logger.info("Market is closed — skipping this check (runs hourly during market hours).")
+        send_followup("💤 Contradiction check skipped — market is closed.")
         return []
 
     # Master-account circuit breakers (risk/circuit_breakers.py) — the same
@@ -826,6 +828,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         # job now, on its own separately scheduled pass -- not this one. See
         # that module's docstring for why.
         logger.info("No open positions — nothing to check this pass.")
+        send_followup("✅ Contradiction check done — no open positions to check.")
         return []
 
     symbols = list(positions.keys())
@@ -889,6 +892,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         # A quiet cycle -- nothing to close. Redeploying any capital an
         # earlier cycle froze in cash is reactivation_monitor.py's job now,
         # on its own separately scheduled pass -- not this one.
+        send_followup(f"✅ Contradiction check done — checked {len(results)} position(s), nothing contradicted.")
         return results
 
     gate = request_fn if request_fn is not None else request_approval

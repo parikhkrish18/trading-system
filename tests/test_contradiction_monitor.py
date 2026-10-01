@@ -163,6 +163,18 @@ def test_market_closed_is_a_clean_noop(monkeypatch):
     assert broker.closed == []
 
 
+def test_market_closed_sends_a_telegram_status(monkeypatch):
+    """So a quiet Telegram feed is distinguishable from the pass having silently stopped running at all."""
+    broker = _FakeBroker({"AAPL": 10}, is_open=False)
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    assert len(followups) == 1
+
+
 def test_no_open_positions_is_a_clean_noop(monkeypatch):
     broker = _FakeBroker({})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
@@ -172,6 +184,18 @@ def test_no_open_positions_is_a_clean_noop(monkeypatch):
     results = cm.run_contradiction_check()
 
     assert results == []
+
+
+def test_no_open_positions_sends_a_telegram_status(monkeypatch):
+    broker = _FakeBroker({})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    assert len(followups) == 1
 
 
 def test_no_open_positions_does_not_attempt_reactivation(monkeypatch):
@@ -705,6 +729,22 @@ def test_quiet_cycle_does_not_attempt_reactivation(monkeypatch):
     cm.run_contradiction_check()
 
     assert reactivation_calls == []
+
+
+def test_quiet_cycle_sends_a_telegram_status(monkeypatch):
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    assert len(followups) == 1
+    assert "1 position" in followups[0]
 
 
 def test_agreeing_signals_leave_the_position_open(monkeypatch):
@@ -1531,6 +1571,16 @@ def test_a_second_overlapping_run_no_ops_when_the_lock_is_already_held(monkeypat
 
     assert results == []
     assert broker_touched == []  # never even got to the market-hours check
+
+
+def test_a_contended_lock_sends_a_telegram_status(monkeypatch):
+    monkeypatch.setattr(cm, "advisory_lock", _busy_lock)
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    assert len(followups) == 1
 
 
 def test_an_uncontended_lock_lets_the_pass_run_normally(monkeypatch):
