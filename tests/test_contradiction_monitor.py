@@ -163,6 +163,18 @@ def test_market_closed_is_a_clean_noop(monkeypatch):
     assert broker.closed == []
 
 
+def test_market_closed_sends_a_telegram_status(monkeypatch):
+    """So a quiet Telegram feed is distinguishable from the pass having silently stopped running at all."""
+    broker = _FakeBroker({"AAPL": 10}, is_open=False)
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    assert len(followups) == 1
+
+
 def test_no_open_positions_is_a_clean_noop(monkeypatch):
     broker = _FakeBroker({})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
@@ -172,6 +184,18 @@ def test_no_open_positions_is_a_clean_noop(monkeypatch):
     results = cm.run_contradiction_check()
 
     assert results == []
+
+
+def test_no_open_positions_sends_a_telegram_status(monkeypatch):
+    broker = _FakeBroker({})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    assert len(followups) == 1
 
 
 def test_no_open_positions_does_not_attempt_reactivation(monkeypatch):
@@ -220,7 +244,6 @@ def test_hourly_check_records_an_equity_snapshot_alongside_a_normal_pass(monkeyp
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
@@ -261,7 +284,6 @@ def test_snapshot_failure_does_not_abort_the_rest_of_the_check(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
 
@@ -281,7 +303,6 @@ def test_negative_sentiment_closes_a_long_position(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
@@ -462,7 +483,6 @@ def test_run_contradiction_check_closes_on_macro_alignment_alone(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", _sentiment_by_symbol({"SNDK": (-0.3, 3), "XLK": (-0.55, 4)}))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(cm, "_sector_by_symbol", lambda engine, symbols: {"SNDK": "Information Technology"})
@@ -493,7 +513,6 @@ def test_close_followup_message_includes_the_reason_not_just_the_symbol(monkeypa
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.55, 5))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
@@ -516,7 +535,6 @@ def test_multiple_closes_in_one_followup_each_get_their_own_reason(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5) if symbol == "AAPL" else (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: _past_the_brake() if symbol == "TSLA" else None)
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
@@ -537,7 +555,6 @@ def test_reversed_momentum_closes_a_short_position(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: _past_the_brake())  # contradicts a short
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
@@ -650,7 +667,6 @@ def test_second_opinion_overrule_keeps_the_position_out_of_the_close_proposal(mo
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.7, 5))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: _past_the_brake())
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
@@ -686,7 +702,6 @@ def test_closure_does_not_trigger_inline_reactivation(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
@@ -705,7 +720,6 @@ def test_quiet_cycle_does_not_attempt_reactivation(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)
 
@@ -717,12 +731,27 @@ def test_quiet_cycle_does_not_attempt_reactivation(monkeypatch):
     assert reactivation_calls == []
 
 
+def test_quiet_cycle_sends_a_telegram_status(monkeypatch):
+    broker = _FakeBroker({"AAPL": 10})
+    monkeypatch.setattr(cm, "get_broker", lambda: broker)
+    monkeypatch.setattr(cm, "get_engine", lambda: object())
+    monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
+    monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))
+    monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    assert len(followups) == 1
+    assert "1 position" in followups[0]
+
+
 def test_agreeing_signals_leave_the_position_open(monkeypatch):
     broker = _FakeBroker({"AAPL": 10})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
@@ -744,7 +773,6 @@ def test_stop_loss_hit_closes_a_position_with_no_news_or_momentum_contradiction(
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
     monkeypatch.setattr(
@@ -775,7 +803,6 @@ def test_take_profit_hit_closes_a_position_and_is_worded_as_a_target_not_a_contr
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(
@@ -821,7 +848,6 @@ def test_exit_levels_lookup_failure_falls_back_to_global_settings(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(
@@ -848,7 +874,6 @@ def test_sparse_news_does_not_trigger_even_with_strong_sentiment(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.9, 1))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
@@ -1186,7 +1211,6 @@ def test_contradiction_closes_are_batched_into_one_gate_call(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5) if symbol == "AAPL" else (None, 0))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: _past_the_brake() if symbol == "TSLA" else None)
     monkeypatch.setattr(cm, "_log_closure", lambda *a, **k: None)
@@ -1230,7 +1254,6 @@ def test_closed_position_logs_as_flat_even_when_the_broker_read_back_is_still_st
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
@@ -1251,7 +1274,6 @@ def test_rejected_close_keeps_the_position_and_logs_the_flag(monkeypatch):
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (-0.8, 5))
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: None)
 
@@ -1399,7 +1421,7 @@ def test_reactivation_still_scopes_the_screen_to_freed_capital_only(monkeypatch)
 
 
 def test_news_refresh_failure_does_not_abort_the_check(monkeypatch):
-    """If Polygon/Anthropic is down, still check against whatever sentiment is already in the DB."""
+    """If Finnhub is down, still check against whatever sentiment is already in the DB."""
     broker = _FakeBroker({"AAPL": 10})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
@@ -1551,13 +1573,22 @@ def test_a_second_overlapping_run_no_ops_when_the_lock_is_already_held(monkeypat
     assert broker_touched == []  # never even got to the market-hours check
 
 
+def test_a_contended_lock_sends_a_telegram_status(monkeypatch):
+    monkeypatch.setattr(cm, "advisory_lock", _busy_lock)
+    followups = []
+    monkeypatch.setattr(cm, "send_followup", lambda msg: followups.append(msg))
+
+    cm.run_contradiction_check()
+
+    assert len(followups) == 1
+
+
 def test_an_uncontended_lock_lets_the_pass_run_normally(monkeypatch):
     broker = _FakeBroker({"AAPL": 10})
     monkeypatch.setattr(cm, "get_broker", lambda: broker)
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "advisory_lock", _free_lock)
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)
@@ -1605,7 +1636,6 @@ def test_a_clean_breaker_pass_leaves_the_hourly_check_unaffected(monkeypatch):
     monkeypatch.setattr(cm, "get_engine", lambda: object())
     monkeypatch.setattr(cm, "_run_breaker_check", lambda b, e: [])
     monkeypatch.setattr(cm, "ingest_finnhub", lambda *a, **k: None)
-    monkeypatch.setattr(cm, "backfill_unscored_news", lambda *a, **k: 0)
     monkeypatch.setattr(cm, "_recent_sentiment", lambda engine, symbol: (0.5, 5))  # agrees with long
     monkeypatch.setattr(cm, "_recent_momentum", lambda engine, symbol: 0.02)  # agrees with long
     monkeypatch.setattr(cm, "_attempt_reactivation", lambda *a, **k: None)

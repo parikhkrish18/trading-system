@@ -74,7 +74,6 @@ from execution.trading_loop import (
     current_pnl_by_symbol,
 )
 from features.qualitative.macro_sentiment import SECTOR_ETF_BY_GICS_SECTOR
-from features.qualitative.sentiment import backfill_unscored_news
 from features.quant.momentum import rolling_return
 from models.screener import _load_recent_headlines, run_screen
 from monitoring import reasoning
@@ -770,6 +769,7 @@ def run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
                 "Another contradiction-check pass is already running (advisory lock held) — "
                 "skipping this run rather than double-processing. It will run again next hour."
             )
+            send_followup("⏭️ Contradiction check skipped — a previous pass was still running. Will try again next hour.")
             return []
         return _run_contradiction_check(request_fn)
 
@@ -781,6 +781,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
 
     if hasattr(broker, "client") and not broker.client.get_clock().is_open:
         logger.info("Market is closed — skipping this check (runs hourly during market hours).")
+        send_followup("💤 Contradiction check skipped — market is closed.")
         return []
 
     # Master-account circuit breakers (risk/circuit_breakers.py) — the same
@@ -827,14 +828,19 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         # job now, on its own separately scheduled pass -- not this one. See
         # that module's docstring for why.
         logger.info("No open positions — nothing to check this pass.")
+        send_followup("✅ Contradiction check done — no open positions to check.")
         return []
 
     symbols = list(positions.keys())
     try:
         ingest_finnhub(symbols, since_hours=_SENTIMENT_LOOKBACK_HOURS)
-        backfill_unscored_news()
     except Exception:
         logger.exception("News refresh failed — checking against whatever sentiment is already in the DB.")
+    # Sentiment scoring itself is features/qualitative/sentiment_worker.py's
+    # job now, on its own continuous, much-shorter cycle -- not this hourly
+    # pass's. This used to call backfill_unscored_news() inline, which is
+    # exactly what made this pass stack up 20-30 Claude calls and run long;
+    # see that module's docstring for the full story.
 
     # Computed once, up front, so every position's stop/target check (inside
     # _check_position below) reads the same P&L and the same levels it was
@@ -886,6 +892,7 @@ def _run_contradiction_check(request_fn=None) -> list[ContradictionResult]:
         # A quiet cycle -- nothing to close. Redeploying any capital an
         # earlier cycle froze in cash is reactivation_monitor.py's job now,
         # on its own separately scheduled pass -- not this one.
+        send_followup(f"✅ Contradiction check done — checked {len(results)} position(s), nothing contradicted.")
         return results
 
     gate = request_fn if request_fn is not None else request_approval

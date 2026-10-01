@@ -661,6 +661,23 @@ def test_flatten_and_alert_logs_a_closing_row_for_every_held_symbol(monkeypatch)
     assert sorted(logged) == [("P", 0.0, "drawdown breach", "paper"), ("Q", 0.0, "drawdown breach", "paper")]
 
 
+def test_flatten_and_alert_reaches_telegram_not_just_slack(monkeypatch):
+    """
+    Regression test: alert_circuit_breaker (monitoring/alerts.py) only ever
+    posts to Slack -- the single most urgent event this system has must
+    also reach the phone, same as every other outcome message.
+    """
+    broker = _FakeBroker(positions={"P": 800.0})
+    monkeypatch.setattr(trading_loop, "_log_circuit_breaker_action", lambda *a, **k: None)
+    followups = []
+    monkeypatch.setattr(trading_loop, "send_followup", lambda msg: followups.append(msg))
+
+    trading_loop._flatten_and_alert(broker, "drawdown breach")
+
+    assert len(followups) == 1
+    assert "drawdown breach" in followups[0]
+
+
 def test_flatten_and_alert_logs_nothing_for_an_already_flat_book(monkeypatch):
     broker = _FakeBroker()  # no positions
     logged = []
@@ -688,6 +705,22 @@ def test_respond_to_breaker_triggers_trim_logs_a_resize_row(monkeypatch):
     )
 
     assert logged == [("P", 237.5, "single position breach", "paper")]
+
+
+def test_respond_to_breaker_triggers_trim_reaches_telegram_not_just_slack(monkeypatch):
+    """Same gap as _flatten_and_alert's — see test_flatten_and_alert_reaches_telegram_not_just_slack."""
+    broker = _FakeBroker(positions={"P": 800.0})
+    monkeypatch.setattr(trading_loop, "_latest_prices", lambda symbols: {"P": 100.0})
+    monkeypatch.setattr(trading_loop, "_log_circuit_breaker_action", lambda *a, **k: None)
+    followups = []
+    monkeypatch.setattr(trading_loop, "send_followup", lambda msg: followups.append(msg))
+
+    trading_loop._respond_to_breaker_triggers(
+        broker, [BreakerResult(True, "single position breach", breaker_type="max_single_position", symbol="P", target_value=23_750.0)]
+    )
+
+    assert len(followups) == 1
+    assert "single position breach" in followups[0] and "P" in followups[0]
 
 
 def test_alert_confidence_checks_sends_the_right_per_check_counts(monkeypatch):

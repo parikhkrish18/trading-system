@@ -62,6 +62,12 @@ def _no_real_equity_writes(monkeypatch):
     monkeypatch.setattr(rm, "record_equity_snapshot", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_followups(monkeypatch):
+    """This file is about reactivation's own flow, not Telegram wiring (see the dedicated status tests below)."""
+    monkeypatch.setattr(rm, "send_followup", lambda *a, **k: None)
+
+
 def test_market_closed_is_a_clean_noop(monkeypatch):
     broker = _FakeBroker(is_open=False)
     monkeypatch.setattr(rm, "get_broker", lambda: broker)
@@ -168,3 +174,44 @@ def test_request_fn_is_threaded_through_to_attempt_reactivation(monkeypatch):
     rm.run_reactivation(request_fn=sentinel)
 
     assert calls == [sentinel]
+
+
+def test_market_closed_sends_a_telegram_status(monkeypatch):
+    broker = _FakeBroker(is_open=False)
+    monkeypatch.setattr(rm, "get_broker", lambda: broker)
+    monkeypatch.setattr(rm, "get_engine", lambda: object())
+    followups = []
+    monkeypatch.setattr(rm, "send_followup", lambda msg: followups.append(msg))
+
+    rm.run_reactivation()
+
+    assert len(followups) == 1
+
+
+def test_contended_lock_sends_a_telegram_status(monkeypatch):
+    monkeypatch.setattr(rm, "advisory_lock", _busy_lock)
+    followups = []
+    monkeypatch.setattr(rm, "send_followup", lambda msg: followups.append(msg))
+
+    rm.run_reactivation()
+
+    assert len(followups) == 1
+
+
+def test_normal_pass_sends_a_done_status_regardless_of_outcome(monkeypatch):
+    """
+    Most passes find nothing to do (freed fraction too small, no confident
+    candidate, etc.) and _attempt_reactivation stays silent for all of
+    those -- this unconditional line is the only way to tell "ran and
+    found nothing to do" apart from "didn't run at all".
+    """
+    broker = _FakeBroker()
+    monkeypatch.setattr(rm, "get_broker", lambda: broker)
+    monkeypatch.setattr(rm, "get_engine", lambda: object())
+    monkeypatch.setattr(rm, "_attempt_reactivation", lambda *a, **k: None)
+    followups = []
+    monkeypatch.setattr(rm, "send_followup", lambda msg: followups.append(msg))
+
+    rm.run_reactivation()
+
+    assert len(followups) == 1

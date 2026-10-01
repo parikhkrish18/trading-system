@@ -44,7 +44,7 @@ from __future__ import annotations
 import logging
 
 from data.ingest.db import get_engine
-from execution.approval_gate import advisory_lock
+from execution.approval_gate import advisory_lock, send_followup
 from execution.broker import get_broker
 from execution.contradiction_monitor import _attempt_reactivation
 from execution.trading_loop import _flatten_and_alert, _run_breaker_check
@@ -73,6 +73,7 @@ def run_reactivation(request_fn=None) -> None:
                 "Another reactivation pass is already running (advisory lock held) — "
                 "skipping this run rather than double-processing. It will run again next scheduled pass."
             )
+            send_followup("⏭️ Reactivation check skipped — a previous pass was still running.")
             return
         _run_reactivation(request_fn)
 
@@ -84,6 +85,7 @@ def _run_reactivation(request_fn=None) -> None:
 
     if hasattr(broker, "client") and not broker.client.get_clock().is_open:
         logger.info("Market is closed — skipping this pass.")
+        send_followup("💤 Reactivation check skipped — market is closed.")
         return
 
     # Same master-account circuit breakers execution/contradiction_monitor.py
@@ -105,6 +107,16 @@ def _run_reactivation(request_fn=None) -> None:
         logger.exception("Could not record this pass's equity snapshot — continuing with reactivation.")
 
     _attempt_reactivation(broker, engine, request_fn=request_fn, excluded_symbols=set())
+    # Unconditional, regardless of what _attempt_reactivation actually did:
+    # its own success path (a real redeploy) already sends its own detailed
+    # "freed capital redeployed" follow-up, but every one of its many
+    # "nothing to do" early-outs (freed fraction too small, no confident
+    # candidate, screen failed, everything already held) stays silent --
+    # and those are the common case for most of this job's 4x/day passes.
+    # Without this, there would be no way to tell "ran and found nothing to
+    # do" apart from "didn't run at all". One short line costs nothing on
+    # the rare pass that already sent its own detailed message.
+    send_followup("✅ Reactivation check done.")
 
 
 def main() -> None:
