@@ -479,6 +479,7 @@ def _fake_unscored_rows() -> pd.DataFrame:
             "symbol": ["SPY", "SPY"],
             "headline": ["h1", "h2"],
             "summary": ["", ""],
+            "source": ["test-fixture", "test-fixture"],
         }
     )
 
@@ -486,6 +487,7 @@ def _fake_unscored_rows() -> pd.DataFrame:
 def _fake_score_sentiment_capturing(captured: dict):
     def _fake(headlines, on_progress=None):
         captured["on_progress"] = on_progress
+        captured["headlines"] = headlines
         out = headlines.copy()
         out["sentiment"] = 0.5
         out["sentiment_reason"] = "fine"
@@ -522,6 +524,50 @@ def test_backfill_unscored_news_report_progress_off_by_default(monkeypatch):
 
     assert n == 2
     assert captured["on_progress"] is None
+
+
+def test_is_boilerplate_filing_matches_known_shelf_takedown_forms():
+    assert sentiment._is_boilerplate_filing("finnhub_filing", "JPM filed Form 424B2")
+    assert sentiment._is_boilerplate_filing("finnhub_filing", "MS filed Form FWP")
+    # A real, variable-content filing type must still go through scoring normally.
+    assert not sentiment._is_boilerplate_filing("finnhub_filing", "JPM filed Form 8-K")
+    # Source gate: only data/ingest/finnhub.py's fixed-template SEC filing
+    # headlines can ever match, never a coincidentally similar-looking real
+    # news headline from a different source.
+    assert not sentiment._is_boilerplate_filing("finnhub", "JPM filed Form 424B2")
+    assert not sentiment._is_boilerplate_filing("finnhub_filing", "")
+
+
+def test_backfill_unscored_news_scores_boilerplate_filings_without_calling_claude(monkeypatch):
+    """
+    Regression test, hit live: a single day's backlog carried 1,200+
+    identical "{symbol} filed Form 424B2"-style headlines for a handful of
+    big debt issuers -- the headline text never varies between instances
+    of the same symbol+form, so there is nothing for Claude to
+    differentiate. These must be scored as a fixed neutral directly,
+    never reaching score_sentiment at all, while a real headline in the
+    same batch still does.
+    """
+    monkeypatch.setattr(sentiment, "get_engine", lambda: _FakeEngine())
+    rows = pd.DataFrame(
+        {
+            "id": [1, 2],
+            "ts": pd.to_datetime(["2026-09-28T09:00:00Z", "2026-09-28T09:05:00Z"], utc=True),
+            "symbol": ["JPM", "AAPL"],
+            "headline": ["JPM filed Form 424B2", "AAPL beats earnings estimates"],
+            "summary": ["https://sec.gov/...", "Strong iPhone sales drove the beat."],
+            "source": ["finnhub_filing", "finnhub"],
+        }
+    )
+    monkeypatch.setattr(sentiment.pd, "read_sql", lambda *a, **k: rows)
+    captured = {}
+    monkeypatch.setattr(sentiment, "score_sentiment", _fake_score_sentiment_capturing(captured))
+
+    n = sentiment.backfill_unscored_news(batch_size=500)
+
+    assert n == 2
+    # Only the real headline reached score_sentiment -- the boilerplate filing never did.
+    assert list(captured["headlines"]["headline"]) == ["AAPL beats earnings estimates"]
 
 
 def test_backfill_unscored_news_writes_the_good_batches_when_one_batch_fails_to_parse(monkeypatch):

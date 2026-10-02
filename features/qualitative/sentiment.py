@@ -253,6 +253,33 @@ def score_sentiment(headlines: pd.DataFrame, on_progress: Callable[[int], None] 
     return scored
 
 
+# Routine shelf-takedown prospectus supplements (424B2/424B3/424B5) and
+# free-writing prospectuses (FWP) filed under an already-effective shelf
+# registration -- data/ingest/finnhub.py renders every SEC filing as a
+# fixed-template headline ("{symbol} filed Form {form}"), and for exactly
+# these form types that template IS the entire content: a debt issuer's
+# 50th 424B2 of the month reads byte-identical to its 1st, so there is
+# nothing in the text for a sentiment read to differentiate between one
+# instance and the next. Large bank/debt issuers file dozens of these a
+# week -- hit live: a single day's backlog carried over 1,200 of them,
+# asking Claude to re-score the same sentence a hundred-plus times in one
+# batch run. Skipped before ever reaching Claude, scored as a fixed
+# neutral instead -- every other filing type (8-K, 10-Q, Form 4, proxy
+# statements, etc.) still goes through scoring normally, since those carry
+# real, variable information the headline alone can't capture.
+_BOILERPLATE_FILING_FORMS = frozenset({"424B2", "424B3", "424B5", "FWP"})
+_BOILERPLATE_FILING_REASON = (
+    "Routine shelf-takedown filing -- a fixed-template headline with no "
+    "company-specific signal to score, so no sentiment read applies."
+)
+
+
+def _is_boilerplate_filing(source: str, headline: str) -> bool:
+    if source != "finnhub_filing" or not headline:
+        return False
+    return any(headline.endswith(f"filed Form {form}") for form in _BOILERPLATE_FILING_FORMS)
+
+
 def backfill_unscored_news(batch_size: int = 500, report_progress: bool = False) -> int:
     """
     Pull rows from news_events where sentiment IS NULL, score them, write back.
@@ -273,7 +300,7 @@ def backfill_unscored_news(batch_size: int = 500, report_progress: bool = False)
     """
     engine = get_engine()
     query = """
-        SELECT id, ts, symbol, headline, summary FROM news_events
+        SELECT id, ts, symbol, headline, summary, source FROM news_events
         WHERE sentiment IS NULL
         ORDER BY ts DESC
         LIMIT %(limit)s
@@ -282,8 +309,19 @@ def backfill_unscored_news(batch_size: int = 500, report_progress: bool = False)
     if df.empty:
         return 0
 
-    on_progress = make_progress_alert("sentiment_backfill", total=len(df)) if report_progress else None
-    scored = score_sentiment(df, on_progress=on_progress)
+    # See _is_boilerplate_filing: these never reach Claude at all, scored
+    # directly as a fixed neutral instead. Everything else goes through
+    # score_sentiment exactly as before.
+    is_boilerplate = df.apply(lambda row: _is_boilerplate_filing(row["source"], row["headline"]), axis=1)
+    boilerplate, to_score = df[is_boilerplate].copy(), df[~is_boilerplate]
+
+    on_progress = make_progress_alert("sentiment_backfill", total=len(to_score)) if report_progress else None
+    scored = score_sentiment(to_score, on_progress=on_progress)
+    if not boilerplate.empty:
+        boilerplate["sentiment"] = 0.0
+        boilerplate["sentiment_reason"] = _BOILERPLATE_FILING_REASON
+        boilerplate["sentiment_relevant"] = True
+        scored = pd.concat([scored, boilerplate], ignore_index=True)
     written = 0
     with engine.begin() as conn:
         for _, row in scored.iterrows():
