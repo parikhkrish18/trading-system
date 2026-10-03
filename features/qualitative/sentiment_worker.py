@@ -22,8 +22,9 @@ Batches on whichever trigger comes first:
 
 Deliberately NOT a flat "poll every N seconds and score whatever's
 pending" loop: during a quiet stretch, that would burn a full Claude call
-(same ~320 cached system-prompt tokens, but still a fresh API round trip
-and its own per-call cost) to score just one or two headlines, over and
+(the ~930-token system prompt, uncached since the gap between polls would
+usually exceed the 5-minute cache TTL, plus its own per-call cost) to
+score just one or two headlines, over and
 over, for no freshness benefit real urgency actually needs. The
 _MAX_WAIT_SECONDS bound below gives the same "never stuck for an hour"
 guarantee without that cost -- a lone urgent headline during a quiet

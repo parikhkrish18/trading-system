@@ -149,9 +149,9 @@ def _score_batch(client: Anthropic, batch: pd.DataFrame) -> dict[int, tuple[floa
         # docstring/prompt above), and backfill_unscored_news() fans this
         # out into up to 25 of these calls back-to-back in a single run (500
         # rows / 20 per batch) -- ephemeral's default 5-minute TTL comfortably
-        # covers that whole run, so only the first call of each hourly pass
-        # pays full price for these ~320 tokens instead of every call paying
-        # it. See response.usage.cache_read_input_tokens to confirm hits.
+        # covers that whole run, so only the first call of each run pays
+        # full price for these ~930 tokens instead of every call paying it.
+        # See response.usage.cache_read_input_tokens to confirm hits.
         system=[{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": json.dumps(items)}],
     )
